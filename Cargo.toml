@@ -1,0 +1,12 @@
+[package]
+name = "tensorlisp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flexbuffers = "25.12.19"
+lasso = "0.7.3"
+codegen = {path = "codegen"}
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.4.3"
