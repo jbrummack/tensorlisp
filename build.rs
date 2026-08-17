@@ -1,25 +1,81 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+fn generate_bindings2(include: impl AsRef<Path>, files: &[impl AsRef<str>]) {
+    let headers = files.iter().flat_map(|fname| {
+        let fname = fname.as_ref();
+        let hname = include.as_ref().join(format!("{fname}.h"));
+        let _canonical = std::fs::canonicalize(&hname).expect("header not found");
+        hname.to_str().map(String::from)
+    });
 
-fn main() -> std::io::Result<()> {
-    println!("cargo:rerun-if-changed=backend/include/ggml.h");
+    // Only keep items whose *origin* is this header, not stuff pulled in
+    // transitively from headers it #includes (e.g. ggml.h via gguf.h).
+
+    //let allow_pattern = format!(".*{}$", regex::escape(&format!("{fname}.h")));
+
     let bindings = bindgen::Builder::default()
-        .header("./backend/include/ggml.h")
+        //.header(hname_str)
+        .headers(headers)
         .rustified_enum(".*")
+        //.allowlist_file(&allow_pattern)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
 
-    let out_path = std::path::PathBuf::from("./src/backend/bindings.rs");
-    // 1. Get raw string from bindgen
+    let out_path = std::path::PathBuf::from(format!("./src/backend/bindings.rs"));
     let code = bindings.to_string();
 
-    // 2. Wrap the generated items directly in the module text
     let wrapped_code = format!(
-        "#[allow(non_camel_case_types,non_snake_case,non_upper_case_globals)]#[codegen::parse_ggml]\npub mod ffi {{\n{}\n}}",
-        code
+        "#[allow(non_camel_case_types,non_snake_case,non_upper_case_globals)]#[codegen::parse_ggml]\npub mod ffi {{\n{code}\n}}",
     );
 
     std::fs::write(out_path, wrapped_code).expect("Couldn't write bindings!");
+}
+fn _generate_bindings(include: impl AsRef<Path>, fname: impl AsRef<str>, deps: &[&str]) {
+    let fname = fname.as_ref();
+    let hname = include.as_ref().join(format!("{fname}.h"));
+    let hname_str = hname.to_str().expect("Cant convert path to string");
+
+    // Only keep items whose *origin* is this header, not stuff pulled in
+    // transitively from headers it #includes (e.g. ggml.h via gguf.h).
+    let _canonical = std::fs::canonicalize(&hname).expect("header not found");
+    let allow_pattern = format!(".*{}$", regex::escape(&format!("{fname}.h")));
+
+    let bindings = bindgen::Builder::default()
+        .header(hname_str)
+        //.headers(headers)
+        .rustified_enum(".*")
+        .allowlist_file(&allow_pattern)
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("Unable to generate bindings");
+
+    let rname = fname.replace('-', "_");
+    let out_path = std::path::PathBuf::from(format!("./src/backend/{rname}.rs"));
+    let code = bindings.to_string();
+
+    // Pull shared types (e.g. ggml_tensor, ggml_threadpool_params) in from
+    // whatever module actually owns them, instead of redefining them here.
+    let mut uses = String::new();
+    for dep in deps {
+        uses.push_str(&format!("pub use crate::backend::{dep}_ffi::*;\n"));
+    }
+
+    let wrapped_code = format!(
+        "#[allow(non_camel_case_types,non_snake_case,non_upper_case_globals)]#[codegen::parse_ggml]\npub mod {rname}_ffi {{\n{uses}{code}\n}}",
+    );
+
+    std::fs::write(out_path, wrapped_code).expect("Couldn't write bindings!");
+}
+fn main() -> std::io::Result<()> {
+    let prefix = PathBuf::from("./backend/");
+    let include = prefix.join("include");
+
+    println!("cargo:rerun-if-changed=backend/include/ggml.h");
+    generate_bindings2(&include, &["ggml", "gguf", "ggml-alloc"]);
+    /*generate_bindings(&include, "ggml", &[]);
+    generate_bindings(&include, "gguf", &["ggml"]);
+    generate_bindings(&include, "ggml-alloc", &["ggml"]);*/
+
     build_ggml();
     Ok(())
 }

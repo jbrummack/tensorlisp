@@ -628,6 +628,10 @@ pub const GGML_ROPE_TYPE_VISION: u32 = 24;
 pub const GGML_ROPE_TYPE_IMROPE: u32 = 40;
 pub const GGML_MROPE_SECTIONS: u32 = 4;
 pub const GGML_N_TASKS_MAX: i32 = -1;
+pub const GGUF_MAGIC: &[u8; 5] = b"GGUF\0";
+pub const GGUF_VERSION: u32 = 3;
+pub const GGUF_KEY_GENERAL_ALIGNMENT: &[u8; 18] = b"general.alignment\0";
+pub const GGUF_DEFAULT_ALIGNMENT: u32 = 32;
 pub type wchar_t = ::std::os::raw::c_int;
 pub type max_align_t = f64;
 pub type int_least8_t = i8;
@@ -4217,6 +4221,397 @@ unsafe extern "C" {
         p0: *const ggml_threadpool_params,
         p1: *const ggml_threadpool_params,
     ) -> bool;
+}
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum gguf_type {
+    GGUF_TYPE_UINT8 = 0,
+    GGUF_TYPE_INT8 = 1,
+    GGUF_TYPE_UINT16 = 2,
+    GGUF_TYPE_INT16 = 3,
+    GGUF_TYPE_UINT32 = 4,
+    GGUF_TYPE_INT32 = 5,
+    GGUF_TYPE_FLOAT32 = 6,
+    GGUF_TYPE_BOOL = 7,
+    GGUF_TYPE_STRING = 8,
+    GGUF_TYPE_ARRAY = 9,
+    GGUF_TYPE_UINT64 = 10,
+    GGUF_TYPE_INT64 = 11,
+    GGUF_TYPE_FLOAT64 = 12,
+    GGUF_TYPE_COUNT = 13,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct gguf_context {
+    _unused: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct gguf_init_params {
+    pub no_alloc: bool,
+    pub ctx: *mut *mut ggml_context,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of gguf_init_params"][::std::mem::size_of::<gguf_init_params>() - 16usize];
+    ["Alignment of gguf_init_params"][::std::mem::align_of::<gguf_init_params>() - 8usize];
+    ["Offset of field: gguf_init_params::no_alloc"]
+        [::std::mem::offset_of!(gguf_init_params, no_alloc) - 0usize];
+    ["Offset of field: gguf_init_params::ctx"]
+        [::std::mem::offset_of!(gguf_init_params, ctx) - 8usize];
+};
+pub type gguf_reader_callback_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        userdata: *mut ::std::os::raw::c_void,
+        output: *mut ::std::os::raw::c_void,
+        offset: u64,
+        len: usize,
+    ) -> usize,
+>;
+unsafe extern "C" {
+    pub fn gguf_init_empty() -> *mut gguf_context;
+}
+unsafe extern "C" {
+    pub fn gguf_init_from_file_ptr(file: *mut FILE, params: gguf_init_params) -> *mut gguf_context;
+}
+unsafe extern "C" {
+    pub fn gguf_init_from_file(
+        fname: *const ::std::os::raw::c_char,
+        params: gguf_init_params,
+    ) -> *mut gguf_context;
+}
+unsafe extern "C" {
+    pub fn gguf_init_from_buffer(
+        data: *const ::std::os::raw::c_void,
+        size: usize,
+        params: gguf_init_params,
+    ) -> *mut gguf_context;
+}
+unsafe extern "C" {
+    pub fn gguf_init_from_callback(
+        callback: gguf_reader_callback_t,
+        userdata: *mut ::std::os::raw::c_void,
+        max_chunk_read: usize,
+        max_expected_size: u64,
+        params: gguf_init_params,
+    ) -> *mut gguf_context;
+}
+unsafe extern "C" {
+    pub fn gguf_free(ctx: *mut gguf_context);
+}
+unsafe extern "C" {
+    pub fn gguf_type_name(type_: gguf_type) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn gguf_get_version(ctx: *const gguf_context) -> u32;
+}
+unsafe extern "C" {
+    pub fn gguf_get_alignment(ctx: *const gguf_context) -> usize;
+}
+unsafe extern "C" {
+    pub fn gguf_get_data_offset(ctx: *const gguf_context) -> usize;
+}
+unsafe extern "C" {
+    pub fn gguf_get_n_kv(ctx: *const gguf_context) -> i64;
+}
+unsafe extern "C" {
+    pub fn gguf_find_key(ctx: *const gguf_context, key: *const ::std::os::raw::c_char) -> i64;
+}
+unsafe extern "C" {
+    pub fn gguf_get_key(ctx: *const gguf_context, key_id: i64) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn gguf_get_kv_type(ctx: *const gguf_context, key_id: i64) -> gguf_type;
+}
+unsafe extern "C" {
+    pub fn gguf_get_arr_type(ctx: *const gguf_context, key_id: i64) -> gguf_type;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_u8(ctx: *const gguf_context, key_id: i64) -> u8;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_i8(ctx: *const gguf_context, key_id: i64) -> i8;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_u16(ctx: *const gguf_context, key_id: i64) -> u16;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_i16(ctx: *const gguf_context, key_id: i64) -> i16;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_u32(ctx: *const gguf_context, key_id: i64) -> u32;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_i32(ctx: *const gguf_context, key_id: i64) -> i32;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_f32(ctx: *const gguf_context, key_id: i64) -> f32;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_u64(ctx: *const gguf_context, key_id: i64) -> u64;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_i64(ctx: *const gguf_context, key_id: i64) -> i64;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_f64(ctx: *const gguf_context, key_id: i64) -> f64;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_bool(ctx: *const gguf_context, key_id: i64) -> bool;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_str(ctx: *const gguf_context, key_id: i64)
+    -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn gguf_get_val_data(
+        ctx: *const gguf_context,
+        key_id: i64,
+    ) -> *const ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn gguf_get_arr_n(ctx: *const gguf_context, key_id: i64) -> usize;
+}
+unsafe extern "C" {
+    pub fn gguf_get_arr_data(
+        ctx: *const gguf_context,
+        key_id: i64,
+    ) -> *const ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn gguf_get_arr_str(
+        ctx: *const gguf_context,
+        key_id: i64,
+        i: usize,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn gguf_get_n_tensors(ctx: *const gguf_context) -> i64;
+}
+unsafe extern "C" {
+    pub fn gguf_find_tensor(ctx: *const gguf_context, name: *const ::std::os::raw::c_char) -> i64;
+}
+unsafe extern "C" {
+    pub fn gguf_get_tensor_offset(ctx: *const gguf_context, tensor_id: i64) -> usize;
+}
+unsafe extern "C" {
+    pub fn gguf_get_tensor_name(
+        ctx: *const gguf_context,
+        tensor_id: i64,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn gguf_get_tensor_ne(ctx: *const gguf_context, tensor_id: i64) -> *const i64;
+}
+unsafe extern "C" {
+    pub fn gguf_get_tensor_type(ctx: *const gguf_context, tensor_id: i64) -> ggml_type;
+}
+unsafe extern "C" {
+    pub fn gguf_get_tensor_size(ctx: *const gguf_context, tensor_id: i64) -> usize;
+}
+unsafe extern "C" {
+    pub fn gguf_remove_key(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char) -> i64;
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_u8(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: u8);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_i8(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: i8);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_u16(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: u16);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_i16(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: i16);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_u32(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: u32);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_i32(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: i32);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_f32(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: f32);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_u64(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: u64);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_i64(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: i64);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_f64(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: f64);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_bool(ctx: *mut gguf_context, key: *const ::std::os::raw::c_char, val: bool);
+}
+unsafe extern "C" {
+    pub fn gguf_set_val_str(
+        ctx: *mut gguf_context,
+        key: *const ::std::os::raw::c_char,
+        val: *const ::std::os::raw::c_char,
+    );
+}
+unsafe extern "C" {
+    pub fn gguf_set_arr_data(
+        ctx: *mut gguf_context,
+        key: *const ::std::os::raw::c_char,
+        type_: gguf_type,
+        data: *const ::std::os::raw::c_void,
+        n: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn gguf_set_arr_str(
+        ctx: *mut gguf_context,
+        key: *const ::std::os::raw::c_char,
+        data: *mut *const ::std::os::raw::c_char,
+        n: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn gguf_set_kv(ctx: *mut gguf_context, src: *const gguf_context);
+}
+unsafe extern "C" {
+    pub fn gguf_add_tensor(ctx: *mut gguf_context, tensor: *const ggml_tensor);
+}
+unsafe extern "C" {
+    pub fn gguf_set_tensor_type(
+        ctx: *mut gguf_context,
+        name: *const ::std::os::raw::c_char,
+        type_: ggml_type,
+    );
+}
+unsafe extern "C" {
+    pub fn gguf_set_tensor_data(
+        ctx: *mut gguf_context,
+        name: *const ::std::os::raw::c_char,
+        data: *const ::std::os::raw::c_void,
+    );
+}
+unsafe extern "C" {
+    pub fn gguf_write_to_file_ptr(
+        ctx: *const gguf_context,
+        file: *mut FILE,
+        only_meta: bool,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn gguf_write_to_file(
+        ctx: *const gguf_context,
+        fname: *const ::std::os::raw::c_char,
+        only_meta: bool,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn gguf_get_meta_size(ctx: *const gguf_context) -> usize;
+}
+unsafe extern "C" {
+    pub fn gguf_get_meta_data(ctx: *const gguf_context, data: *mut ::std::os::raw::c_void);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_buffer_type {
+    _unused: [u8; 0],
+}
+pub type ggml_backend_buffer_type_t = *mut ggml_backend_buffer_type;
+pub type ggml_backend_buffer_t = *mut ggml_backend_buffer;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend {
+    _unused: [u8; 0],
+}
+pub type ggml_backend_t = *mut ggml_backend;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_tallocr {
+    pub buffer: ggml_backend_buffer_t,
+    pub base: *mut ::std::os::raw::c_void,
+    pub alignment: usize,
+    pub offset: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_tallocr"][::std::mem::size_of::<ggml_tallocr>() - 32usize];
+    ["Alignment of ggml_tallocr"][::std::mem::align_of::<ggml_tallocr>() - 8usize];
+    ["Offset of field: ggml_tallocr::buffer"]
+        [::std::mem::offset_of!(ggml_tallocr, buffer) - 0usize];
+    ["Offset of field: ggml_tallocr::base"][::std::mem::offset_of!(ggml_tallocr, base) - 8usize];
+    ["Offset of field: ggml_tallocr::alignment"]
+        [::std::mem::offset_of!(ggml_tallocr, alignment) - 16usize];
+    ["Offset of field: ggml_tallocr::offset"]
+        [::std::mem::offset_of!(ggml_tallocr, offset) - 24usize];
+};
+unsafe extern "C" {
+    pub fn ggml_tallocr_new(buffer: ggml_backend_buffer_t) -> ggml_tallocr;
+}
+unsafe extern "C" {
+    pub fn ggml_tallocr_alloc(talloc: *mut ggml_tallocr, tensor: *mut ggml_tensor) -> ggml_status;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_gallocr {
+    _unused: [u8; 0],
+}
+pub type ggml_gallocr_t = *mut ggml_gallocr;
+unsafe extern "C" {
+    pub fn ggml_gallocr_new(buft: ggml_backend_buffer_type_t) -> ggml_gallocr_t;
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_new_n(
+        bufts: *mut ggml_backend_buffer_type_t,
+        n_bufs: ::std::os::raw::c_int,
+    ) -> ggml_gallocr_t;
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_free(galloc: ggml_gallocr_t);
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_reserve(galloc: ggml_gallocr_t, graph: *mut ggml_cgraph) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_reserve_n_size(
+        galloc: ggml_gallocr_t,
+        graph: *mut ggml_cgraph,
+        node_buffer_ids: *const ::std::os::raw::c_int,
+        leaf_buffer_ids: *const ::std::os::raw::c_int,
+        sizes: *mut usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_reserve_n(
+        galloc: ggml_gallocr_t,
+        graph: *mut ggml_cgraph,
+        node_buffer_ids: *const ::std::os::raw::c_int,
+        leaf_buffer_ids: *const ::std::os::raw::c_int,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_alloc_graph(galloc: ggml_gallocr_t, graph: *mut ggml_cgraph) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_gallocr_get_buffer_size(
+        galloc: ggml_gallocr_t,
+        buffer_id: ::std::os::raw::c_int,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_alloc_ctx_tensors_from_buft_size(
+        ctx: *mut ggml_context,
+        buft: ggml_backend_buffer_type_t,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_alloc_ctx_tensors_from_buft(
+        ctx: *mut ggml_context,
+        buft: ggml_backend_buffer_type_t,
+    ) -> *mut ggml_backend_buffer;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_alloc_ctx_tensors(
+        ctx: *mut ggml_context,
+        backend: ggml_backend_t,
+    ) -> *mut ggml_backend_buffer;
 }
 pub type __builtin_va_list = *mut ::std::os::raw::c_char;
 #[repr(C)]
