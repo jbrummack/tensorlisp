@@ -3679,6 +3679,7 @@ unsafe extern "C" {
         B: *mut ggml_tensor,
         C: *mut ggml_tensor,
         ids: *mut ggml_tensor,
+        K: i64,
     ) -> *mut ggml_tensor;
 }
 unsafe extern "C" {
