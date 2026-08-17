@@ -10,4 +10,3 @@ codegen = {path = "codegen"}
 [build-dependencies]
 bindgen = "0.72.1"
 cc = "1.4.3"
-regex = "1.13.1"

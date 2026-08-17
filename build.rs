@@ -7,11 +7,6 @@ fn generate_bindings2(include: impl AsRef<Path>, files: &[impl AsRef<str>]) {
         hname.to_str().map(String::from)
     });
 
-    // Only keep items whose *origin* is this header, not stuff pulled in
-    // transitively from headers it #includes (e.g. ggml.h via gguf.h).
-
-    //let allow_pattern = format!(".*{}$", regex::escape(&format!("{fname}.h")));
-
     let bindings = bindgen::Builder::default()
         //.header(hname_str)
         .headers(headers)
