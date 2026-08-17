@@ -28,6 +28,7 @@ fn build_ggml() {
     let include = prefix.join("include");
     let src = prefix.join("src");
     let ggml_cpu = src.join("ggml-cpu");
+    let _ggml_metal = src.join("ggml-metal");
     let common_includes = [&include, &src, &ggml_cpu];
 
     // Create a base builder to share common logic
