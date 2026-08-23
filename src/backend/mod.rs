@@ -1,5 +1,9 @@
 use std::ffi::CStr;
-
+pub mod dyntype;
+pub mod gguf;
+pub mod hashcons;
+pub mod list;
+pub mod stupid_lisp;
 use crate::backend::ffi::ggml_tensor;
 
 include!("bindings.rs");

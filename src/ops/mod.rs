@@ -1,12 +1,21 @@
 pub enum Op {
-    Expr,
-    List,
-    Car,
-    Cdr,
-    Cons,
+    IsExpr, //is expr?
+    IsList, //is list?
+    Car,    //Rest
+    Cdr,    //First
+    Cons,   //Construct list
     Quote,
     Eq,
     Cond,
-    Lambda,
+    Lambda, //λ/fn
+    If,
     Def,
+    Math(Math),
+}
+pub enum Math {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
 }

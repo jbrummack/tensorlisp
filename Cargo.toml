@@ -7,6 +7,8 @@ edition = "2024"
 flexbuffers = "25.12.19"
 lasso = "0.7.3"
 codegen = {path = "codegen"}
+thiserror = "2.0.20"
+anyhow = "1.0.104"
 [build-dependencies]
 bindgen = "0.72.1"
 cc = "1.4.3"
