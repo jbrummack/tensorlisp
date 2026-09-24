@@ -5,11 +5,11 @@ use std::{
     ops::{Index, IndexMut},
     ptr::null_mut,
 };
-
+pub const LAMBDA: &str = "λ";
 use lasso::{Key, Rodeo, Spur};
 
 use crate::runtime::memory::FreeMap;
-
+#[repr(u8)]
 #[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Int,
@@ -20,6 +20,7 @@ pub enum Type {
     False,
     Atom,
     String,
+    Lambda,
 }
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct Cell {
@@ -84,6 +85,10 @@ impl<'a> std::fmt::Debug for Reference<'a> {
                 };
                 write!(f, "({car} {cdr})")
             }
+            Type::Lambda => {
+                let val = unsafe { self.rt.cells[self.cell].pointer };
+                write!(f, "λ{val:?}")
+            }
         }
     }
 }
@@ -144,19 +149,76 @@ impl<'a> std::fmt::Display for Reference<'a> {
                 }
                 f.write_char(')')
             }
+            Type::Lambda => {
+                //Safe because only reading a number
+                let val = unsafe { self.rt.cells[self.cell].pointer };
+                write!(f, "λ{val:?}")
+            }
         }
     }
+}
+#[derive(Hash, PartialEq, Eq, Clone, Copy)]
+pub struct Decimal([u8; 8]);
+impl From<f64> for Decimal {
+    #[inline]
+    fn from(value: f64) -> Self {
+        Decimal(value.to_ne_bytes())
+    }
+}
+impl From<f32> for Decimal {
+    #[inline]
+    fn from(value: f32) -> Self {
+        Decimal((value as f64).to_ne_bytes())
+    }
+}
+impl From<Decimal> for f64 {
+    #[inline]
+    fn from(value: Decimal) -> Self {
+        value.fp64()
+    }
+}
+impl From<Decimal> for f32 {
+    #[inline]
+    fn from(value: Decimal) -> Self {
+        value.fp32()
+    }
+}
+impl Decimal {
+    #[inline]
+    pub fn fp32(&self) -> f32 {
+        self.fp64() as f32
+    }
+    #[inline]
+    pub fn fp64(&self) -> f64 {
+        f64::from_ne_bytes(self.0)
+    }
+}
+impl std::fmt::Debug for Decimal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.fp64())
+    }
+}
+impl std::fmt::Display for Decimal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.2}", self.fp64())
+    }
+}
+
+pub enum VMValue {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
 }
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum Value {
     Keyword(String),
     String(String),
     Int(i64),
-    //Float(f64),
+    Float(Decimal),
     Bool(bool),
     List(Vec<Self>),
     Cell(Cell),
-    //Cons(Box<Value>, Box<Value>),
+    Lambda(Lambda),
     Nil,
 }
 
@@ -192,21 +254,11 @@ impl Cell {
         Spur::try_from_usize(self.ptr())
     }
 }
-/*pub enum InputValue {
-    Outsider(Value),
-    Insider(Cell),
-}*/
+
 pub struct CellBuilder<'a> {
     runtime: &'a mut HashedLisp,
 }
-pub struct ListBuilder<'a> {
-    runtime: CellBuilder<'a>,
-}
-/*impl<'a> ListBuilder<'a> {
-    pub fn append(&mut self,) {
-        self.runtime.set_car(cons, car);
-    }
-}*/
+
 impl<'a> CellBuilder<'a> {
     pub fn register_value(&mut self, value: &Value) -> Cell {
         self.runtime.register_value(value)
@@ -251,7 +303,12 @@ impl<'a> CellBuilder<'a> {
         let kw = self.runtime.atoms.get_or_intern(kw);
         Cell::text(Type::Atom, kw)
     }
-
+    pub fn lambda(&mut self, lambda: Lambda) -> Cell {
+        let fnp = lambda.clos as *mut c_void;
+        let pointee = StoredCell { pointer: fnp };
+        let ptr = self.runtime.cells.alloc_new(pointee);
+        Cell::new(Type::Float, ptr)
+    }
     pub fn string(&mut self, s: impl AsRef<str>) -> Cell {
         let s = self.runtime.strings.get_or_intern(s);
         Cell::text(Type::String, s)
@@ -271,14 +328,14 @@ impl<'a> CellBuilder<'a> {
         cell
     }
 
-    fn fetch_cons(&self, ptr: Cell) -> Cons {
+    fn _fetch_cons(&self, ptr: Cell) -> Cons {
         self.runtime.conses[ptr]
     }
-    fn set_car(&mut self, cons: Cell, car: Cell) {
+    fn _set_car(&mut self, cons: Cell, car: Cell) {
         let cons = &mut self.runtime.conses[cons];
         cons.car = car;
     }
-    fn set_cdr(&mut self, cons: Cell, cdr: Cell) {
+    fn _set_cdr(&mut self, cons: Cell, cdr: Cell) {
         let cons = &mut self.runtime.conses[cons];
         cons.cdr = cdr;
     }
@@ -286,6 +343,12 @@ impl<'a> CellBuilder<'a> {
 impl From<i64> for StoredCell {
     fn from(value: i64) -> Self {
         StoredCell { int: value }
+    }
+}
+
+impl From<Lambda> for StoredCell {
+    fn from(value: Lambda) -> Self {
+        (value.clos as *mut c_void).into()
     }
 }
 impl From<f64> for StoredCell {
@@ -326,6 +389,11 @@ impl StoredCell {
     pub unsafe fn as_pointer<T>(&self) -> *mut T {
         let p = unsafe { self.pointer };
         p as *mut T
+    }
+    pub unsafe fn as_lambda(&self) -> Lambda {
+        let f: fn(LispEvaluator<'_>) -> Result<Value, Cell> =
+            unsafe { std::mem::transmute(self.pointer) };
+        Lambda { clos: f }
     }
 }
 pub struct SlotMap<T: Debug> {
@@ -433,6 +501,63 @@ pub struct LispEvaluator<'a> {
     runtime: &'a mut HashedLisp,
     placeholder: Option<Cons>,
 }
+#[allow(unpredictable_function_pointer_comparisons)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub struct Lambda {
+    clos: fn(LispEvaluator<'_>) -> Result<Value, Cell>,
+    // dat: Cell,
+}
+impl Lambda {
+    pub fn execute(&self, eval: LispEvaluator<'_>) -> Result<Value, Cell> {
+        (self.clos)(eval)
+    }
+}
+pub struct FnTable {
+    //storage: HashMap<Spur, fn(LispEvaluator<'_>) -> Value>,
+}
+pub fn dispatch(fname: &str) -> fn(LispEvaluator<'_>) -> Result<Value, Cell> {
+    match fname {
+        "+" => integer_sum,
+        "-" => integer_subtraction,
+        _ => yield_nonexistent_fn,
+    }
+}
+
+fn yield_nonexistent_fn(eval: LispEvaluator<'_>) -> Result<Value, Cell> {
+    Err(eval
+        .runtime
+        .register_value(&Value::String("Function doesnt exist".into())))
+}
+fn integer_subtraction(mut eval: LispEvaluator<'_>) -> Result<Value, Cell> {
+    let mut output: i64 = 0;
+    if let Some(int) = eval.get_int()? {
+        output += int;
+    } else {
+        return Ok(Value::Int(output));
+    }
+    loop {
+        if let Some(int) = eval.get_int()? {
+            output -= int;
+        } else {
+            return Ok(Value::Int(output));
+        }
+    }
+}
+fn integer_sum(mut eval: LispEvaluator<'_>) -> Result<Value, Cell> {
+    let mut output: i64 = 0;
+    loop {
+        if let Some(int) = eval.get_int()? {
+            output += int;
+        } else {
+            return Ok(Value::Int(output));
+        }
+    }
+}
+/*impl FnTable {
+    fn run(atom: Spur) ->  {
+        todo!()
+    }
+}*/
 impl<'a> LispEvaluator<'a> {
     pub fn get_int(&mut self) -> Result<Option<i64>, Cell> {
         if let Some(n) = self.next() {
@@ -500,7 +625,7 @@ impl HashedLisp {
     pub fn dump_cache(&self) {
         println!("Cache Dump ================================");
         for (k, v) in &self.outsider {
-            println!("{k:?} -> {v:?}");
+            print!("{k:?} -> {v:?} | ");
             if let Value::Cell(c) = k {
                 let k = Reference { rt: self, cell: *c };
                 let v = Reference { rt: self, cell: *v };
@@ -523,7 +648,7 @@ impl HashedLisp {
             cons_cache: HashMap::new(),
         }
     }
-    pub const LAMBDA: &str = "λ";
+
     pub fn eval(&mut self, cell: Cell) -> Reference<'_> {
         let key = Value::Cell(cell);
         if let Some(cached) = self.outsider.get(&key) {
@@ -572,76 +697,27 @@ impl HashedLisp {
             }
             .spur()
             .expect("expected atom");
-
-            match self.atoms.resolve(&aname) {
-                "+" => {
-                    let p = iterator.placeholder;
-                    drop(iterator);
-                    let evaluator = LispEvaluator {
-                        runtime: self,
-                        placeholder: p,
-                    };
-                    match evaluator.add() {
-                        Ok(int) => {
-                            let cell = self.register_value(&Value::Int(int));
-                            Reference { rt: self, cell }
-                        }
-                        Err(cell) => {
-                            let reference = Reference { rt: self, cell };
-                            println!("DUMPING CACHE:");
-                            for (k, v) in &self.outsider {
-                                let k = if let Value::Cell(c) = k {
-                                    format!(
-                                        "{:?} {c:?}",
-                                        Reference {
-                                            rt: reference.rt,
-                                            cell: *c
-                                        }
-                                    )
-                                } else {
-                                    format!("{:?}", k)
-                                };
-                                let v = Reference {
-                                    rt: reference.rt,
-                                    cell: *v,
-                                };
-
-                                println!("{k} -> {v}");
-                            }
-                            //println!("{:?}", self.outsider);
-                            panic!("Unexpected add value {reference:?} {:?}", reference.cell)
-                        }
-                    }
-                    //self.eval(iterator.next());
-                    /*while let Some(cell) = iterator.next() {
-                        self.eval(cell);
-                    }*/
-                    /*Reference {
-                        rt: iterator.runtime,
-                        cell: self.register_value(&Value::Int(start)),
-                    }*/
-                }
-                other => panic!("unknown function {other}"),
-            }
+            let name = self.atoms.resolve(&aname);
+            let function = dispatch(&name);
+            let p = iterator.placeholder;
+            drop(iterator);
+            let evaluator = LispEvaluator {
+                runtime: self,
+                placeholder: p,
+            };
+            let value = function(evaluator).unwrap();
+            let cell = self.register_value(&value);
+            Reference { rt: self, cell }
         } else {
             Reference {
                 rt: self,
                 cell: cons,
             }
         };
-        /*let start = Reference {
-            rt: result.rt,
-            cell: cons,
-        };*/
-        //println!("λ {start} -> {result}");
+
         result
     }
     pub fn iter_cell(&'_ self, cell: Cell) -> LispIterator<'_> {
-        //let start = self.conses[cell];
-        //println!("{start:?}");
-
-        /*println!("{:?}", l.placeholder);
-         */
         let mut l = LispIterator {
             runtime: self,
             placeholder: None,
@@ -662,7 +738,6 @@ impl HashedLisp {
 
         let result = match value {
             Value::Int(i) => builder.int(*i),
-            //Value::Float(f) => builder.float(*f),
             Value::Bool(b) => builder.bool(*b),
             Value::List(values) => {
                 let mut cell = Cell::NIL;
@@ -672,31 +747,12 @@ impl HashedLisp {
                 }
                 if values.is_empty() { Cell::NIL } else { cell }
             }
-            /*Value::List(values) => {
-                let mut iterator = values.into_iter();
-                let begin = if let Some(begin) = iterator.next() {
-                    let value = builder.register_value(begin);
-                    builder.cons(value, Cell::NIL)
-                } else {
-                    return Cell::NIL;
-                };
-                let mut list = begin;
-
-                loop {
-                    if let Some(next) = iterator.next() {
-                        let value = builder.register_value(next);
-                        let next_cell = builder.cons(value, Cell::NIL);
-                        builder.set_cdr(list, next_cell);
-                        list = next_cell;
-                    } else {
-                        return begin;
-                    }
-                }
-            }*/
             Value::Nil => builder.nil(),
             Value::Keyword(kw) => builder.atom(kw),
             Value::String(s) => builder.string(s),
             Value::Cell(cell) => *cell,
+            Value::Lambda(_lambda) => todo!(),
+            Value::Float(decimal) => builder.float(*decimal),
         };
         if !is_list {
             self.outsider.insert(value.clone(), result);
@@ -704,10 +760,3 @@ impl HashedLisp {
         result
     }
 }
-/*pub fn add(mut iterator: LispIterator<'_>) -> i64 {
-    let mut start: i64 = 0;
-    while let Ok(cell) = iterator.next() {
-        cell.
-    }
-    Reference { rt: iterator.runtime, cell:  }
-}*/

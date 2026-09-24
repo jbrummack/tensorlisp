@@ -25,13 +25,29 @@ fn generate_bindings2(include: impl AsRef<Path>, files: &[impl AsRef<str>]) {
 
     std::fs::write(out_path, wrapped_code).expect("Couldn't write bindings!");
 }
-
+fn generate_onnx() -> std::io::Result<()> {
+    prost_build::Config::default()
+        .out_dir("src/onnx/")
+        .compile_protos(&["src/onnx.proto"], &["src/"])?;
+    Ok(())
+}
+fn generate_mil() -> std::io::Result<()> {
+    prost_build::Config::default()
+        .out_dir("src/mil/")
+        .compile_protos(
+            &["src/coreml_protos/Model.proto"],
+            &["src/", "src/coreml_protos/"],
+        )?;
+    Ok(())
+}
 fn main() -> std::io::Result<()> {
+    generate_onnx()?;
+    generate_mil()?;
     let prefix = PathBuf::from("./backend/");
     let include = prefix.join("include");
 
     println!("cargo:rerun-if-changed=backend/include/ggml.h");
-    generate_bindings2(&include, &["ggml", "gguf", "ggml-alloc"]);
+    generate_bindings2(&include, &["ggml", "gguf", "ggml-alloc", "ggml-cpu"]);
     /*generate_bindings(&include, "ggml", &[]);
     generate_bindings(&include, "gguf", &["ggml"]);
     generate_bindings(&include, "ggml-alloc", &["ggml"]);*/

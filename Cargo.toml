@@ -9,6 +9,12 @@ lasso = "0.7.3"
 codegen = {path = "codegen"}
 thiserror = "2.0.20"
 anyhow = "1.0.104"
+half = "2.7.1"
+prost = "0.14.4"
+
+
+
 [build-dependencies]
 bindgen = "0.72.1"
 cc = "1.4.3"
+prost-build = "0.14.4"

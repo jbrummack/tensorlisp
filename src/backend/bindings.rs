@@ -175,6 +175,8 @@ pub const __MAC_26_2: u32 = 260200;
 pub const __MAC_26_3: u32 = 260300;
 pub const __MAC_26_4: u32 = 260400;
 pub const __MAC_26_5: u32 = 260500;
+pub const __MAC_26_6: u32 = 260600;
+pub const __MAC_27_0: u32 = 270000;
 pub const __IPHONE_2_0: u32 = 20000;
 pub const __IPHONE_2_1: u32 = 20100;
 pub const __IPHONE_2_2: u32 = 20200;
@@ -269,6 +271,8 @@ pub const __IPHONE_26_2: u32 = 260200;
 pub const __IPHONE_26_3: u32 = 260300;
 pub const __IPHONE_26_4: u32 = 260400;
 pub const __IPHONE_26_5: u32 = 260500;
+pub const __IPHONE_26_6: u32 = 260600;
+pub const __IPHONE_27_0: u32 = 270000;
 pub const __WATCHOS_1_0: u32 = 10000;
 pub const __WATCHOS_2_0: u32 = 20000;
 pub const __WATCHOS_2_1: u32 = 20100;
@@ -332,6 +336,8 @@ pub const __WATCHOS_26_2: u32 = 260200;
 pub const __WATCHOS_26_3: u32 = 260300;
 pub const __WATCHOS_26_4: u32 = 260400;
 pub const __WATCHOS_26_5: u32 = 260500;
+pub const __WATCHOS_26_6: u32 = 260600;
+pub const __WATCHOS_27_0: u32 = 270000;
 pub const __TVOS_9_0: u32 = 90000;
 pub const __TVOS_9_1: u32 = 90100;
 pub const __TVOS_9_2: u32 = 90200;
@@ -395,6 +401,8 @@ pub const __TVOS_26_2: u32 = 260200;
 pub const __TVOS_26_3: u32 = 260300;
 pub const __TVOS_26_4: u32 = 260400;
 pub const __TVOS_26_5: u32 = 260500;
+pub const __TVOS_26_6: u32 = 260600;
+pub const __TVOS_27_0: u32 = 270000;
 pub const __BRIDGEOS_2_0: u32 = 20000;
 pub const __BRIDGEOS_3_0: u32 = 30000;
 pub const __BRIDGEOS_3_1: u32 = 30100;
@@ -434,7 +442,8 @@ pub const __BRIDGEOS_10_1: u32 = 100100;
 pub const __BRIDGEOS_10_2: u32 = 100200;
 pub const __BRIDGEOS_10_3: u32 = 100300;
 pub const __BRIDGEOS_10_4: u32 = 100400;
-pub const __BRIDGEOS_26_5: u32 = 260500;
+pub const __BRIDGEOS_10_5: u32 = 100500;
+pub const __BRIDGEOS_10_6: u32 = 100600;
 pub const __DRIVERKIT_19_0: u32 = 190000;
 pub const __DRIVERKIT_20_0: u32 = 200000;
 pub const __DRIVERKIT_21_0: u32 = 210000;
@@ -462,6 +471,8 @@ pub const __DRIVERKIT_25_2: u32 = 250200;
 pub const __DRIVERKIT_25_3: u32 = 250300;
 pub const __DRIVERKIT_25_4: u32 = 250400;
 pub const __DRIVERKIT_25_5: u32 = 250500;
+pub const __DRIVERKIT_25_6: u32 = 250600;
+pub const __DRIVERKIT_27_0: u32 = 270000;
 pub const __VISIONOS_1_0: u32 = 10000;
 pub const __VISIONOS_1_1: u32 = 10100;
 pub const __VISIONOS_1_2: u32 = 10200;
@@ -480,6 +491,8 @@ pub const __VISIONOS_26_2: u32 = 260200;
 pub const __VISIONOS_26_3: u32 = 260300;
 pub const __VISIONOS_26_4: u32 = 260400;
 pub const __VISIONOS_26_5: u32 = 260500;
+pub const __VISIONOS_26_6: u32 = 260600;
+pub const __VISIONOS_27_0: u32 = 270000;
 pub const MAC_OS_X_VERSION_10_0: u32 = 1000;
 pub const MAC_OS_X_VERSION_10_1: u32 = 1010;
 pub const MAC_OS_X_VERSION_10_2: u32 = 1020;
@@ -558,10 +571,12 @@ pub const MAC_OS_VERSION_26_2: u32 = 260200;
 pub const MAC_OS_VERSION_26_3: u32 = 260300;
 pub const MAC_OS_VERSION_26_4: u32 = 260400;
 pub const MAC_OS_VERSION_26_5: u32 = 260500;
+pub const MAC_OS_VERSION_26_6: u32 = 260600;
+pub const MAC_OS_VERSION_27_0: u32 = 270000;
 pub const __AVAILABILITY_VERSIONS_VERSION_HASH: u32 = 93585900;
 pub const __AVAILABILITY_VERSIONS_VERSION_STRING: &[u8; 6] = b"Local\0";
 pub const __AVAILABILITY_FILE: &[u8; 23] = b"AvailabilityVersions.h\0";
-pub const __MAC_OS_X_VERSION_MAX_ALLOWED: u32 = 260500;
+pub const __MAC_OS_X_VERSION_MAX_ALLOWED: u32 = 270000;
 pub const __ENABLE_LEGACY_MAC_AVAILABILITY: u32 = 1;
 pub const __DARWIN_WCHAR_MIN: i32 = -2147483648;
 pub const _FORTIFY_SOURCE: u32 = 2;
@@ -632,6 +647,7 @@ pub const GGUF_MAGIC: &[u8; 5] = b"GGUF\0";
 pub const GGUF_VERSION: u32 = 3;
 pub const GGUF_KEY_GENERAL_ALIGNMENT: &[u8; 18] = b"general.alignment\0";
 pub const GGUF_DEFAULT_ALIGNMENT: u32 = 32;
+pub const GGML_BACKEND_META_MAX_DEVICES: u32 = 16;
 pub type wchar_t = ::std::os::raw::c_int;
 pub type max_align_t = f64;
 pub type int_least8_t = i8;
@@ -4612,6 +4628,1093 @@ unsafe extern "C" {
         ctx: *mut ggml_context,
         backend: ggml_backend_t,
     ) -> *mut ggml_backend_buffer;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_event {
+    _unused: [u8; 0],
+}
+pub type ggml_backend_event_t = *mut ggml_backend_event;
+pub type ggml_backend_graph_plan_t = *mut ::std::os::raw::c_void;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_reg {
+    _unused: [u8; 0],
+}
+pub type ggml_backend_reg_t = *mut ggml_backend_reg;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_device {
+    _unused: [u8; 0],
+}
+pub type ggml_backend_dev_t = *mut ggml_backend_device;
+unsafe extern "C" {
+    pub fn ggml_backend_buft_name(
+        buft: ggml_backend_buffer_type_t,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buft_alloc_buffer(
+        buft: ggml_backend_buffer_type_t,
+        size: usize,
+    ) -> ggml_backend_buffer_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buft_get_alignment(buft: ggml_backend_buffer_type_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buft_get_max_size(buft: ggml_backend_buffer_type_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buft_get_alloc_size(
+        buft: ggml_backend_buffer_type_t,
+        tensor: *const ggml_tensor,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buft_is_host(buft: ggml_backend_buffer_type_t) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buft_get_device(buft: ggml_backend_buffer_type_t) -> ggml_backend_dev_t;
+}
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ggml_backend_buffer_usage {
+    GGML_BACKEND_BUFFER_USAGE_ANY = 0,
+    GGML_BACKEND_BUFFER_USAGE_WEIGHTS = 1,
+    GGML_BACKEND_BUFFER_USAGE_COMPUTE = 2,
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_name(buffer: ggml_backend_buffer_t)
+    -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_free(buffer: ggml_backend_buffer_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_base(
+        buffer: ggml_backend_buffer_t,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_size(buffer: ggml_backend_buffer_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_init_tensor(
+        buffer: ggml_backend_buffer_t,
+        tensor: *mut ggml_tensor,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_alignment(buffer: ggml_backend_buffer_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_max_size(buffer: ggml_backend_buffer_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_alloc_size(
+        buffer: ggml_backend_buffer_t,
+        tensor: *const ggml_tensor,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_clear(buffer: ggml_backend_buffer_t, value: u8);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_is_host(buffer: ggml_backend_buffer_t) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_set_usage(
+        buffer: ggml_backend_buffer_t,
+        usage: ggml_backend_buffer_usage,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_usage(
+        buffer: ggml_backend_buffer_t,
+    ) -> ggml_backend_buffer_usage;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_get_type(
+        buffer: ggml_backend_buffer_t,
+    ) -> ggml_backend_buffer_type_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_buffer_reset(buffer: ggml_backend_buffer_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_copy(src: *const ggml_tensor, dst: *mut ggml_tensor);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_guid(backend: ggml_backend_t) -> ggml_guid_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_name(backend: ggml_backend_t) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_free(backend: ggml_backend_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_get_default_buffer_type(
+        backend: ggml_backend_t,
+    ) -> ggml_backend_buffer_type_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_alloc_buffer(backend: ggml_backend_t, size: usize)
+    -> ggml_backend_buffer_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_get_alignment(backend: ggml_backend_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_get_max_size(backend: ggml_backend_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_set_async(
+        backend: ggml_backend_t,
+        tensor: *mut ggml_tensor,
+        data: *const ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_get_async(
+        backend: ggml_backend_t,
+        tensor: *const ggml_tensor,
+        data: *mut ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_set_2d_async(
+        backend: ggml_backend_t,
+        tensor: *mut ggml_tensor,
+        data: *const ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+        n_copies: usize,
+        stride_tensor: usize,
+        stride_data: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_get_2d_async(
+        backend: ggml_backend_t,
+        tensor: *const ggml_tensor,
+        data: *mut ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+        n_copies: usize,
+        stride_tensor: usize,
+        stride_data: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_set(
+        tensor: *mut ggml_tensor,
+        data: *const ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_get(
+        tensor: *const ggml_tensor,
+        data: *mut ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_set_2d(
+        tensor: *mut ggml_tensor,
+        data: *const ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+        n_copies: usize,
+        stride_tensor: usize,
+        stride_data: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_get_2d(
+        tensor: *const ggml_tensor,
+        data: *mut ::std::os::raw::c_void,
+        offset: usize,
+        size: usize,
+        n_copies: usize,
+        stride_tensor: usize,
+        stride_data: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_memset(
+        tensor: *mut ggml_tensor,
+        value: u8,
+        offset: usize,
+        size: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_synchronize(backend: ggml_backend_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_graph_plan_create(
+        backend: ggml_backend_t,
+        cgraph: *mut ggml_cgraph,
+    ) -> ggml_backend_graph_plan_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_graph_plan_free(backend: ggml_backend_t, plan: ggml_backend_graph_plan_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_graph_plan_compute(
+        backend: ggml_backend_t,
+        plan: ggml_backend_graph_plan_t,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_graph_compute(
+        backend: ggml_backend_t,
+        cgraph: *mut ggml_cgraph,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_graph_compute_async(
+        backend: ggml_backend_t,
+        cgraph: *mut ggml_cgraph,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_supports_op(backend: ggml_backend_t, op: *const ggml_tensor) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_supports_buft(
+        backend: ggml_backend_t,
+        buft: ggml_backend_buffer_type_t,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_offload_op(backend: ggml_backend_t, op: *const ggml_tensor) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_copy_async(
+        backend_src: ggml_backend_t,
+        backend_dst: ggml_backend_t,
+        src: *const ggml_tensor,
+        dst: *mut ggml_tensor,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_get_device(backend: ggml_backend_t) -> ggml_backend_dev_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_event_new(device: ggml_backend_dev_t) -> ggml_backend_event_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_event_free(event: ggml_backend_event_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_event_record(event: ggml_backend_event_t, backend: ggml_backend_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_event_synchronize(event: ggml_backend_event_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_event_wait(backend: ggml_backend_t, event: ggml_backend_event_t);
+}
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ggml_backend_dev_type {
+    GGML_BACKEND_DEVICE_TYPE_CPU = 0,
+    GGML_BACKEND_DEVICE_TYPE_GPU = 1,
+    GGML_BACKEND_DEVICE_TYPE_IGPU = 2,
+    GGML_BACKEND_DEVICE_TYPE_ACCEL = 3,
+    GGML_BACKEND_DEVICE_TYPE_META = 4,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_dev_caps {
+    pub async_: bool,
+    pub host_buffer: bool,
+    pub buffer_from_host_ptr: bool,
+    pub events: bool,
+    pub mmap_support: bool,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_backend_dev_caps"][::std::mem::size_of::<ggml_backend_dev_caps>() - 5usize];
+    ["Alignment of ggml_backend_dev_caps"]
+        [::std::mem::align_of::<ggml_backend_dev_caps>() - 1usize];
+    ["Offset of field: ggml_backend_dev_caps::async_"]
+        [::std::mem::offset_of!(ggml_backend_dev_caps, async_) - 0usize];
+    ["Offset of field: ggml_backend_dev_caps::host_buffer"]
+        [::std::mem::offset_of!(ggml_backend_dev_caps, host_buffer) - 1usize];
+    ["Offset of field: ggml_backend_dev_caps::buffer_from_host_ptr"]
+        [::std::mem::offset_of!(ggml_backend_dev_caps, buffer_from_host_ptr) - 2usize];
+    ["Offset of field: ggml_backend_dev_caps::events"]
+        [::std::mem::offset_of!(ggml_backend_dev_caps, events) - 3usize];
+    ["Offset of field: ggml_backend_dev_caps::mmap_support"]
+        [::std::mem::offset_of!(ggml_backend_dev_caps, mmap_support) - 4usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_dev_props {
+    pub name: *const ::std::os::raw::c_char,
+    pub description: *const ::std::os::raw::c_char,
+    pub memory_free: usize,
+    pub memory_total: usize,
+    pub type_: ggml_backend_dev_type,
+    pub device_id: *const ::std::os::raw::c_char,
+    pub caps: ggml_backend_dev_caps,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_backend_dev_props"][::std::mem::size_of::<ggml_backend_dev_props>() - 56usize];
+    ["Alignment of ggml_backend_dev_props"]
+        [::std::mem::align_of::<ggml_backend_dev_props>() - 8usize];
+    ["Offset of field: ggml_backend_dev_props::name"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, name) - 0usize];
+    ["Offset of field: ggml_backend_dev_props::description"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, description) - 8usize];
+    ["Offset of field: ggml_backend_dev_props::memory_free"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, memory_free) - 16usize];
+    ["Offset of field: ggml_backend_dev_props::memory_total"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, memory_total) - 24usize];
+    ["Offset of field: ggml_backend_dev_props::type_"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, type_) - 32usize];
+    ["Offset of field: ggml_backend_dev_props::device_id"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, device_id) - 40usize];
+    ["Offset of field: ggml_backend_dev_props::caps"]
+        [::std::mem::offset_of!(ggml_backend_dev_props, caps) - 48usize];
+};
+unsafe extern "C" {
+    pub fn ggml_backend_dev_name(device: ggml_backend_dev_t) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_description(
+        device: ggml_backend_dev_t,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_memory(device: ggml_backend_dev_t, free: *mut usize, total: *mut usize);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_type(device: ggml_backend_dev_t) -> ggml_backend_dev_type;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_get_props(
+        device: ggml_backend_dev_t,
+        props: *mut ggml_backend_dev_props,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_backend_reg(device: ggml_backend_dev_t) -> ggml_backend_reg_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_init(
+        device: ggml_backend_dev_t,
+        params: *const ::std::os::raw::c_char,
+    ) -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_buffer_type(device: ggml_backend_dev_t) -> ggml_backend_buffer_type_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_host_buffer_type(
+        device: ggml_backend_dev_t,
+    ) -> ggml_backend_buffer_type_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_buffer_from_host_ptr(
+        device: ggml_backend_dev_t,
+        ptr: *mut ::std::os::raw::c_void,
+        size: usize,
+        max_tensor_size: usize,
+    ) -> ggml_backend_buffer_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_supports_op(device: ggml_backend_dev_t, op: *const ggml_tensor)
+    -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_supports_buft(
+        device: ggml_backend_dev_t,
+        buft: ggml_backend_buffer_type_t,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_offload_op(device: ggml_backend_dev_t, op: *const ggml_tensor) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_name(reg: ggml_backend_reg_t) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_dev_count(reg: ggml_backend_reg_t) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_dev_get(reg: ggml_backend_reg_t, index: usize) -> ggml_backend_dev_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_get_proc_address(
+        reg: ggml_backend_reg_t,
+        name: *const ::std::os::raw::c_char,
+    ) -> *mut ::std::os::raw::c_void;
+}
+pub type ggml_backend_comm_init_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        backends: *mut ggml_backend_t,
+        n_backends: usize,
+    ) -> *mut ::std::os::raw::c_void,
+>;
+pub type ggml_backend_comm_free_t =
+    ::std::option::Option<unsafe extern "C" fn(comm_ctx: *mut ::std::os::raw::c_void)>;
+pub type ggml_backend_comm_allreduce_tensor_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        comm_ctx: *mut ::std::os::raw::c_void,
+        tensors: *mut *mut ggml_tensor,
+    ) -> bool,
+>;
+pub type ggml_backend_split_buffer_type_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        main_device: ::std::os::raw::c_int,
+        tensor_split: *const f32,
+    ) -> ggml_backend_buffer_type_t,
+>;
+pub type ggml_backend_set_n_threads_t = ::std::option::Option<
+    unsafe extern "C" fn(backend: ggml_backend_t, n_threads: ::std::os::raw::c_int),
+>;
+pub type ggml_backend_dev_get_extra_bufts_t = ::std::option::Option<
+    unsafe extern "C" fn(device: ggml_backend_dev_t) -> *mut ggml_backend_buffer_type_t,
+>;
+pub type ggml_backend_set_abort_callback_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        backend: ggml_backend_t,
+        abort_callback: ggml_abort_callback,
+        abort_callback_data: *mut ::std::os::raw::c_void,
+    ),
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_feature {
+    pub name: *const ::std::os::raw::c_char,
+    pub value: *const ::std::os::raw::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_backend_feature"][::std::mem::size_of::<ggml_backend_feature>() - 16usize];
+    ["Alignment of ggml_backend_feature"][::std::mem::align_of::<ggml_backend_feature>() - 8usize];
+    ["Offset of field: ggml_backend_feature::name"]
+        [::std::mem::offset_of!(ggml_backend_feature, name) - 0usize];
+    ["Offset of field: ggml_backend_feature::value"]
+        [::std::mem::offset_of!(ggml_backend_feature, value) - 8usize];
+};
+pub type ggml_backend_get_features_t = ::std::option::Option<
+    unsafe extern "C" fn(reg: ggml_backend_reg_t) -> *mut ggml_backend_feature,
+>;
+unsafe extern "C" {
+    pub fn ggml_backend_register(reg: ggml_backend_reg_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_device_register(device: ggml_backend_dev_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_count() -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_get(index: usize) -> ggml_backend_reg_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_reg_by_name(name: *const ::std::os::raw::c_char) -> ggml_backend_reg_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_count() -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_get(index: usize) -> ggml_backend_dev_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_by_name(name: *const ::std::os::raw::c_char) -> ggml_backend_dev_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_dev_by_type(type_: ggml_backend_dev_type) -> ggml_backend_dev_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_init_by_name(
+        name: *const ::std::os::raw::c_char,
+        params: *const ::std::os::raw::c_char,
+    ) -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_init_by_type(
+        type_: ggml_backend_dev_type,
+        params: *const ::std::os::raw::c_char,
+    ) -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_init_best() -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_load(path: *const ::std::os::raw::c_char) -> ggml_backend_reg_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_unload(reg: ggml_backend_reg_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_load_all();
+}
+unsafe extern "C" {
+    pub fn ggml_backend_load_all_from_path(dir_path: *const ::std::os::raw::c_char);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_sched {
+    _unused: [u8; 0],
+}
+pub type ggml_backend_sched_t = *mut ggml_backend_sched;
+pub type ggml_backend_sched_eval_callback = ::std::option::Option<
+    unsafe extern "C" fn(
+        t: *mut ggml_tensor,
+        ask: bool,
+        user_data: *mut ::std::os::raw::c_void,
+    ) -> bool,
+>;
+unsafe extern "C" {
+    pub fn ggml_backend_sched_new(
+        backends: *mut ggml_backend_t,
+        bufts: *mut ggml_backend_buffer_type_t,
+        n_backends: ::std::os::raw::c_int,
+        graph_size: usize,
+        parallel: bool,
+        op_offload: bool,
+    ) -> ggml_backend_sched_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_free(sched: ggml_backend_sched_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_reserve_size(
+        sched: ggml_backend_sched_t,
+        measure_graph: *mut ggml_cgraph,
+        sizes: *mut usize,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_reserve(
+        sched: ggml_backend_sched_t,
+        measure_graph: *mut ggml_cgraph,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_n_backends(sched: ggml_backend_sched_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_backend(
+        sched: ggml_backend_sched_t,
+        i: ::std::os::raw::c_int,
+    ) -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_n_splits(sched: ggml_backend_sched_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_n_copies(sched: ggml_backend_sched_t) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_buffer_type(
+        sched: ggml_backend_sched_t,
+        backend: ggml_backend_t,
+    ) -> ggml_backend_buffer_type_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_buffer_size(
+        sched: ggml_backend_sched_t,
+        backend: ggml_backend_t,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_set_tensor_backend(
+        sched: ggml_backend_sched_t,
+        node: *mut ggml_tensor,
+        backend: ggml_backend_t,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_get_tensor_backend(
+        sched: ggml_backend_sched_t,
+        node: *mut ggml_tensor,
+    ) -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_split_graph(sched: ggml_backend_sched_t, graph: *mut ggml_cgraph);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_alloc_graph(
+        sched: ggml_backend_sched_t,
+        graph: *mut ggml_cgraph,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_graph_compute(
+        sched: ggml_backend_sched_t,
+        graph: *mut ggml_cgraph,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_graph_compute_async(
+        sched: ggml_backend_sched_t,
+        graph: *mut ggml_cgraph,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_synchronize(sched: ggml_backend_sched_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_reset(sched: ggml_backend_sched_t);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_sched_set_eval_callback(
+        sched: ggml_backend_sched_t,
+        callback: ggml_backend_sched_eval_callback,
+        user_data: *mut ::std::os::raw::c_void,
+    );
+}
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ggml_backend_meta_split_axis {
+    GGML_BACKEND_SPLIT_AXIS_0 = 0,
+    GGML_BACKEND_SPLIT_AXIS_1 = 1,
+    GGML_BACKEND_SPLIT_AXIS_2 = 2,
+    GGML_BACKEND_SPLIT_AXIS_3 = 3,
+    GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10,
+    GGML_BACKEND_SPLIT_AXIS_PARTIAL = 11,
+    GGML_BACKEND_SPLIT_AXIS_NONE = 98,
+    GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
+}
+unsafe extern "C" {
+    pub fn ggml_backend_meta_split_axis_name(
+        split_axis: ggml_backend_meta_split_axis,
+    ) -> *const ::std::os::raw::c_char;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_meta_split_state {
+    pub axis: ggml_backend_meta_split_axis,
+    pub ne: [i64; 256usize],
+    pub nr: [u32; 16usize],
+    pub n_segments: u32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_backend_meta_split_state"]
+        [::std::mem::size_of::<ggml_backend_meta_split_state>() - 2128usize];
+    ["Alignment of ggml_backend_meta_split_state"]
+        [::std::mem::align_of::<ggml_backend_meta_split_state>() - 8usize];
+    ["Offset of field: ggml_backend_meta_split_state::axis"]
+        [::std::mem::offset_of!(ggml_backend_meta_split_state, axis) - 0usize];
+    ["Offset of field: ggml_backend_meta_split_state::ne"]
+        [::std::mem::offset_of!(ggml_backend_meta_split_state, ne) - 8usize];
+    ["Offset of field: ggml_backend_meta_split_state::nr"]
+        [::std::mem::offset_of!(ggml_backend_meta_split_state, nr) - 2056usize];
+    ["Offset of field: ggml_backend_meta_split_state::n_segments"]
+        [::std::mem::offset_of!(ggml_backend_meta_split_state, n_segments) - 2120usize];
+};
+pub type ggml_backend_meta_get_split_state_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        tensor: *const ggml_tensor,
+        userdata: *mut ::std::os::raw::c_void,
+    ) -> ggml_backend_meta_split_state,
+>;
+unsafe extern "C" {
+    pub fn ggml_backend_meta_device(
+        devs: *mut ggml_backend_dev_t,
+        n_devs: usize,
+        get_split_state: ggml_backend_meta_get_split_state_t,
+        get_split_state_ud: *mut ::std::os::raw::c_void,
+    ) -> ggml_backend_dev_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_backend_graph_copy {
+    pub buffer: ggml_backend_buffer_t,
+    pub ctx_allocated: *mut ggml_context,
+    pub ctx_unallocated: *mut ggml_context,
+    pub graph: *mut ggml_cgraph,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_backend_graph_copy"][::std::mem::size_of::<ggml_backend_graph_copy>() - 32usize];
+    ["Alignment of ggml_backend_graph_copy"]
+        [::std::mem::align_of::<ggml_backend_graph_copy>() - 8usize];
+    ["Offset of field: ggml_backend_graph_copy::buffer"]
+        [::std::mem::offset_of!(ggml_backend_graph_copy, buffer) - 0usize];
+    ["Offset of field: ggml_backend_graph_copy::ctx_allocated"]
+        [::std::mem::offset_of!(ggml_backend_graph_copy, ctx_allocated) - 8usize];
+    ["Offset of field: ggml_backend_graph_copy::ctx_unallocated"]
+        [::std::mem::offset_of!(ggml_backend_graph_copy, ctx_unallocated) - 16usize];
+    ["Offset of field: ggml_backend_graph_copy::graph"]
+        [::std::mem::offset_of!(ggml_backend_graph_copy, graph) - 24usize];
+};
+unsafe extern "C" {
+    pub fn ggml_backend_graph_copy(
+        backend: ggml_backend_t,
+        graph: *mut ggml_cgraph,
+    ) -> ggml_backend_graph_copy;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_graph_copy_free(copy: ggml_backend_graph_copy);
+}
+pub type ggml_backend_eval_callback = ::std::option::Option<
+    unsafe extern "C" fn(
+        node_index: ::std::os::raw::c_int,
+        t1: *mut ggml_tensor,
+        t2: *mut ggml_tensor,
+        user_data: *mut ::std::os::raw::c_void,
+    ) -> bool,
+>;
+unsafe extern "C" {
+    pub fn ggml_backend_compare_graph_backend(
+        backend1: ggml_backend_t,
+        backend2: ggml_backend_t,
+        graph: *mut ggml_cgraph,
+        callback: ggml_backend_eval_callback,
+        user_data: *mut ::std::os::raw::c_void,
+        test_nodes: *const *const ggml_tensor,
+        num_test_nodes: usize,
+    ) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_tensor_alloc(
+        buffer: ggml_backend_buffer_t,
+        tensor: *mut ggml_tensor,
+        addr: *mut ::std::os::raw::c_void,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_view_init(tensor: *mut ggml_tensor) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_buffer_from_ptr(
+        ptr: *mut ::std::os::raw::c_void,
+        size: usize,
+    ) -> ggml_backend_buffer_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_buffer_type() -> ggml_backend_buffer_type_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_cplan {
+    pub work_size: usize,
+    pub work_data: *mut u8,
+    pub n_threads: ::std::os::raw::c_int,
+    pub threadpool: *mut ggml_threadpool,
+    pub abort_callback: ggml_abort_callback,
+    pub abort_callback_data: *mut ::std::os::raw::c_void,
+    pub use_ref: bool,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_cplan"][::std::mem::size_of::<ggml_cplan>() - 56usize];
+    ["Alignment of ggml_cplan"][::std::mem::align_of::<ggml_cplan>() - 8usize];
+    ["Offset of field: ggml_cplan::work_size"]
+        [::std::mem::offset_of!(ggml_cplan, work_size) - 0usize];
+    ["Offset of field: ggml_cplan::work_data"]
+        [::std::mem::offset_of!(ggml_cplan, work_data) - 8usize];
+    ["Offset of field: ggml_cplan::n_threads"]
+        [::std::mem::offset_of!(ggml_cplan, n_threads) - 16usize];
+    ["Offset of field: ggml_cplan::threadpool"]
+        [::std::mem::offset_of!(ggml_cplan, threadpool) - 24usize];
+    ["Offset of field: ggml_cplan::abort_callback"]
+        [::std::mem::offset_of!(ggml_cplan, abort_callback) - 32usize];
+    ["Offset of field: ggml_cplan::abort_callback_data"]
+        [::std::mem::offset_of!(ggml_cplan, abort_callback_data) - 40usize];
+    ["Offset of field: ggml_cplan::use_ref"][::std::mem::offset_of!(ggml_cplan, use_ref) - 48usize];
+};
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ggml_numa_strategy {
+    GGML_NUMA_STRATEGY_DISABLED = 0,
+    GGML_NUMA_STRATEGY_DISTRIBUTE = 1,
+    GGML_NUMA_STRATEGY_ISOLATE = 2,
+    GGML_NUMA_STRATEGY_NUMACTL = 3,
+    GGML_NUMA_STRATEGY_MIRROR = 4,
+    GGML_NUMA_STRATEGY_COUNT = 5,
+}
+unsafe extern "C" {
+    pub fn ggml_numa_init(numa: ggml_numa_strategy);
+}
+unsafe extern "C" {
+    pub fn ggml_is_numa() -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_new_i32(ctx: *mut ggml_context, value: i32) -> *mut ggml_tensor;
+}
+unsafe extern "C" {
+    pub fn ggml_new_f32(ctx: *mut ggml_context, value: f32) -> *mut ggml_tensor;
+}
+unsafe extern "C" {
+    pub fn ggml_set_i32(tensor: *mut ggml_tensor, value: i32) -> *mut ggml_tensor;
+}
+unsafe extern "C" {
+    pub fn ggml_set_f32(tensor: *mut ggml_tensor, value: f32) -> *mut ggml_tensor;
+}
+unsafe extern "C" {
+    pub fn ggml_get_i32_1d(tensor: *const ggml_tensor, i: ::std::os::raw::c_int) -> i32;
+}
+unsafe extern "C" {
+    pub fn ggml_set_i32_1d(tensor: *const ggml_tensor, i: ::std::os::raw::c_int, value: i32);
+}
+unsafe extern "C" {
+    pub fn ggml_get_i32_nd(
+        tensor: *const ggml_tensor,
+        i0: ::std::os::raw::c_int,
+        i1: ::std::os::raw::c_int,
+        i2: ::std::os::raw::c_int,
+        i3: ::std::os::raw::c_int,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn ggml_set_i32_nd(
+        tensor: *const ggml_tensor,
+        i0: ::std::os::raw::c_int,
+        i1: ::std::os::raw::c_int,
+        i2: ::std::os::raw::c_int,
+        i3: ::std::os::raw::c_int,
+        value: i32,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_get_f32_1d(tensor: *const ggml_tensor, i: ::std::os::raw::c_int) -> f32;
+}
+unsafe extern "C" {
+    pub fn ggml_set_f32_1d(tensor: *const ggml_tensor, i: ::std::os::raw::c_int, value: f32);
+}
+unsafe extern "C" {
+    pub fn ggml_get_f32_nd(
+        tensor: *const ggml_tensor,
+        i0: ::std::os::raw::c_int,
+        i1: ::std::os::raw::c_int,
+        i2: ::std::os::raw::c_int,
+        i3: ::std::os::raw::c_int,
+    ) -> f32;
+}
+unsafe extern "C" {
+    pub fn ggml_set_f32_nd(
+        tensor: *const ggml_tensor,
+        i0: ::std::os::raw::c_int,
+        i1: ::std::os::raw::c_int,
+        i2: ::std::os::raw::c_int,
+        i3: ::std::os::raw::c_int,
+        value: f32,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_threadpool_new(params: *mut ggml_threadpool_params) -> *mut ggml_threadpool;
+}
+unsafe extern "C" {
+    pub fn ggml_threadpool_free(threadpool: *mut ggml_threadpool);
+}
+unsafe extern "C" {
+    pub fn ggml_threadpool_get_n_threads(threadpool: *mut ggml_threadpool)
+    -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_threadpool_pause(threadpool: *mut ggml_threadpool);
+}
+unsafe extern "C" {
+    pub fn ggml_threadpool_resume(threadpool: *mut ggml_threadpool);
+}
+unsafe extern "C" {
+    pub fn ggml_graph_plan(
+        cgraph: *const ggml_cgraph,
+        n_threads: ::std::os::raw::c_int,
+        threadpool: *mut ggml_threadpool,
+    ) -> ggml_cplan;
+}
+unsafe extern "C" {
+    pub fn ggml_graph_compute(cgraph: *mut ggml_cgraph, cplan: *mut ggml_cplan) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_graph_compute_with_ctx(
+        ctx: *mut ggml_context,
+        cgraph: *mut ggml_cgraph,
+        n_threads: ::std::os::raw::c_int,
+    ) -> ggml_status;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_sse3() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_ssse3() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx_vnni() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx2() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_bmi2() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_f16c() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_fma() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx512() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx512_vbmi() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx512_vnni() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_avx512_bf16() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_amx_int8() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_neon() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_arm_fma() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_fp16_va() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_dotprod() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_matmul_int8() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_sve() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_get_sve_cnt() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_sme() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_sme2() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_riscv_v() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_get_rvv_vlen() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_vsx() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_vxe() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_wasm_simd() -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_has_llamafile() -> ::std::os::raw::c_int;
+}
+pub type ggml_vec_dot_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        n: ::std::os::raw::c_int,
+        s: *mut f32,
+        bs: usize,
+        x: *const ::std::os::raw::c_void,
+        bx: usize,
+        y: *const ::std::os::raw::c_void,
+        by: usize,
+        nrc: ::std::os::raw::c_int,
+    ),
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ggml_type_traits_cpu {
+    pub from_float: ggml_from_float_t,
+    pub vec_dot: ggml_vec_dot_t,
+    pub vec_dot_type: ggml_type,
+    pub nrows: i64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of ggml_type_traits_cpu"][::std::mem::size_of::<ggml_type_traits_cpu>() - 32usize];
+    ["Alignment of ggml_type_traits_cpu"][::std::mem::align_of::<ggml_type_traits_cpu>() - 8usize];
+    ["Offset of field: ggml_type_traits_cpu::from_float"]
+        [::std::mem::offset_of!(ggml_type_traits_cpu, from_float) - 0usize];
+    ["Offset of field: ggml_type_traits_cpu::vec_dot"]
+        [::std::mem::offset_of!(ggml_type_traits_cpu, vec_dot) - 8usize];
+    ["Offset of field: ggml_type_traits_cpu::vec_dot_type"]
+        [::std::mem::offset_of!(ggml_type_traits_cpu, vec_dot_type) - 16usize];
+    ["Offset of field: ggml_type_traits_cpu::nrows"]
+        [::std::mem::offset_of!(ggml_type_traits_cpu, nrows) - 24usize];
+};
+unsafe extern "C" {
+    pub fn ggml_get_type_traits_cpu(type_: ggml_type) -> *const ggml_type_traits_cpu;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_init();
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_init() -> ggml_backend_t;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_is_cpu(backend: ggml_backend_t) -> bool;
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_set_n_threads(
+        backend_cpu: ggml_backend_t,
+        n_threads: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_set_threadpool(
+        backend_cpu: ggml_backend_t,
+        threadpool: ggml_threadpool_t,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_set_abort_callback(
+        backend_cpu: ggml_backend_t,
+        abort_callback: ggml_abort_callback,
+        abort_callback_data: *mut ::std::os::raw::c_void,
+    );
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_set_use_ref(backend_cpu: ggml_backend_t, use_ref: bool);
+}
+unsafe extern "C" {
+    pub fn ggml_backend_cpu_reg() -> ggml_backend_reg_t;
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_fp32_to_fp32(arg1: *const f32, arg2: *mut f32, arg3: i64);
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_fp32_to_i32(arg1: *const f32, arg2: *mut i32, arg3: i64);
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_fp32_to_fp16(arg1: *const f32, arg2: *mut ggml_fp16_t, arg3: i64);
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_fp16_to_fp32(arg1: *const ggml_fp16_t, arg2: *mut f32, arg3: i64);
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_fp32_to_bf16(arg1: *const f32, arg2: *mut ggml_bf16_t, arg3: i64);
+}
+unsafe extern "C" {
+    pub fn ggml_cpu_bf16_to_fp32(arg1: *const ggml_bf16_t, arg2: *mut f32, arg3: i64);
 }
 pub type __builtin_va_list = *mut ::std::os::raw::c_char;
 #[repr(C)]

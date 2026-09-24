@@ -1,7 +1,7 @@
 use std::{collections::HashSet, sync::LazyLock};
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{ItemMod, Pat, PatStruct, Path, Signature, Type, TypePath, TypePtr, parse_macro_input};
 static _TENSOR_ADJACENT_TYPES: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["ggml_tensor", "ggml_context", "usize", "f32", "c_int"].into());
@@ -176,64 +176,222 @@ fn extract_sig(sig: &Signature) -> Function {
         output,
     }
 }
+//gguf_get_val_i8
+fn any_int() -> proc_macro2::TokenStream {
+    let bits = [8, 16, 32, 64];
+    let names: Vec<_> = bits
+        .map(|num| [format_ident!("u{num}"), format_ident!("i{num}")])
+        .as_flattened()
+        .to_vec();
+
+    let stream = names.iter().map(|a| {
+        quote! {
+            impl From<#a> for AnyInt {
+                fn from(value: #a) -> Self {
+                    AnyInt(value as i64)
+                }
+            }
+            impl From<AnyInt> for #a {
+                fn from(value: AnyInt) -> Self {
+                    value.0 as #a
+                }
+            }
+        }
+    });
+    quote! {
+        #[derive(Clone,Copy,Debug)]
+        pub struct AnyInt(i64);
+        #(#stream)*
+    }
+    //let signs = ['i','u'];
+}
+
+fn dyn_type_impl(ty: &syn::ItemEnum) -> Option<proc_macro2::TokenStream> {
+    fn scalar_getter_fn(name: &str) -> Option<String> {
+        let suffix = name.split("_").last()?;
+        let r = match suffix {
+            "BOOL" => "bool".to_string(),
+            "ARRAY" => None?,
+            "STRING" => None?,
+            other if other.contains("UINT") => other.replace("UINT", "u"),
+            other if other.contains("INT") => other.replace("INT", "i"),
+            other if other.contains("FLOAT") => other.replace("FLOAT", "f"),
+            _ => None?,
+        };
+        Some(r)
+    }
+    let _int_arms: Vec<_> = ty
+        .variants
+        .iter()
+        .filter_map(|v| {
+            let varn_str = v.ident.to_string();
+            let sg = scalar_getter_fn(&varn_str)?;
+
+            // Filter for u8..u64 and i8..i64
+            if sg.starts_with('i') || sg.starts_with('u') {
+                let varn = &v.ident;
+                let getter = format_ident!("gguf_get_val_{sg}");
+                Some(quote! {
+                    gguf_type::#varn => Ok(Kv(|ctx, key_id| {
+                        AnyInt::from(unsafe { #getter(ctx, key_id) })
+                    })),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    let item_name = ty.ident.to_string();
+    if item_name.as_str() != "gguf_type" {
+        return None;
+    };
+    let ggml_scalars = ["F32", "F64", "I8", "I16", "I32", "I64"];
+    let ggml_scalar_impl = ggml_scalars.iter().map(|s| {
+        let ggml_ty = format_ident!("GGML_TYPE_{}", s);
+        let r_ty = format_ident!("{}", s.to_lowercase());
+
+        quote! {
+            impl GgmlScalar for #r_ty {
+                type SelfT = #r_ty;
+                const GGML_SCALAR: ggml_type = ggml_type::#ggml_ty;
+            }
+        }
+    });
+    let trait_impl = quote! {
+        pub trait GgmlScalar {
+            type SelfT;
+            const GGML_SCALAR: ggml_type;
+        }
+        pub trait GgufScalar {
+            type SelfT;
+            const GGUF_SCALAR: gguf_type;
+        }
+        pub struct Kv<T>(unsafe extern "C" fn(*const gguf_context, i64) -> T);
+        impl<T> Kv<T> {
+            pub fn exec(&self, ctx: *const gguf_context, key_id: i64) -> T {
+                unsafe { (self.0)(ctx, key_id) }
+            }
+        }
+    };
+    fn impl_trait(v: &syn::Variant) -> Option<proc_macro2::TokenStream> {
+        let varn = v.ident.to_string();
+        let sg = scalar_getter_fn(&varn)?;
+        let ty = format_ident!("{sg}");
+
+        let varn = format_ident!("{varn}");
+        let getter = format_ident!("gguf_get_val_{sg}");
+
+        println!("{varn} {ty:?},{getter:?}");
+        let q = quote! {
+            impl GgufScalar for #ty {
+                type SelfT = #ty;
+                const GGUF_SCALAR: gguf_type = gguf_type::#varn;
+            }
+
+            impl TryFrom<gguf_type> for Kv<#ty> {
+                type Error = gguf_type;
+                fn try_from(value: gguf_type) -> Result<Self, Self::Error> {
+                    if value == gguf_type::#varn {
+                        Ok(Kv(#getter))
+                    } else {
+                        Err(gguf_type::#varn)
+                    }
+                }
+            }
+        };
+        //println!("{q:?}");
+        Some(q)
+    }
+    let kv_impl = ty.variants.iter().flat_map(impl_trait);
+    /*for v in &ty.variants {
+        let varn = v.ident.to_string();
+        if let Some(sg) = scalar_getter_fn(&varn) {
+            impl_trait(varn, sg);
+        }
+    }*/
+    Some(quote! {
+        #trait_impl
+        #(#kv_impl)*
+        #(#ggml_scalar_impl)*
+    })
+}
 #[proc_macro_attribute]
 pub fn parse_ggml(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemMod);
     if input.content.is_none() {
         println!("No content")
     }
-    if let Some((_, content)) = &input.content {
-        //println!("Got {} items", content.len());
-        for item in content {
-            //println!("{item:?}");
-            match item {
-                //syn::Item::Const(item_const) => todo!(),
-                syn::Item::Enum(item_enum) => {
-                    let item_name = item_enum.ident.to_string();
-                    println!("{item_name}");
+    //let mut dyn_type = quote! {};
+    fn parse_item(item: &syn::Item) -> proc_macro2::TokenStream {
+        //println!("{item:?}");
+        match item {
+            //syn::Item::Const(item_const) => todo!(),
+            syn::Item::Enum(item_enum) => {
+                if let Some(dt) = dyn_type_impl(item_enum) {
+                    quote! {#item_enum #dt}
+                } else {
+                    quote! {#item_enum}
                 }
-                syn::Item::ForeignMod(foreign) => {
-                    for i in &foreign.items {
-                        if let syn::ForeignItem::Fn(func) = i {
-                            let sig = &func.sig;
-                            let func = extract_sig(sig);
-                            println!("{func:?}");
-                        }
-                        /*let name = match i {
-                            syn::ForeignItem::Fn(func) => func.sig.ident.to_string(),
-                            syn::ForeignItem::Static(st) => st.ident.to_string(),
-                            syn::ForeignItem::Type(ty) => ty.ident.to_string(),
-                            _ => String::new(),
-                        };
-                        println!("{name}")*/
-                    }
-                }
-                //syn::Item::ExternCrate(item_extern_crate) => todo!(),
-                syn::Item::Fn(_item_fn) => {}
-                //syn::Item::ForeignMod(item_foreign_mod) => todo!(),
-                //syn::Item::Impl(item_impl) => todo!(),
-                //syn::Item::Macro(item_macro) => todo!(),
-                //syn::Item::Mod(item_mod) => todo!(),
-                //syn::Item::Static(item_static) => todo!(),
-                //syn::Item::Struct(item_struct) => todo!(),
-                //syn::Item::Trait(item_trait) => todo!(),
-                //syn::Item::TraitAlias(item_trait_alias) => todo!(),
-                //syn::Item::Type(item_type) => todo!(),
-                //syn::Item::Union(item_union) => todo!(),
-                // syn::Item::Use(item_use) => todo!(),
-                //syn::Item::Verbatim(token_stream) => todo!(),
-                _ => (),
+                //let item_name = item_enum.ident.to_string();
+                //println!("{item_name}");
             }
+            syn::Item::ForeignMod(foreign) => {
+                for i in &foreign.items {
+                    if let syn::ForeignItem::Fn(func) = i {
+                        let sig = &func.sig;
+                        let func = extract_sig(sig);
+                        //println!("{func:?}");
+                    }
+                    /*let name = match i {
+                        syn::ForeignItem::Fn(func) => func.sig.ident.to_string(),
+                        syn::ForeignItem::Static(st) => st.ident.to_string(),
+                        syn::ForeignItem::Type(ty) => ty.ident.to_string(),
+                        _ => String::new(),
+                    };
+                    println!("{name}")*/
+                }
+                quote! {#foreign}
+            }
+            //syn::Item::ExternCrate(item_extern_crate) => todo!(),
+            //syn::Item::Fn(_item_fn) => {}
+            //syn::Item::ForeignMod(item_foreign_mod) => todo!(),
+            //syn::Item::Impl(item_impl) => todo!(),
+            //syn::Item::Macro(item_macro) => todo!(),
+            //syn::Item::Mod(item_mod) => todo!(),
+            //syn::Item::Static(item_static) => todo!(),
+            //syn::Item::Struct(item_struct) => todo!(),
+            //syn::Item::Trait(item_trait) => todo!(),
+            //syn::Item::TraitAlias(item_trait_alias) => todo!(),
+            //syn::Item::Type(item_type) => todo!(),
+            //syn::Item::Union(item_union) => todo!(),
+            // syn::Item::Use(item_use) => todo!(),
+            //syn::Item::Verbatim(token_stream) => todo!(),
+            other => quote! {#other},
         }
     }
+    let expanded = if let Some((_, content)) = &input.content {
+        let any_int = any_int(); //
+        //println!("Got {} items", content.len());
+        let stream = content.iter().map(parse_item);
+        quote! {
+
+            #[allow(non_camel_case_types,non_snake_case,non_upper_case_globals)]
+            pub mod ffi {
+            #any_int
+            #(#stream)*
+            }
+        }
+    } else {
+        quote! {
+            #[allow(non_camel_case_types,non_snake_case,non_upper_case_globals)]
+            pub mod ffi {#input}
+
+        }
+    };
     /*let name = &input.sig.ident;
     let block = &input.block;
     let vis = &input.vis;
     let sig = &input.sig;*/
-
-    let expanded = quote! {
-        #input
-    };
 
     TokenStream::from(expanded)
 }

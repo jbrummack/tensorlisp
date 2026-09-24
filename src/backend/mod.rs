@@ -3,6 +3,7 @@ pub mod dyntype;
 pub mod gguf;
 pub mod hashcons;
 pub mod list;
+pub mod loader;
 pub mod stupid_lisp;
 use crate::backend::ffi::ggml_tensor;
 
