@@ -10,3 +10,7 @@ ggml-sys.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 lasso.workspace = true
+
+[lib]
+# Archived code; its doc comments contain sketches, not runnable examples.
+doctest = false

@@ -1,0 +1,11 @@
+[package]
+name = "gguf-loader"
+version.workspace = true
+edition.workspace = true
+description = "Archived experiment: first GGUF loader (hierarchical tensor names, quantise). Superseded by tensorlisp::gguf and `tl`."
+publish = false
+
+[dependencies]
+ggml-sys.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

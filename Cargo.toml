@@ -5,10 +5,12 @@ members = [
     "crates/ggml-sys",
     "crates/ggml-codegen",
     "crates/tensorlisp",
+    "crates/tensorlisp-cli",
     "crates/importers",
     "experiments/handrolled-lisp",
+    "experiments/gguf-loader",
 ]
-default-members = ["crates/tensorlisp"]
+default-members = ["crates/tensorlisp", "crates/tensorlisp-cli"]
 
 [workspace.package]
 version = "0.1.0"

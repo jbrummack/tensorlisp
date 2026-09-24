@@ -11,3 +11,10 @@ ggml-codegen.workspace = true
 [build-dependencies]
 bindgen = "0.72.1"
 cc = "1.4.3"
+
+[features]
+default = ["platform-backends"]
+# Enable every backend the target platform supports (Metal on macOS).
+# Turn default features off to pick backends explicitly.
+platform-backends = []
+metal = []

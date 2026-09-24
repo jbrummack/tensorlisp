@@ -3,6 +3,9 @@ use crate::ffi::ggml_tensor;
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+/// Whether the Metal backend was compiled in.
+pub const HAS_METAL: bool = cfg!(ggml_metal);
+
 pub struct Tensor(*mut ggml_tensor);
 impl Tensor {
     fn get(&self) -> &ggml_tensor {

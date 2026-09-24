@@ -2,11 +2,11 @@
 name = "tensorlisp"
 version.workspace = true
 edition.workspace = true
+description = "Runtime: loads a tensorlisp program + weights from GGUF and runs it on ggml."
 
 [dependencies]
+chez.workspace = true
 ggml-sys.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-chez.workspace = true
+ndarray = "0.17.2"

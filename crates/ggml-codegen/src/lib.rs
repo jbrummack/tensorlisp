@@ -1,5 +1,7 @@
 use std::{collections::HashSet, sync::LazyLock};
 
+mod scheme;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemMod, Pat, PatStruct, Path, Signature, Type, TypePath, TypePtr, parse_macro_input};
@@ -373,12 +375,14 @@ pub fn parse_ggml(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let any_int = any_int(); //
         //println!("Got {} items", content.len());
         let stream = content.iter().map(parse_item);
+        let scheme = scheme::generate(content);
         quote! {
 
             #[allow(non_camel_case_types,non_snake_case,non_upper_case_globals)]
             pub mod ffi {
             #any_int
             #(#stream)*
+            #scheme
             }
         }
     } else {
