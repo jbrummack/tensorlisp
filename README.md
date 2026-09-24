@@ -20,6 +20,9 @@ crates/
 experiments/
   handrolled-lisp/ archived hand-written lisp interpreters (superseded by Chez)
   gguf-loader/     archived first GGUF loader (superseded by tensorlisp::gguf and `tl`)
+ports/             real model ports: program, PyTorch reference script, nix flake
+  tipsv2/          TIPSv2 B/14 text and vision encoders (match PyTorch, run on Metal)
+docs/              design notes, e.g. stdlib-candidates.md
 examples/          tensorlisp programs (*.tl)
 scripts/           build helpers
 vendor/
@@ -90,13 +93,16 @@ A tensorlisp GGUF is a normal GGUF (weights as tensors) plus three keys:
 ```
 
 - Programs run in a sandbox: R6RS `(rnrs base)`, `lists`, `control`, fixnum
-  and flonum arithmetic, plus `(tensorlisp)`. No eval, ports, files or FFI.
+  and flonum arithmetic, the R5RS `quotient remainder modulo
+  exact->inexact inexact->exact`, Chez's `iota list-head format fold-left
+  fold-right`, plus `(tensorlisp)`. No eval, ports, files or FFI.
 - **Shapes inside Scheme are in ggml order**, innermost first: a numpy array
   of shape `(batch, 784)` is `(784 batch)`. The Rust API uses ndarray order;
   the memory layout is the same.
 - `(model (inputs [name dtype (dims ...)] ...) body ...)` declares the inputs;
-  dims are optional and may be `#f` or a symbol to accept any size. Only `f32`
-  inputs for now.
+  dims are optional and may be `#f` or a symbol to accept any size. Input
+  dtypes are `f32` and `i32` (e.g. token ids); the Rust API and `.npy` files
+  pass i32 inputs as whole-number floats.
 - `(outputs [name tensor] ...)` ends the body. An optional integer after the
   tensor sets the output's rank; by default trailing size-1 dimensions are
   dropped, as ggml does.
@@ -105,7 +111,8 @@ A tensorlisp GGUF is a normal GGUF (weights as tensors) plus three keys:
   dashes: `ggml_conv_2d(ctx, a, b, ...)` is `(ggml-conv-2d a b ...)`. Pass `#f`
   for optional tensor arguments (e.g. a mask). ggml enum values are available
   under their C names (`GGML_TYPE_F16`, ...).
-- `(shape t)` (ggml order) and `(dtype t)` inspect tensors.
+- `(shape t)`, `(strides t)` (byte strides, as `ggml-view-*` takes them; both
+  ggml order) and `(dtype t)` inspect tensors.
 - `(tap "name" t [rank])` returns `t` and marks it as an intermediate result
   that `tl run --taps` / `tl compare` (or `RunOptions::taps`) can read back.
 
@@ -149,7 +156,9 @@ tl compare weights.gguf --program net.ss -i x=x.npy --reference-dir ref/
 #   ref/ holds NAME.npy for outputs and taps, dumped from the reference model;
 #   reports each in tap order and the first failure; exit code 2 on mismatch
 tl pack weights.gguf --program net.ss -o model.gguf        # final file
-tl quantize model.gguf model-q8.gguf -t q8_0               # keeps 1-D tensors by default
+tl quantize model.gguf model-q8.gguf -t q8_0 -i x=1,3,224,224
+#   builds the program's graph and converts only weights that feed matmuls /
+#   embedding lookups (others, e.g. added position embeddings, stay f32)
 tl run model-q8.gguf -i x=x.npy -o out/ --repeat 20        # outputs as .npy + timing
 ```
 

@@ -13,3 +13,13 @@ fn generated_scheme_bindings() {
     assert!(!scheme::OP_NAMES.split(' ').any(|n| n == "ggml-new-f32"));
     assert!(scheme::CONSTANTS.contains("(define GGML_TYPE_F32 0)"));
 }
+
+#[test]
+fn bool_parameters_are_int_sized() {
+    // See the comment in ggml-codegen: stdbool stack arguments break Chez's arm64 macOS FFI.
+    assert!(scheme::RAW.contains(
+        r#"(define ggml_im2col (foreign-procedure "ggml_im2col" (uptr uptr uptr integer-32 integer-32 integer-32 integer-32 integer-32 integer-32 boolean unsigned-32) uptr))"#
+    ));
+    // Returns stay stdbool.
+    assert!(scheme::RAW.contains(r#"(define ggml_is_contiguous (foreign-procedure "ggml_is_contiguous" (uptr) stdbool))"#));
+}

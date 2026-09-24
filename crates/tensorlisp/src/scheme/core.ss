@@ -6,6 +6,7 @@
 
 (define tl_tensor_ne (foreign-procedure "tl_tensor_ne" (uptr int) integer-64))
 (define tl_tensor_type (foreign-procedure "tl_tensor_type" (uptr) int))
+(define tl_tensor_nb (foreign-procedure "tl_tensor_nb" (uptr int) size_t))
 
 ;; Tensors remember the ggml context they belong to, so a tensor kept from an
 ;; earlier graph build (whose context is freed) can't be used again.
@@ -81,6 +82,13 @@
     (let loop ([i (- (ggml_n_dims p) 1)] [dims '()])
       (if (< i 0) dims (loop (- i 1) (cons (tl_tensor_ne p i) dims))))))
 
+;; Byte strides (nb0 nb1 ...) in ggml order, one per dimension of (shape t);
+;; what ggml-view-* take as nb arguments.
+(define (strides t)
+  (let ([p (%tensor-ptr 'strides t)])
+    (let loop ([i (- (ggml_n_dims p) 1)] [nbs '()])
+      (if (< i 0) nbs (loop (- i 1) (cons (tl_tensor_nb p i) nbs))))))
+
 (define (dtype t)
   (string->symbol (ggml_type_name (tl_tensor_type (%tensor-ptr 'dtype t)))))
 
@@ -152,7 +160,7 @@
     [(_ (inputs [name type dims ...] ...) body ...)
      (%register-model! '((name type dims ...) ...) (lambda (name ...) body ...))]))
 
-(define %dtypes '(f32))
+(define %dtypes '(f32 i32))
 
 (define (%check-input-spec spec)
   (unless (and (list? spec) (<= 2 (length spec) 3) (symbol? (car spec)))
@@ -188,12 +196,15 @@
       [(memq (car xs) seen) (loop (cdr xs) seen)]
       [else (loop (cdr xs) (cons (car xs) seen))])))
 
-;; Environment programs are evaluated in: pure R6RS plus (tensorlisp). No
-;; eval, ports, files or foreign-procedure.
+;; Environment programs are evaluated in: pure R6RS (plus the R5RS names like
+;; quotient), a few pure Chez utilities, and (tensorlisp). No eval, ports,
+;; files or foreign-procedure.
 (define (%program-environment)
   (copy-environment
     (environment '(rnrs base) '(rnrs lists) '(rnrs control)
                  '(rnrs arithmetic fixnums) '(rnrs arithmetic flonums)
+                 '(only (rnrs r5rs) quotient remainder modulo exact->inexact inexact->exact)
+                 '(only (chezscheme) iota list-head format fold-left fold-right)
                  '(tensorlisp))
     #t))
 
@@ -222,13 +233,15 @@
                       (map (lambda (d) (and (fixnum? d) d)) (caddr spec)))))
          (car (unbox slot)))))
 
-;; Creates an input tensor of type f32 with ggml dims ne (a list of 1-4 sizes).
-(define (%new-input ctx name ne)
-  (let ([t (case (length ne)
-             [(1) (apply ggml_new_tensor_1d ctx GGML_TYPE_F32 ne)]
-             [(2) (apply ggml_new_tensor_2d ctx GGML_TYPE_F32 ne)]
-             [(3) (apply ggml_new_tensor_3d ctx GGML_TYPE_F32 ne)]
-             [(4) (apply ggml_new_tensor_4d ctx GGML_TYPE_F32 ne)])])
+;; Creates an input tensor for spec (name dtype ...) with ggml dims ne (1-4 sizes).
+(define (%new-input ctx spec ne)
+  (let* ([type (case (cadr spec) [(f32) GGML_TYPE_F32] [(i32) GGML_TYPE_I32])]
+         [name (symbol->string (car spec))]
+         [t (case (length ne)
+              [(1) (apply ggml_new_tensor_1d ctx type ne)]
+              [(2) (apply ggml_new_tensor_2d ctx type ne)]
+              [(3) (apply ggml_new_tensor_3d ctx type ne)]
+              [(4) (apply ggml_new_tensor_4d ctx type ne)])])
     (ggml_set_name t name)
     (ggml_set_input t)
     t))
@@ -264,7 +277,7 @@
     (set! %op 'inputs)
     (set! %pending '())
     (parameterize ([%ctx ctx] [%weights weights] [%taps tap-slot])
-      (let* ([inputs (map (lambda (spec ne) (%new-input ctx (symbol->string (car spec)) ne))
+      (let* ([inputs (map (lambda (spec ne) (%new-input ctx spec ne))
                           (car m) input-dims)]
              [outs (apply (cdr m) (map (lambda (p) (make-tensor p ctx)) inputs))])
         (unless (and (list? outs) (pair? outs))

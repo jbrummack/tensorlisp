@@ -139,10 +139,11 @@ fn porting_workflow() {
     assert!(dir.join("out/hidden.npy").exists());
 
     // quantize keeps the program; results stay close.
-    let (code, v) = tl_json(&dir, &["quantize", "mlp.gguf", "mlp-q8.gguf", "-t", "q8_0", "--min-elements", "0"]);
+    let (code, v) = tl_json(&dir, &["quantize", "mlp.gguf", "mlp-q8.gguf", "-t", "q8_0", "--min-elements", "0", "-i", "x=4,32"]);
     assert_eq!(code, 0);
     assert_eq!(find(&v["tensors"], "name", "fc1.weight")["to"], "q8_0");
-    assert_eq!(find(&v["tensors"], "name", "fc1.bias")["kept_because"], "1-D (use --include-1d)");
+    // The graph shows biases feed ADD, so they stay f32 whatever their rank.
+    assert!(find(&v["tensors"], "name", "fc1.bias")["kept_because"].as_str().unwrap().starts_with("used by ADD"));
     let (code, v) = tl_json(&dir, &["compare", "mlp-q8.gguf", "--device", "cpu", "-i", "x=x.npy", "-r", "logits=ref/logits.npy", "--atol", "0.1", "--rtol", "0.1"]);
     assert_eq!(code, 0, "{v}");
     assert!(v["comparisons"][0]["cosine_similarity"].as_f64().unwrap() > 0.999);

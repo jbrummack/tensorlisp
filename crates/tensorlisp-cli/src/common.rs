@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result, bail};
 use ndarray::ArrayD;
-use tensorlisp::{Device, Model, Program};
+use tensorlisp::{Device, InputSpec, Model, Program};
 
 use crate::{ModelArgs, npy};
 
@@ -151,4 +151,48 @@ mod tests {
         assert!(glob_match("a*b*c", "axxbyyc"));
         assert!(!glob_match("a*b*c", "axxbyy"));
     }
+}
+
+/// The declared shape in numpy order, if every dimension is fixed.
+fn declared_shape(spec: &InputSpec) -> Option<Vec<usize>> {
+    let dims = spec.dims.as_ref()?;
+    dims.iter().rev().map(|d| d.map(|d| d as usize)).collect()
+}
+
+fn declared_string(spec: &InputSpec) -> String {
+    match &spec.dims {
+        Some(dims) => format!(
+            "[{}]",
+            dims.iter().rev().map(|d| d.map_or("_".into(), |d| d.to_string())).collect::<Vec<_>>().join(", ")
+        ),
+        None => "any shape".into(),
+    }
+}
+
+/// Input shapes (numpy order) from `NAME=1,3,224,224` / `NAME=file.npy`
+/// arguments, falling back to the program's fixed declared shapes.
+pub fn resolve_input_shapes(model: &Model, args: &[String]) -> Result<Vec<(String, Vec<usize>)>> {
+    let mut shapes: Vec<(String, Vec<usize>)> = args
+        .iter()
+        .map(|arg| {
+            let (name, value) = split_assignment(arg)?;
+            let shape = if value.ends_with(".npy") { npy::read(value.as_ref())?.shape().to_vec() } else { parse_shape(value)? };
+            Ok((name.to_string(), shape))
+        })
+        .collect::<Result<_>>()?;
+    for spec in model.inputs() {
+        if shapes.iter().any(|(n, _)| *n == spec.name) {
+            continue;
+        }
+        match declared_shape(spec) {
+            Some(shape) => shapes.push((spec.name.clone(), shape)),
+            None => bail!(
+                "input {:?} ({}) needs a shape: --input {}=DIMS (numpy order)",
+                spec.name,
+                declared_string(spec),
+                spec.name
+            ),
+        }
+    }
+    Ok(shapes)
 }

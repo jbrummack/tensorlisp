@@ -175,3 +175,31 @@ fn outputs_can_share_intermediates() {
     assert_close(&out["t"], &pre.t().to_owned());
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn i32_inputs_and_strides() {
+    // Rows 0..8 of fc1.weight ([8, 4], ggml [4, 8]) looked up by i32 ids.
+    let weights = Weights::new();
+    let program = r#"
+      (model (inputs [ids i32 (n)])
+        (define rows (ggml-get-rows (weight "fc1.weight") ids))
+        (define nb (strides (weight "fc1.weight")))
+        ;; Second column of the table as a strided view: offset nb0 = 4 bytes, rows nb1 apart.
+        (outputs [rows rows 2] [column (ggml-cont (ggml-view-2d (weight "fc1.weight") 1 8 (cadr nb) (car nb))) 2]))
+    "#;
+    let path = write_model("i32", program, &weights);
+    let model = Model::load(&path, Device::Cpu).unwrap();
+    let ids = ArrayD::from_shape_vec(IxDyn(&[3]), vec![2.0, 0.0, 7.0]).unwrap();
+    let out = model.run(&[("ids", ids.view())]).unwrap();
+    for (i, &id) in [2usize, 0, 7].iter().enumerate() {
+        assert_eq!(out["rows"].index_axis(ndarray::Axis(0), i), weights.w1.row(id).into_dyn());
+    }
+    assert_eq!(out["column"].shape(), &[8, 1]);
+    assert_eq!(out["column"].iter().copied().collect::<Vec<_>>(), weights.w1.column(1).to_vec());
+
+    // Non-integers are rejected for i32 inputs.
+    let bad = ArrayD::from_shape_vec(IxDyn(&[1]), vec![1.5]).unwrap();
+    let err = model.run(&[("ids", bad.view())]).unwrap_err().to_string();
+    assert!(err.contains("is i32 but contains 1.5"), "{err}");
+    std::fs::remove_file(path).unwrap();
+}

@@ -147,7 +147,19 @@ struct Function {
 
 impl Function {
     fn raw_definition(&self) -> String {
-        let params: Vec<_> = self.params.iter().map(|(_, k)| k.foreign_type()).collect();
+        // C bool parameters are passed as Chez's int-sized `boolean`: with
+        // `stdbool`, Chez (10.x, tarm64osx) misplaces the stack arguments that
+        // follow a bool passed on the stack (e.g. ggml_im2col's dst_type).
+        // An int holding 0/1 has the same low byte in registers and in Apple's
+        // packed stack layout, and a full slot elsewhere.
+        let params: Vec<_> = self
+            .params
+            .iter()
+            .map(|(_, k)| match k.foreign_type() {
+                "stdbool" => "boolean",
+                other => other,
+            })
+            .collect();
         format!(
             "(define {0} (foreign-procedure \"{0}\" ({1}) {2}))\n",
             self.name,

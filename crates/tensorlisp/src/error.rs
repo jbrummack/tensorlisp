@@ -6,7 +6,7 @@ pub enum Error {
     Gguf(String),
     #[error("program: {0}")]
     Program(String),
-    #[error("scheme: {0}")]
+    #[error(transparent)]
     Scheme(#[from] chez::Error),
     #[error("input: {0}")]
     Input(String),

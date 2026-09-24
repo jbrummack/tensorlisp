@@ -237,10 +237,15 @@ impl Model {
         }
         let (_, graph) = inner.graph.as_ref().unwrap();
 
-        for (&t, array) in graph.inputs.iter().zip(&ordered) {
+        for ((&t, array), spec) in graph.inputs.iter().zip(&ordered).zip(&self.inputs) {
             let data = array.as_standard_layout();
-            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * size_of::<f32>()) };
-            guard::tensor_set(t, bytes)?;
+            if spec.dtype == "i32" {
+                guard::tensor_set(t, &to_i32_bytes(&spec.name, data.as_slice().unwrap())?)?;
+            } else {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * size_of::<f32>()) };
+                guard::tensor_set(t, bytes)?;
+            }
         }
         match guard::sched_graph_compute(inner.sched, graph.graph) {
             Ok(ggml_status::GGML_STATUS_SUCCESS) => {}
@@ -287,14 +292,29 @@ impl Model {
                 if matches.next().is_some() {
                     return Err(Error::Input(format!("input {:?} given twice", spec.name)));
                 }
-                if spec.dtype != "f32" {
-                    return Err(Error::Input(format!("input {:?} is {}, only f32 is supported", spec.name, spec.dtype)));
+                if spec.dtype != "f32" && spec.dtype != "i32" {
+                    return Err(Error::Input(format!("input {:?} has unsupported dtype {}", spec.name, spec.dtype)));
                 }
                 check_shape(spec, shape_of(value))?;
                 Ok(value)
             })
             .collect()
     }
+}
+
+/// i32 inputs are passed as f32 arrays holding whole numbers.
+fn to_i32_bytes(name: &str, values: &[f32]) -> Result<Vec<u8>> {
+    values
+        .iter()
+        .map(|&v| {
+            if v.fract() == 0.0 && v >= i32::MIN as f32 && v <= i32::MAX as f32 {
+                Ok((v as i32).to_le_bytes())
+            } else {
+                Err(Error::Input(format!("input {name:?} is i32 but contains {v}")))
+            }
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|b| b.concat())
 }
 
 /// Reads graph results back as ndarrays of their declared rank.

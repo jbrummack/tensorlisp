@@ -21,12 +21,16 @@ use crate::error::{Error, Result};
 const CORE: &str = include_str!("core.ss");
 
 /// Names exported to programs by `(tensorlisp)`, besides generated ops and constants.
-const PUBLIC: &str = "tensor? shape dtype weight weight? model inputs outputs tap";
+const PUBLIC: &str = "tensor? shape strides dtype weight weight? model inputs outputs tap";
 /// Host entry points, only visible from Rust.
 const HOST: &str = "$tl-load-program $tl-build $tl-unload $tl-abort-handler";
 
 extern "C" fn tl_tensor_ne(t: *const ggml_tensor, i: i32) -> i64 {
     unsafe { (*t).ne[i as usize] }
+}
+
+extern "C" fn tl_tensor_nb(t: *const ggml_tensor, i: i32) -> usize {
+    unsafe { (*t).nb[i as usize] }
 }
 
 extern "C" fn tl_tensor_type(t: *const ggml_tensor) -> i32 {
@@ -58,6 +62,7 @@ fn boot() -> Result<Scheme> {
         }
         scheme.register_foreign("tl_tensor_ne", tl_tensor_ne as *const _)?;
         scheme.register_foreign("tl_tensor_type", tl_tensor_type as *const _)?;
+        scheme.register_foreign("tl_tensor_nb", tl_tensor_nb as *const _)?;
     }
     scheme.eval(&library_source())?;
 

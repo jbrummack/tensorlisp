@@ -15,5 +15,5 @@ ggml asserts are caught: at graph build via a Chez foreign-callable abort handle
 ChezScheme is the submodule `vendor/ChezScheme`, built with `scripts/build-chez.sh` into `vendor/chez` (gitignored).
 
 ## plan
-done: runtime (Model::load/run, taps, graph info), assert recovery, `tl` CLI. Later: TL_BIN binary programs, C bindings, rust preprocessors (autoprocessors), vulkan/cuda backends.
+done: runtime (Model::load/run, taps, graph info), assert recovery, `tl` CLI, first real port `ports/tipsv2` (TIPSv2 B/14 text + vision encoders, match PyTorch; reference env is a CPU-only torch nix flake, clean with `nix store gc`). Reusable helpers found while porting go into `docs/stdlib-candidates.md` (to become the tl stdlib). User will add the tokenizer (SentencePiece) later. `tl quantize` is graph-aware (needs -i shapes). Generated FFI passes C bool params as `boolean` (Chez stdbool stack-arg bug on arm64 macOS). Planned: multiple entry points per file (docs/design/multiple-entry-points.md). Later: TL_BIN binary programs, C bindings, rust preprocessors (autoprocessors), vulkan/cuda backends.
 GGUF keys: TL_TXT (utf8 program), TL_BIN (binary), TL_VER (u32 version).
