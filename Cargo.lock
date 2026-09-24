@@ -93,6 +93,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chez"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "thiserror",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -502,6 +511,7 @@ name = "tensorlisp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chez",
  "ggml-sys",
  "thiserror",
 ]

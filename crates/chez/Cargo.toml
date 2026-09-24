@@ -1,0 +1,13 @@
+[package]
+name = "chez"
+version.workspace = true
+edition.workspace = true
+description = "Embeds ChezScheme (vendor/chez) with its boot files, plus a small safe API."
+links = "chez"
+
+[dependencies]
+thiserror.workspace = true
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.4.3"

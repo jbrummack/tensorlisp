@@ -12,6 +12,7 @@ host-side work.
 
 ```
 crates/
+  chez/            embedded ChezScheme: raw bindings (chez::sys) + safe Scheme/Value API
   ggml-sys/        compiles vendor/ggml (CPU backend) and generates bindgen FFI
   ggml-codegen/    proc macro applied to the bindings (typed GGUF/ggml helpers)
   tensorlisp/      core library: GGUF loading, tensor access, (later) Chez host
@@ -39,15 +40,18 @@ vendor/chez/bin/scheme           # REPL
 cargo build --workspace
 ```
 
-`vendor/chez/lib/csv<version>/<machine>/` has `scheme.h`, `libkernel.a` and
-the boot files (`petite.boot`, `scheme.boot`), which is what the Rust host
-needs to embed Chez.
+The `chez` crate links `vendor/chez/lib/csv<version>/<machine>/libkernel.a`
+and embeds the boot files (`petite.boot`, `scheme.boot`) into the binary, so
+nothing has to be installed at runtime. Set `CHEZ_LIB_DIR` to use a different
+Chez install.
 
 ## Running the experiments
 
 These expect models in `models/`:
 
 ```sh
+cargo run -p chez --example repl                 # Chez REPL embedded in a Rust binary
+cargo run -p tensorlisp --example scheme_graph   # ggml graph built from Scheme
 cargo run -p tensorlisp --example inspect_gguf   # models/rfdetr-small-q4_K.gguf
 cargo run -p importers  --example onnx           # models/model_fp16.onnx
 cargo run -p importers  --example coreml         # models/model.mlmodel

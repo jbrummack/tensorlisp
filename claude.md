@@ -10,5 +10,5 @@ I evaluated several LISPs, even tried implementing a lisp by hand but i tried al
 i looked at other file formats/backends where support may later be added.
 
 ## layout
-Cargo workspace, see README.md. `crates/ggml-sys` builds vendored ggml (`vendor/ggml`) + bindgen into OUT_DIR; `crates/tensorlisp` is the core (gguf loading, later the Chez host); `crates/importers` has onnx/coreml readers; `experiments/handrolled-lisp` is the archived hand-written lisp attempts.
+Cargo workspace, see README.md. `crates/chez` embeds Chez (bindgen'd scheme.h + C shim for its macros, boot files via include_bytes!). `crates/ggml-sys` builds vendored ggml (`vendor/ggml`) + bindgen into OUT_DIR; `crates/tensorlisp` is the core (gguf loading, later the Chez host); `crates/importers` has onnx/coreml readers; `experiments/handrolled-lisp` is the archived hand-written lisp attempts.
 ChezScheme is the submodule `vendor/ChezScheme`, built with `scripts/build-chez.sh` into `vendor/chez` (gitignored).

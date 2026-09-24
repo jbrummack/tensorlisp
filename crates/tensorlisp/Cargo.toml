@@ -7,3 +7,6 @@ edition.workspace = true
 ggml-sys.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+chez.workspace = true
