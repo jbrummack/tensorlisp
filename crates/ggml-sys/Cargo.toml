@@ -1,0 +1,13 @@
+[package]
+name = "ggml-sys"
+version.workspace = true
+edition.workspace = true
+description = "Builds the vendored ggml (vendor/ggml) and exposes bindgen FFI bindings."
+links = "ggml"
+
+[dependencies]
+ggml-codegen.workspace = true
+
+[build-dependencies]
+bindgen = "0.72.1"
+cc = "1.4.3"

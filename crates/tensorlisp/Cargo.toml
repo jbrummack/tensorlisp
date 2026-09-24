@@ -1,0 +1,9 @@
+[package]
+name = "tensorlisp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ggml-sys.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

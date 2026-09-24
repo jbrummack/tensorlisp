@@ -1,20 +1,23 @@
-[package]
-name = "tensorlisp"
+[workspace]
+resolver = "3"
+members = [
+    "crates/ggml-sys",
+    "crates/ggml-codegen",
+    "crates/tensorlisp",
+    "crates/importers",
+    "experiments/handrolled-lisp",
+]
+default-members = ["crates/tensorlisp"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-flexbuffers = "25.12.19"
-lasso = "0.7.3"
-codegen = {path = "codegen"}
-thiserror = "2.0.20"
+[workspace.dependencies]
+ggml-sys = { path = "crates/ggml-sys" }
+ggml-codegen = { path = "crates/ggml-codegen" }
 anyhow = "1.0.104"
-half = "2.7.1"
+thiserror = "2.0.20"
+lasso = "0.7.3"
 prost = "0.14.4"
-
-
-
-[build-dependencies]
-bindgen = "0.72.1"
-cc = "1.4.3"
 prost-build = "0.14.4"

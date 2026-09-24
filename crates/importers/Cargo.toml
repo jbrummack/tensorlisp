@@ -1,0 +1,12 @@
+[package]
+name = "importers"
+version.workspace = true
+edition.workspace = true
+description = "Readers for other model formats (ONNX, CoreML/MIL) to translate into tensorlisp."
+
+[dependencies]
+anyhow.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true

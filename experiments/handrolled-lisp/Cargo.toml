@@ -1,0 +1,12 @@
+[package]
+name = "handrolled-lisp"
+version.workspace = true
+edition.workspace = true
+description = "Archived experiments: hand-written lisp interpreters, superseded by ChezScheme."
+publish = false
+
+[dependencies]
+ggml-sys.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+lasso.workspace = true
