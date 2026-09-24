@@ -11,7 +11,7 @@ use safetensors::{Dtype, SafeTensors};
 use serde_json::json;
 use tensorlisp::{DType, gguf::GgufFile, gguf::GgufWriter};
 
-use crate::common::{glob_match, human_bytes, print_json, read_program, shape_string, split_assignment};
+use crate::common::{glob_match, human_bytes, print_json, read_assets, read_program, shape_string, split_assignment};
 
 #[derive(Args)]
 pub struct ConvertArgs {
@@ -42,6 +42,9 @@ pub struct ConvertArgs {
     /// Add a string metadata key, KEY=VALUE (repeatable).
     #[arg(long)]
     pub meta: Vec<String>,
+    /// Embed a file the program reads with (asset NAME), NAME=PATH (repeatable).
+    #[arg(long = "asset")]
+    pub assets: Vec<String>,
 }
 
 #[derive(Args)]
@@ -54,6 +57,9 @@ pub struct PackArgs {
     /// Write to this file instead of replacing the model file.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+    /// Embed a file the program reads with (asset NAME), NAME=PATH (repeatable).
+    #[arg(long = "asset")]
+    pub assets: Vec<String>,
 }
 
 fn safetensors_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -162,8 +168,9 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
     };
     let renames: Vec<_> = args.rename.iter().map(|r| split_assignment(r)).collect::<Result<_>>()?;
     let program = args.program.as_ref().map(read_program).transpose()?;
+    let assets = read_assets(&args.assets)?;
     if let Some(program) = &program {
-        tensorlisp::program_inputs(program).context("the program is invalid")?;
+        tensorlisp::program_inputs(program, assets.clone()).context("the program is invalid")?;
     }
 
     let files = safetensors_files(&args.inputs)?;
@@ -182,6 +189,9 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
     for meta in &args.meta {
         let (key, value) = split_assignment(meta)?;
         writer.set_str(key, value)?;
+    }
+    for (name, bytes) in &assets {
+        writer.set_asset(name, bytes)?;
     }
 
     let mut report = Vec::new();
@@ -243,12 +253,15 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// Rewrites `model` with its tensors and metadata plus `program`.
-pub fn repack(model: &Path, output: &Path, program: &tensorlisp::Program) -> Result<()> {
+/// Rewrites `model` with its tensors and metadata plus `program` and `assets`.
+pub fn repack(model: &Path, output: &Path, program: &tensorlisp::Program, assets: &[(String, Vec<u8>)]) -> Result<()> {
     let file = GgufFile::open(model).with_context(|| format!("opening {}", model.display()))?;
     let mut writer = GgufWriter::new();
     writer.copy_metadata(&file);
     writer.set_program(program)?;
+    for (name, bytes) in assets {
+        writer.set_asset(name, bytes)?;
+    }
     for (i, info) in file.tensor_infos().into_iter().enumerate() {
         let file = &file;
         writer.add_tensor_with(&info.name, info.dtype, &info.shape, move || file.read_tensor_bytes(model, i as i64))?;
@@ -262,9 +275,16 @@ pub fn repack(model: &Path, output: &Path, program: &tensorlisp::Program) -> Res
 
 pub fn pack(args: &PackArgs, json: bool) -> Result<i32> {
     let program = read_program(&args.program)?;
-    let inputs = tensorlisp::program_inputs(&program).context("the program is invalid")?;
+    let new_assets = read_assets(&args.assets)?;
+    // The program sees the file's assets plus the new ones.
+    let mut all_assets = GgufFile::open(&args.model).with_context(|| format!("opening {}", args.model.display()))?.assets();
+    for (name, bytes) in &new_assets {
+        all_assets.retain(|(n, _)| n != name);
+        all_assets.push((name.clone(), bytes.clone()));
+    }
+    let inputs = tensorlisp::program_inputs(&program, all_assets).context("the program is invalid")?;
     let output = args.output.as_ref().unwrap_or(&args.model);
-    repack(&args.model, output, &program)?;
+    repack(&args.model, output, &program, &new_assets)?;
     if json {
         print_json(&json!({ "output": output, "inputs": inputs.iter().map(|i| &i.name).collect::<Vec<_>>() }))?;
     } else {

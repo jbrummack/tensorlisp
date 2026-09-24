@@ -35,8 +35,10 @@ enum Command {
     Pack(convert::PackArgs),
     /// Build the graph for given input shapes without running it, and list its nodes.
     Check(check::CheckArgs),
-    /// Run a model on .npy inputs.
+    /// Run a model on .npy inputs, or on raw inputs through its preprocess.
     Run(run::RunArgs),
+    /// Run only the program's preprocess on raw inputs and show or save the arrays.
+    Process(run::ProcessArgs),
     /// Run a model and compare outputs and taps with reference .npy files.
     Compare(run::CompareArgs),
     /// Quantize the weights of a GGUF file.
@@ -54,9 +56,17 @@ pub struct ModelArgs {
     /// Where to run: auto (GPU if available), cpu or gpu.
     #[arg(long, default_value = "auto")]
     pub device: common::DeviceArg,
+    /// Add or replace an asset the program reads with (asset NAME), NAME=PATH (repeatable).
+    #[arg(long = "asset")]
+    pub assets: Vec<String>,
 }
 
 fn main() {
+    // Exit quietly when stdout is closed early (e.g. `tl inspect ... | head`).
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     set_ggml_log_level(match cli.verbose {
         0 => LogLevel::Error,
@@ -69,6 +79,7 @@ fn main() {
         Command::Pack(args) => convert::pack(args, cli.json),
         Command::Check(args) => check::run(args, cli.json),
         Command::Run(args) => run::run(args, cli.json),
+        Command::Process(args) => run::process(args, cli.json),
         Command::Compare(args) => run::compare(args, cli.json),
         Command::Quantize(args) => quantize::run(args, cli.json),
     };

@@ -6,6 +6,8 @@
 ;;                       normalization); H and W multiples of 14, 448 native.
 ;;                       Other sizes interpolate the position embeddings
 ;;                       (bilinear, antialiased), like the reference.
+;; Raw input:            image, preprocessed like the checkpoint's image processor
+;;                        (448 x 448 bilinear, rescaled to [0, 1])
 ;; Outputs:              cls      [batch, 768]           first token after the final norm
 ;;                       register [batch, 768]           register token after the final norm
 ;;                       patches  [batch, H/14 * W/14, 768]  patch tokens, row-major
@@ -86,6 +88,11 @@
 (define (grid->tokens grid)
   (let ([w (dim grid 0)] [h (dim grid 1)] [c (dim grid 2)])
     (ggml-reshape-2d (ggml-cont (ggml-permute grid 1 2 0 3)) c (* w h))))
+
+;; --- Preprocessing: processor_config.json (448 x 448, resample 2 = bilinear, rescale 1/255)
+
+(preprocess ([image image])
+  (model-inputs [image (image->array (image-resize image 448 448 'bilinear))]))
 
 ;; --- TIPSv2 vision encoder
 

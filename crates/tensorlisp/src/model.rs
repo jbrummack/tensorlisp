@@ -18,8 +18,36 @@ use crate::{
     guard,
     program::Program,
     dtype::DType,
-    scheme::{InputSpec, LoadedProgram, Taps},
+    scheme::{InputSpec, LoadedProgram, RawKind, RawSpec, RawValue, Taps},
 };
+
+/// Options for [`Model::load_with`].
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Run this program instead of the file's (the file then needn't have one).
+    pub program: Option<Program>,
+    /// Assets in addition to (or replacing, by name) the file's `TL_ASSET.*`.
+    pub assets: Vec<(String, Vec<u8>)>,
+}
+
+/// A raw input for a program's `(preprocess ...)`.
+pub enum RawInput {
+    Text(String),
+    Image(image::DynamicImage),
+    Audio(autopro::audio::Audio),
+    Array(ArrayD<f32>),
+}
+
+impl RawInput {
+    fn kind(&self) -> RawKind {
+        match self {
+            RawInput::Text(_) => RawKind::Text,
+            RawInput::Image(_) => RawKind::Image,
+            RawInput::Audio(_) => RawKind::Audio,
+            RawInput::Array(_) => RawKind::Array,
+        }
+    }
+}
 
 /// Maximum number of nodes in one graph.
 const GRAPH_SIZE: usize = 16384;
@@ -156,20 +184,23 @@ fn load_weights(file: &GgufFile, path: &Path) -> Result<()> {
 
 impl Model {
     pub fn load(path: impl AsRef<Path>, device: Device) -> Result<Model> {
-        Self::load_with(path, device, None)
+        Self::load_with(path, device, LoadOptions::default())
     }
 
-    /// Loads weights from `path`, running `program` instead of the file's own
-    /// program if given (the file then doesn't need one).
-    pub fn load_with(path: impl AsRef<Path>, device: Device, program: Option<Program>) -> Result<Model> {
+    pub fn load_with(path: impl AsRef<Path>, device: Device, options: LoadOptions) -> Result<Model> {
         guard::install();
         let path = path.as_ref();
         let file = GgufFile::open(path)?;
-        let Program::Text(text) = match program {
+        let Program::Text(text) = match options.program {
             Some(program) => program,
             None => file.program()?,
         };
-        let program = LoadedProgram::load(&text)?;
+        let mut assets = file.assets();
+        for (name, bytes) in options.assets {
+            assets.retain(|(n, _)| *n != name);
+            assets.push((name, bytes));
+        }
+        let program = LoadedProgram::load(&text, assets)?;
         let backends = init_backends(device)?;
 
         // From here on, Inner's Drop frees what was created so far.
@@ -207,6 +238,71 @@ impl Model {
     /// Inputs declared by the program, in declaration order.
     pub fn inputs(&self) -> &[InputSpec] {
         &self.inputs
+    }
+
+    /// Raw inputs of the program's `(preprocess ...)`, if it has one.
+    pub fn raw_inputs(&self) -> Option<Vec<RawSpec>> {
+        self.inner.lock().unwrap().program.raw_inputs.clone()
+    }
+
+    /// Runs the program's `(preprocess ...)` on one example: one array per
+    /// model input (without the batch dimension), in input order.
+    pub fn preprocess(&self, example: Vec<(String, RawInput)>) -> Result<Vec<(String, ArrayD<f32>)>> {
+        let inner = self.inner.lock().unwrap();
+        let specs = inner
+            .program
+            .raw_inputs
+            .clone()
+            .ok_or_else(|| Error::Program("the program has no (preprocess ...) form".into()))?;
+        let mut example = example;
+        let expected = || specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+        if let Some((name, _)) = example.iter().find(|(n, _)| !specs.iter().any(|s| s.name == *n)) {
+            return Err(Error::Input(format!("unknown raw input {name:?}, expected: {}", expected())));
+        }
+        let values = specs
+            .iter()
+            .map(|spec| {
+                let i = example
+                    .iter()
+                    .position(|(n, _)| *n == spec.name)
+                    .ok_or_else(|| Error::Input(format!("missing raw input {:?}, expected: {}", spec.name, expected())))?;
+                let (_, input) = example.swap_remove(i);
+                if input.kind() != spec.kind {
+                    return Err(Error::Input(format!("raw input {:?} must be {:?}", spec.name, spec.kind)));
+                }
+                Ok(match input {
+                    RawInput::Text(t) => RawValue::Text(t),
+                    RawInput::Image(i) => RawValue::Image(i.to_rgb8()),
+                    RawInput::Audio(a) => RawValue::Audio(a),
+                    RawInput::Array(a) => RawValue::Array(a),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        inner.program.preprocess(values)
+    }
+
+    /// Preprocesses every example and stacks them: one `[batch, ...]` array per model input.
+    pub fn preprocess_batch(&self, examples: Vec<Vec<(String, RawInput)>>) -> Result<Vec<(String, ArrayD<f32>)>> {
+        let processed: Vec<Vec<(String, ArrayD<f32>)>> =
+            examples.into_iter().map(|e| self.preprocess(e)).collect::<Result<_>>()?;
+        let Some(first) = processed.first() else { return Err(Error::Input("no examples".into())) };
+        (0..first.len())
+            .map(|i| {
+                let name = first[i].0.clone();
+                let views: Vec<_> = processed.iter().map(|p| p[i].1.view()).collect();
+                let stacked = ndarray::stack(ndarray::Axis(0), &views).map_err(|_| {
+                    Error::Input(format!("preprocessed {name} differs in shape between examples; pad to a fixed size"))
+                })?;
+                Ok((name, stacked))
+            })
+            .collect()
+    }
+
+    /// Preprocesses raw examples, stacks them into a batch and runs the model.
+    pub fn run_raw(&self, examples: Vec<Vec<(String, RawInput)>>, options: &RunOptions) -> Result<RunOutput> {
+        let inputs = self.preprocess_batch(examples)?;
+        let views: Vec<(&str, ArrayViewD<f32>)> = inputs.iter().map(|(n, a)| (n.as_str(), a.view())).collect();
+        self.run_with(&views, options)
     }
 
     /// Name of the primary backend, e.g. "MTL0" or "CPU".

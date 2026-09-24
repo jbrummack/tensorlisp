@@ -15,7 +15,7 @@ use ndarray::ArrayViewD;
 use crate::{
     dtype::DType,
     error::{Error, Result},
-    program::{FORMAT_VERSION, Program, TL_BIN, TL_TXT, TL_VER},
+    program::{FORMAT_VERSION, Program, TL_ASSET_PREFIX, TL_BIN, TL_TXT, TL_VER},
 };
 
 /// ggml tensors have at most four dimensions.
@@ -183,6 +183,25 @@ impl GgufFile {
         }
     }
 
+    /// Files embedded under `TL_ASSET.<name>`: (name, bytes).
+    pub fn assets(&self) -> Vec<(String, Vec<u8>)> {
+        let n = unsafe { gguf_get_n_kv(self.gguf) };
+        (0..n)
+            .filter_map(|id| unsafe {
+                let key = CStr::from_ptr(gguf_get_key(self.gguf, id)).to_string_lossy();
+                let name = key.strip_prefix(TL_ASSET_PREFIX)?.to_string();
+                if gguf_get_kv_type(self.gguf, id) != gguf_type::GGUF_TYPE_ARRAY
+                    || gguf_get_arr_type(self.gguf, id) != gguf_type::GGUF_TYPE_UINT8
+                {
+                    return None;
+                }
+                let len = gguf_get_arr_n(self.gguf, id);
+                let data = std::slice::from_raw_parts(gguf_get_arr_data(self.gguf, id) as *const u8, len);
+                Some((name, data.to_vec()))
+            })
+            .collect()
+    }
+
     /// Name, type, shape and location of every tensor, in file order.
     pub fn tensor_infos(&self) -> Vec<TensorInfo> {
         (0..self.tensor_count())
@@ -321,6 +340,18 @@ impl<'a> GgufWriter<'a> {
         let key = c_string(key)?;
         unsafe { gguf_set_val_u32(self.gguf, key.as_ptr(), value) };
         Ok(())
+    }
+
+    /// Stores bytes as a u8 array.
+    pub fn set_bytes(&mut self, key: &str, data: &[u8]) -> Result<()> {
+        let key = c_string(key)?;
+        unsafe { gguf_set_arr_data(self.gguf, key.as_ptr(), gguf_type::GGUF_TYPE_UINT8, data.as_ptr().cast(), data.len()) };
+        Ok(())
+    }
+
+    /// Embeds a file programs can read with `(asset name)`.
+    pub fn set_asset(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        self.set_bytes(&format!("{TL_ASSET_PREFIX}{name}"), data)
     }
 
     pub fn remove_key(&mut self, key: &str) -> Result<()> {

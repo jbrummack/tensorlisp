@@ -1,6 +1,8 @@
 ;; TIPSv2 text encoder (the text tower of google/tipsv2-b14), ported from the
 ;; checkpoint's text_encoder.py.
 ;;
+;; Raw input:            text, tokenized by (preprocess ...) with the checkpoint's
+;;                        SentencePiece model (asset "tokenizer.model")
 ;; Inputs (numpy order):  ids      [batch, 64]  SentencePiece ids (lowercased text, no BOS/EOS)
 ;;                        paddings [batch, 64]  1.0 at padding positions, else 0.0
 ;; Output:                embedding [batch, 768], the masked mean of the final
@@ -77,6 +79,15 @@
          [sums (ggml-sum-rows (ggml-cont (ggml-transpose (ggml-mul x valid))))]  ; [1, D, B]
          [counts (ggml-scale-bias (ggml-sum-rows (ggml-cont (ggml-permute valid 1 0 2 3))) 1.0 eps)])  ; [1, 1, B]
     (ggml-reshape-2d (ggml-div sums counts) d batch)))
+
+;; --- Preprocessing: the checkpoint's Tokenizer.tokenize(texts, max_len=64)
+
+(define tok (tokenizer (asset "tokenizer.model")))
+
+(preprocess ([text string])
+  (let-values ([(ids mask) (tokenize tok text 'lowercase #t 'special-tokens #f 'pad-to 64 'pad-id 0)])
+    (model-inputs [ids ids]
+                  [paddings (array-affine mask -1 1)])))
 
 ;; --- TIPSv2 text encoder
 

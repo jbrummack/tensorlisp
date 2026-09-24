@@ -21,9 +21,13 @@ use crate::error::{Error, Result};
 const CORE: &str = include_str!("core.ss");
 
 /// Names exported to programs by `(tensorlisp)`, besides generated ops and constants.
-const PUBLIC: &str = "tensor? shape strides dtype weight weight? model inputs outputs tap";
+const PUBLIC: &str = "tensor? shape strides dtype weight weight? model inputs outputs tap \
+    preprocess model-inputs host? asset tokenizer tokenize \
+    image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array \
+    audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
+    array-shape array-affine array-reshape";
 /// Host entry points, only visible from Rust.
-const HOST: &str = "$tl-load-program $tl-build $tl-unload $tl-abort-handler";
+const HOST: &str = "$tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess";
 
 extern "C" fn tl_tensor_ne(t: *const ggml_tensor, i: i32) -> i64 {
     unsafe { (*t).ne[i as usize] }
@@ -63,6 +67,9 @@ fn boot() -> Result<Scheme> {
         scheme.register_foreign("tl_tensor_ne", tl_tensor_ne as *const _)?;
         scheme.register_foreign("tl_tensor_type", tl_tensor_type as *const _)?;
         scheme.register_foreign("tl_tensor_nb", tl_tensor_nb as *const _)?;
+        for (name, addr) in crate::host::symbols() {
+            scheme.register_foreign(name, addr)?;
+        }
     }
     scheme.eval(&library_source())?;
 
@@ -165,42 +172,148 @@ fn bad_reply(what: &str, value: &Value) -> Error {
     Error::Program(format!("unexpected reply from {what}: {value:?}"))
 }
 
+/// Kind of a raw (pre-preprocessing) input declared by `(preprocess ...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawKind {
+    Text,
+    Image,
+    Audio,
+    Array,
+}
+
+/// A raw input declared by `(preprocess ([name kind] ...) ...)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSpec {
+    pub name: String,
+    pub kind: RawKind,
+}
+
+/// A raw input value for preprocessing.
+pub enum RawValue {
+    Text(String),
+    Image(image::RgbImage),
+    Audio(autopro::audio::Audio),
+    Array(ndarray::ArrayD<f32>),
+}
+
 /// A program evaluated on the Scheme thread, identified by `id`.
 pub(crate) struct LoadedProgram {
     id: i64,
     pub inputs: Vec<InputSpec>,
+    pub raw_inputs: Option<Vec<RawSpec>>,
 }
 
 impl LoadedProgram {
-    pub fn load(text: &str) -> Result<Self> {
+    /// Evaluates `text`; `assets` are available to it through `(asset name)`.
+    pub fn load(text: &str, assets: Vec<(String, Vec<u8>)>) -> Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed) as i64;
         let text = text.to_owned();
         let reply = with_scheme(move |s| {
-            s.call("$tl-load-program", &[Value::Int(id), Value::String(text)])
-        })??;
-        let Some(specs) = as_list(&reply) else { return Err(bad_reply("load", &reply)) };
+            crate::host::in_scope(crate::host::Scope::Model(id), || {
+                let assets = Value::List(
+                    assets
+                        .into_iter()
+                        .map(|(name, bytes)| {
+                            let handle = crate::host::insert(crate::host::HostValue::Bytes(std::sync::Arc::new(bytes)));
+                            Value::Pair(Box::new(Value::String(name)), Box::new(Value::Int(handle)))
+                        })
+                        .collect(),
+                );
+                s.call("$tl-load-program", &[Value::Int(id), Value::String(text), assets])
+            })
+        })?;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => {
+                crate::host::drop_model(id);
+                return Err(e.into());
+            }
+        };
+        let bad = || bad_reply("load", &reply);
+        let Some([specs, raw]) = as_list(&reply) else { return Err(bad()) };
+        let Some(specs) = as_list(specs) else { return Err(bad()) };
         let inputs = specs
             .iter()
-            .map(|spec| match spec {
-                Value::List(fields) => match fields.as_slice() {
-                    [Value::String(name), Value::String(dtype), dims] => Ok(InputSpec {
-                        name: name.clone(),
-                        dtype: dtype.clone(),
-                        dims: match dims {
-                            Value::Bool(false) => None,
-                            Value::List(ds) => Some(
-                                ds.iter().map(|d| if let Value::Int(n) = d { Some(*n) } else { None }).collect(),
-                            ),
-                            _ => return Err(bad_reply("load", &reply)),
-                        },
-                    }),
-                    _ => Err(bad_reply("load", &reply)),
-                },
-                _ => Err(bad_reply("load", &reply)),
+            .map(|spec| match as_list(spec) {
+                Some([Value::String(name), Value::String(dtype), dims]) => Ok(InputSpec {
+                    name: name.clone(),
+                    dtype: dtype.clone(),
+                    dims: match dims {
+                        Value::Bool(false) => None,
+                        other => Some(
+                            as_list(other)
+                                .ok_or_else(bad)?
+                                .iter()
+                                .map(|d| if let Value::Int(n) = d { Some(*n) } else { None })
+                                .collect(),
+                        ),
+                    },
+                }),
+                _ => Err(bad()),
             })
             .collect::<Result<_>>()?;
-        Ok(LoadedProgram { id, inputs })
+        let raw_inputs = match raw {
+            Value::Bool(false) => None,
+            other => Some(
+                as_list(other)
+                    .ok_or_else(bad)?
+                    .iter()
+                    .map(|spec| match as_list(spec) {
+                        Some([Value::String(name), Value::String(kind)]) => Ok(RawSpec {
+                            name: name.clone(),
+                            kind: match kind.as_str() {
+                                "string" => RawKind::Text,
+                                "image" => RawKind::Image,
+                                "audio" => RawKind::Audio,
+                                _ => RawKind::Array,
+                            },
+                        }),
+                        _ => Err(bad()),
+                    })
+                    .collect::<Result<_>>()?,
+            ),
+        };
+        Ok(LoadedProgram { id, inputs, raw_inputs })
+    }
+
+    /// Runs `(preprocess ...)` on one example (values in raw-input order).
+    /// Returns one array per model input, in input order.
+    pub fn preprocess(&self, raws: Vec<RawValue>) -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
+        use crate::host::{HostValue, Scope, clear_calls, in_scope, insert, take_tensor};
+        let id = self.id;
+        with_scheme(move |s| {
+            let result = in_scope(Scope::Call, || -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
+                let args: Vec<Value> = raws
+                    .into_iter()
+                    .map(|raw| {
+                        let (kind, value) = match raw {
+                            RawValue::Text(t) => return Value::String(t),
+                            RawValue::Image(i) => ("image", HostValue::Image(i)),
+                            RawValue::Audio(a) => ("audio", HostValue::Audio(a)),
+                            RawValue::Array(t) => ("tensor", HostValue::Tensor(t)),
+                        };
+                        Value::Pair(Box::new(Value::Symbol(kind.into())), Box::new(Value::Int(insert(value))))
+                    })
+                    .collect();
+                let reply = s.call("$tl-preprocess", &[Value::Int(id), Value::List(args)])?;
+                let bad = || bad_reply("preprocess", &reply);
+                as_list(&reply)
+                    .ok_or_else(bad)?
+                    .iter()
+                    .map(|entry| match as_list(entry) {
+                        Some([Value::String(name), Value::Int(array)]) => {
+                            let array = take_tensor(*array)
+                                .ok_or_else(|| Error::Program(format!("preprocess: array for {name} is gone")))?;
+                            Ok((name.clone(), array))
+                        }
+                        _ => Err(bad()),
+                    })
+                    .collect()
+            });
+            clear_calls();
+            result
+        })?
     }
 
     /// Runs the model body in `ctx`, with inputs of the given ggml dims.
@@ -272,5 +385,6 @@ impl Drop for LoadedProgram {
     fn drop(&mut self) {
         let id = self.id;
         let _ = with_scheme(move |s| s.call("$tl-unload", &[Value::Int(id)]));
+        crate::host::drop_model(id);
     }
 }

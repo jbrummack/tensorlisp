@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result, bail};
 use ndarray::ArrayD;
-use tensorlisp::{Device, InputSpec, Model, Program};
+use tensorlisp::{Device, InputSpec, LoadOptions, Model, Program, RawInput, RawKind};
 
 use crate::{ModelArgs, npy};
 
@@ -26,10 +26,57 @@ pub fn read_program(path: &PathBuf) -> Result<Program> {
     Ok(Program::Text(text))
 }
 
+/// `NAME=PATH` asset arguments, read into memory.
+pub fn read_assets(args: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
+    args.iter()
+        .map(|arg| {
+            let (name, path) = split_assignment(arg)?;
+            let bytes = std::fs::read(path).with_context(|| format!("reading asset {path}"))?;
+            Ok((name.to_string(), bytes))
+        })
+        .collect()
+}
+
 pub fn load_model(args: &ModelArgs) -> Result<Model> {
-    let program = args.program.as_ref().map(read_program).transpose()?;
-    Model::load_with(&args.model, args.device.0, program)
-        .with_context(|| format!("loading {}", args.model.display()))
+    let options = LoadOptions {
+        program: args.program.as_ref().map(read_program).transpose()?,
+        assets: read_assets(&args.assets)?,
+    };
+    Model::load_with(&args.model, args.device.0, options).with_context(|| format!("loading {}", args.model.display()))
+}
+
+/// Raw examples from `NAME=VALUE` arguments: `@path` reads a file (decoded
+/// by the input's kind), anything else is literal text. Repeating a name adds
+/// examples to the batch.
+pub fn read_raw_examples(model: &Model, args: &[String]) -> Result<Vec<Vec<(String, RawInput)>>> {
+    let specs = model.raw_inputs().context("the program has no (preprocess ...) form; pass arrays with -i")?;
+    let mut columns: Vec<(String, Vec<RawInput>)> = specs.iter().map(|s| (s.name.clone(), Vec::new())).collect();
+    for arg in args {
+        let (name, value) = split_assignment(arg)?;
+        let spec = specs.iter().find(|s| s.name == name).with_context(|| {
+            format!("unknown raw input {name:?}, expected: {}", specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "))
+        })?;
+        let file = value.strip_prefix('@');
+        let read = |p: &str| std::fs::read(p).with_context(|| format!("reading {p}"));
+        let input = match (spec.kind, file) {
+            (RawKind::Text, None) => RawInput::Text(value.to_string()),
+            (RawKind::Text, Some(p)) => RawInput::Text(String::from_utf8(read(p)?).context("text file is not UTF-8")?),
+            (RawKind::Image, Some(p)) => RawInput::Image(tensorlisp::autopro::image::decode(&read(p)?)?),
+            (RawKind::Audio, Some(p)) => RawInput::Audio(tensorlisp::autopro::audio::Audio::from_wav_bytes(&read(p)?)?),
+            (RawKind::Array, Some(p)) => RawInput::Array(npy::read(p.as_ref())?),
+            (kind, None) => bail!("raw input {name:?} is {kind:?}; pass a file as {name}=@path"),
+        };
+        columns.iter_mut().find(|(n, _)| n == name).unwrap().1.push(input);
+    }
+    let batch = columns.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    if let Some((name, v)) = columns.iter().find(|(_, v)| v.len() != batch) {
+        bail!("raw input {name:?} given {} times, others {batch} times", v.len());
+    }
+    let mut columns: Vec<(String, std::vec::IntoIter<RawInput>)> =
+        columns.into_iter().map(|(n, v)| (n, v.into_iter())).collect();
+    Ok((0..batch)
+        .map(|_| columns.iter_mut().map(|(n, it)| (n.clone(), it.next().unwrap())).collect())
+        .collect())
 }
 
 /// Splits `name=value`.

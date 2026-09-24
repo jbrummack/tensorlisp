@@ -8,7 +8,7 @@ use tensorlisp::{Model, RunOptions, Taps};
 
 use crate::{
     ModelArgs,
-    common::{Stats, file_name, load_model, print_json, read_npy_args, shape_string, stats},
+    common::{Stats, file_name, load_model, print_json, read_npy_args, read_raw_examples, shape_string, stats},
     npy,
 };
 
@@ -19,6 +19,10 @@ pub struct RunArgs {
     /// Input as NAME=file.npy (repeatable).
     #[arg(short, long = "input")]
     pub inputs: Vec<String>,
+    /// Raw input for the program's preprocess, NAME=text or NAME=@file
+    /// (repeat a name for a batch).
+    #[arg(long = "raw")]
+    pub raw: Vec<String>,
     /// Write every output (and requested tap) to DIR/NAME.npy.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
@@ -37,6 +41,9 @@ pub struct CompareArgs {
     /// Input as NAME=file.npy (repeatable).
     #[arg(short, long = "input")]
     pub inputs: Vec<String>,
+    /// Raw input for the program's preprocess, NAME=text or NAME=@file.
+    #[arg(long = "raw")]
+    pub raw: Vec<String>,
     /// Expected values of an output or tap, NAME=file.npy (repeatable).
     #[arg(short, long = "reference")]
     pub references: Vec<String>,
@@ -49,6 +56,62 @@ pub struct CompareArgs {
     /// Relative tolerance.
     #[arg(long, default_value_t = 1e-3)]
     pub rtol: f32,
+}
+
+#[derive(Args)]
+pub struct ProcessArgs {
+    #[command(flatten)]
+    pub model: ModelArgs,
+    /// Raw input, NAME=text or NAME=@file (repeat a name for a batch).
+    #[arg(long = "raw", required = true)]
+    pub raw: Vec<String>,
+    /// Write each preprocessed model input to DIR/NAME.npy.
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+}
+
+/// Model inputs from .npy files (-i) or through the program's preprocess (--raw).
+fn gather_inputs(model: &Model, npy_args: &[String], raw: &[String]) -> Result<Vec<(String, ArrayD<f32>)>> {
+    match (npy_args.is_empty(), raw.is_empty()) {
+        (_, true) => read_npy_args(npy_args),
+        (true, false) => Ok(model.preprocess_batch(read_raw_examples(model, raw)?)?),
+        (false, false) => bail!("pass either arrays (-i) or raw inputs (--raw), not both"),
+    }
+}
+
+pub fn process(args: &ProcessArgs, json: bool) -> Result<i32> {
+    let model = load_model(&args.model)?;
+    let arrays = gather_inputs(&model, &[], &args.raw)?;
+    let mut files = Vec::new();
+    if let Some(dir) = &args.output {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        for (name, array) in &arrays {
+            let path = dir.join(format!("{}.npy", file_name(name)));
+            npy::write(&path, array)?;
+            files.push(path);
+        }
+    }
+    if json {
+        print_json(&json!({
+            "inputs": arrays.iter().enumerate().map(|(i, (name, a))| json!({
+                "name": name, "shape": a.shape(), "stats": stats(a), "file": files.get(i),
+            })).collect::<Vec<_>>(),
+        }))?;
+    } else {
+        let width = arrays.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        for (i, (name, a)) in arrays.iter().enumerate() {
+            let Stats { min, max, mean, .. } = stats(a);
+            let file = files.get(i).map(|p| format!("  -> {}", p.display())).unwrap_or_default();
+            let preview: Vec<String> = a.iter().take(8).map(|v| format!("{v}")).collect();
+            println!(
+                "  {name:width$}  {:18} min {min:<10.4} max {max:<10.4} mean {mean:<10.4} [{}{}]{file}",
+                shape_string(a.shape()),
+                preview.join(", "),
+                if a.len() > 8 { ", …" } else { "" }
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn parse_taps(taps: &Option<String>) -> Taps {
@@ -64,10 +127,10 @@ fn views(inputs: &[(String, ArrayD<f32>)]) -> Vec<(&str, ArrayViewD<'_, f32>)> {
 }
 
 pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
-    let inputs = read_npy_args(&args.inputs)?;
     let start = Instant::now();
     let model = load_model(&args.model)?;
     let load_time = start.elapsed();
+    let inputs = gather_inputs(&model, &args.inputs, &args.raw)?;
     let options = RunOptions { taps: parse_taps(&args.taps) };
 
     let mut times = Vec::new();
@@ -226,8 +289,8 @@ fn result_names(model: &Model, inputs: &[(String, ArrayD<f32>)]) -> Result<(Vec<
 }
 
 pub fn compare(args: &CompareArgs, json: bool) -> Result<i32> {
-    let inputs = read_npy_args(&args.inputs)?;
     let model = load_model(&args.model)?;
+    let inputs = gather_inputs(&model, &args.inputs, &args.raw)?;
     let (outputs, taps) = result_names(&model, &inputs)?;
 
     let mut references = read_npy_args(&args.references)?;

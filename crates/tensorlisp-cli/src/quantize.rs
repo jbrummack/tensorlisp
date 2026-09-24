@@ -91,7 +91,8 @@ fn analyze(args: &QuantizeArgs, file: &GgufFile, names: &HashSet<&str>) -> Resul
             }
         },
     };
-    let model = Model::load_with(&args.input, Device::Cpu, Some(program)).context("loading the program to analyze its graph")?;
+    let options = tensorlisp::LoadOptions { program: Some(program), assets: Vec::new() };
+    let model = Model::load_with(&args.input, Device::Cpu, options).context("loading the program to analyze its graph")?;
     let shapes = resolve_input_shapes(&model, &args.inputs)
         .context("the graph is needed to see which weights feed matmuls (or pass --no-graph)")?;
     let given: Vec<(&str, Vec<usize>)> = shapes.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();

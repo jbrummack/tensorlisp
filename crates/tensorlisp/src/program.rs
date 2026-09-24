@@ -4,6 +4,9 @@
 pub const TL_TXT: &str = "TL_TXT";
 /// Binary program (GGUF u8 array). Reserved, not supported yet.
 pub const TL_BIN: &str = "TL_BIN";
+/// Prefix of embedded files (GGUF u8 arrays), e.g. `TL_ASSET.tokenizer.model`;
+/// programs read them with `(asset "tokenizer.model")`.
+pub const TL_ASSET_PREFIX: &str = "TL_ASSET.";
 /// Program format version (GGUF u32).
 pub const TL_VER: &str = "TL_VER";
 

@@ -15,6 +15,7 @@ crates/
   ggml-sys/        builds vendor/ggml with cc (no CMake), bindgen FFI, backend features
   ggml-codegen/    proc macro on the bindings; generates the Scheme FFI layer
   tensorlisp/      runtime: Model::load(gguf) + Model::run(ndarray) -> ndarray
+                   (preprocessing via ../autopro, a sibling repository)
   tensorlisp-cli/  `tl`: inspect, convert, pack, check, run, compare, quantize
   importers/       ONNX and CoreML/MIL readers, for translating models to tensorlisp
 experiments/
@@ -137,6 +138,37 @@ Exception in ggml-add: ggml assertion failed: ggml.c:2062: GGML_ASSERT(ggml_can_
 - **On backend worker threads** (CPU threadpool, Metal/GCD) there is nowhere
   to return to: the message is printed and ggml aborts.
 
+### Preprocessing
+
+Programs can turn raw inputs into their tensor inputs with `(preprocess ...)`,
+using [autopro](../autopro) (Hugging Face processor compatible) from Scheme.
+Files such as tokenizers are embedded in the GGUF as assets (`TL_ASSET.<name>`,
+see `tl pack --asset`).
+
+```scheme
+(define tok (tokenizer (asset "tokenizer.model")))      ; SentencePiece or tokenizer.json
+
+(preprocess ([text string] [photo image])
+  (let-values ([(ids mask) (tokenize tok text 'lowercase #t 'pad-to 64)])
+    (model-inputs [ids ids]
+                  [pixels (image->array (image-resize photo 448 448 'bilinear))])))
+```
+
+- Raw input kinds: `string`, `image`, `audio`, `array`. The body ends in
+  `(model-inputs [name array] ...)` naming every model input; one example is
+  processed at a time and examples are stacked into the batch.
+- Text: `tokenizer`, `(tokenize tok text 'lowercase b 'special-tokens b
+  'max-length n 'pad-to n 'pad-id n)` → ids and attention mask.
+- Images: `image-size`, `image-resize` (static), `image-resize-shortest`,
+  `image-resize-longest`, `image-resize-multiple` (dynamic), `image-center-crop`,
+  `(image->array img 'scale s 'mean (...) 'std (...) 'channels rgb|bgr 'layout chw|hwc)`.
+  Filters: `nearest bilinear bicubic lanczos box hamming` (Pillow-exact).
+- Audio: `audio-rate`, `audio-length`, `audio-resample`, `audio-pad`,
+  `audio->array` (waveform + mask), `log-mel` (options `n-fft hop win mels
+  f-min f-max power center scale norm log floor`), `whisper-features`.
+- Arrays: `array-shape`, `array-affine`, `array-reshape`.
+- Rust: `model.run_raw(examples, &options)`, `model.preprocess(example)`.
+
 ## CLI (`tl`)
 
 ```sh
@@ -160,6 +192,9 @@ tl quantize model.gguf model-q8.gguf -t q8_0 -i x=1,3,224,224
 #   builds the program's graph and converts only weights that feed matmuls /
 #   embedding lookups (others, e.g. added position embeddings, stay f32)
 tl run model-q8.gguf -i x=x.npy -o out/ --repeat 20        # outputs as .npy + timing
+tl pack weights.gguf --program net.ss --asset tokenizer.model=tok.model -o model.gguf
+tl run model.gguf --raw text="a photo" --raw image=@cat.jpg  # through (preprocess ...)
+tl process model.gguf --raw image=@cat.jpg -o pre/          # only preprocess: arrays as .npy
 ```
 
 Note: ggml's f16/bf16 matmuls round the activations to f16/bf16 as well, so

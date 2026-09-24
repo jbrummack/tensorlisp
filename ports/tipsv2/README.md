@@ -12,7 +12,12 @@ ported from the checkpoint's `text_encoder.py` and `image_encoder.py`.
 - Output: `embedding [batch, 768]`, not L2-normalized (like `encode_text`).
 - Taps: `embed`, `layer.00` .. `layer.11`, `final_ln`.
 
-Tokenization is not part of the program yet (the host will provide it).
+`(preprocess ([text string]) ...)` tokenizes with the checkpoint's SentencePiece
+model, embedded as the asset `tokenizer.model`:
+
+```sh
+tl run tipsv2-b14-text-f16.gguf --raw text="a photo of a bus" --raw text="a dog" -o out/
+```
 
 ## Vision encoder — `vision.ss`
 
@@ -26,6 +31,9 @@ DINOv2-style ViT-B/14 with one register token and LayerScale.
   `patches [batch, H/14 * W/14, 768]` (row-major over the patch grid), all
   after the final norm.
 - Taps: `embed`, `block.00` .. `block.11`, `norm`.
+- `(preprocess ([image image]) ...)` reproduces the checkpoint's processor
+  (448 x 448 bilinear, rescale); its output is identical to HF's:
+  `tl run tipsv2-b14-vision-f16.gguf --raw image=@photo.jpg`.
 - `flash-attention` (top of the file, default `#t`) uses ggml's fused attention
   with f16 K/V: ~30% faster on Metal. Set it to `#f` for exact comparisons on
   the CPU (all taps then match PyTorch at the default 1e-4/1e-3 tolerance).
@@ -42,7 +50,8 @@ done
 tl convert $M/model.safetensors --include 'text_encoder.*' --strip-prefix text_encoder. -o $M/text-f32.gguf
 tl convert $M/model.safetensors --include 'vision_encoder.*' --exclude vision_encoder.mask_token \
    --strip-prefix vision_encoder. -o $M/vision-f32.gguf
-tl pack $M/text-f32.gguf --program ports/tipsv2/text.ss -o $M/tipsv2-b14-text-f32.gguf
+tl pack $M/text-f32.gguf --program ports/tipsv2/text.ss --asset tokenizer.model=$M/tokenizer.model \
+   -o $M/tipsv2-b14-text-f32.gguf
 tl pack $M/vision-f32.gguf --program ports/tipsv2/vision.ss -o $M/tipsv2-b14-vision-f32.gguf
 tl quantize $M/tipsv2-b14-text-f32.gguf $M/tipsv2-b14-text-f16.gguf -t f16 -i ids=1,64 -i paddings=1,64
 tl quantize $M/tipsv2-b14-vision-f32.gguf $M/tipsv2-b14-vision-f16.gguf -t f16 -i image=1,3,448,448

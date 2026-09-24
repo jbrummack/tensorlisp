@@ -178,6 +178,37 @@ fn c_string(s: &str) -> Result<CString, Error> {
     CString::new(s).map_err(|_| Error::Nul(s.into()))
 }
 
+/// Signal handlers Chez installs while booting (c/schsig.c), which would
+/// otherwise change the host process: SIGPIPE ignored, SIGINT caught (Ctrl-C
+/// no longer exits), fault signals turned into Scheme errors (replacing e.g.
+/// Rust's stack overflow reporting).
+#[cfg(unix)]
+const CHEZ_SIGNALS: &[libc::c_int] =
+    &[libc::SIGINT, libc::SIGPIPE, libc::SIGQUIT, libc::SIGILL, libc::SIGFPE, libc::SIGBUS, libc::SIGSEGV];
+
+/// Runs `f`, then restores the handlers of [`CHEZ_SIGNALS`] to what they were.
+#[cfg(unix)]
+fn preserving_signals<R>(f: impl FnOnce() -> R) -> R {
+    let saved: Vec<(libc::c_int, libc::sigaction)> = CHEZ_SIGNALS
+        .iter()
+        .map(|&sig| unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(sig, std::ptr::null(), &mut old);
+            (sig, old)
+        })
+        .collect();
+    let result = f();
+    for (sig, old) in &saved {
+        unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn preserving_signals<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// The embedded Chez runtime. Tied to the thread that created it.
 pub struct Scheme {
     _not_send: PhantomData<*mut ()>,
@@ -189,7 +220,7 @@ impl Scheme {
         if RUNNING.swap(true, Ordering::SeqCst) {
             return Err(Error::AlreadyRunning);
         }
-        unsafe {
+        preserving_signals(|| unsafe {
             sys::Sscheme_init(None);
             sys::Sregister_boot_file_bytes(
                 c"petite".as_ptr(),
@@ -202,7 +233,7 @@ impl Scheme {
                 SCHEME_BOOT.len() as sys::iptr,
             );
             sys::Sbuild_heap(null(), None);
-        }
+        });
         let scheme = Scheme { _not_send: PhantomData };
         scheme.bootstrap_prelude();
         Ok(scheme)

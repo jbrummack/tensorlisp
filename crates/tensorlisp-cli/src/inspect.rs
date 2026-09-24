@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tensorlisp::{
     Program,
     gguf::{GgufFile, MetaValue},
-    program::{TL_BIN, TL_TXT},
+    program::{TL_ASSET_PREFIX, TL_BIN, TL_TXT},
 };
 
 use crate::common::{human_bytes, print_json, shape_string};
@@ -95,7 +95,12 @@ pub fn run(args: &InspectArgs, json: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    let metadata: Vec<_> = file.metadata().into_iter().filter(|(k, _)| k != TL_TXT && k != TL_BIN).collect();
+    let metadata: Vec<_> = file
+        .metadata()
+        .into_iter()
+        .filter(|(k, _)| k != TL_TXT && k != TL_BIN && !k.starts_with(TL_ASSET_PREFIX))
+        .collect();
+    let assets: Vec<(String, usize)> = file.assets().into_iter().map(|(n, b)| (n, b.len())).collect();
     let tensors = file.tensor_infos();
     let total: usize = tensors.iter().map(|t| t.nbytes).sum();
 
@@ -117,6 +122,7 @@ pub fn run(args: &InspectArgs, json: bool) -> Result<i32> {
                 "offset": t.offset,
             })).collect::<Vec<_>>(),
             "tensor_bytes": total,
+            "assets": assets.iter().map(|(n, len)| json!({ "name": n, "bytes": len })).collect::<Vec<_>>(),
         }))
         .map(|_| 0);
     }
@@ -137,6 +143,9 @@ pub fn run(args: &InspectArgs, json: bool) -> Result<i32> {
         ),
         Err(tensorlisp::Error::Program(e)) => println!("program: none ({e})"),
         Err(e) => println!("program: none ({e})"),
+    }
+    if !assets.is_empty() {
+        println!("assets: {}", assets.iter().map(|(n, len)| format!("{n} ({})", human_bytes(*len))).collect::<Vec<_>>().join(", "));
     }
     if !metadata.is_empty() {
         println!("\nmetadata:");

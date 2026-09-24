@@ -21,6 +21,9 @@ pub struct CheckArgs {
     /// the file's shape (repeatable). Inputs declared with fixed shapes can be omitted.
     #[arg(short, long = "input")]
     pub inputs: Vec<String>,
+    /// Add or replace an asset, NAME=PATH (repeatable).
+    #[arg(long = "asset")]
+    pub assets: Vec<String>,
     /// Only show inputs, outputs and taps, not every node.
     #[arg(long)]
     pub summary: bool,
@@ -32,6 +35,7 @@ pub fn run(args: &CheckArgs, json: bool) -> Result<i32> {
         model: args.model.clone(),
         program: args.program.clone(),
         device: DeviceArg(Device::Cpu),
+        assets: args.assets.clone(),
     })?;
 
     let shapes = resolve_input_shapes(&model, &args.inputs)?;
