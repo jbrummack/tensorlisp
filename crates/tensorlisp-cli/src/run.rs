@@ -161,8 +161,15 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
     let mean_after_first = (times.len() > 1).then(|| times[1..].iter().sum::<f64>() / (times.len() - 1) as f64);
 
     // Postprocess per example, with the raw inputs when there are any.
+    // A postprocess that reads raw inputs can't run on arrays from -i.
+    let needs_raw = model.postprocess_args().is_some_and(|post| {
+        model.raw_inputs().is_some_and(|raw| raw.iter().any(|r| post.contains(&r.name)))
+    });
+    if needs_raw && args.raw.is_empty() && !args.no_post && is_default && !json {
+        eprintln!("note: postprocess skipped: it reads raw inputs (pass them with --raw)");
+    }
     let post = match model.postprocess_args() {
-        Some(_) if !args.no_post && is_default => {
+        Some(_) if !args.no_post && is_default && !(needs_raw && args.raw.is_empty()) => {
             let start = Instant::now();
             let examples = if args.raw.is_empty() {
                 model.postprocess(&result.outputs)?

@@ -26,7 +26,7 @@ const PUBLIC: &str = "tensor? shape strides dtype weight weight? model inputs ou
     image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array \
     audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
     array-shape array-affine array-reshape \
-    postprocess results pipeline run output detokenize token-id define-state state effect array-length array->list list->array array-slice array-transpose array-take array-argmax \
+    postprocess results pipeline run output detokenize token-id define-state state effect device array-length array->list list->array array-slice array-transpose array-take array-argmax \
     image-letterbox boxes-convert nms detect boxes-scale boxes-clip boxes-unletterbox dbscan cluster-centroids";
 /// Host entry points, only visible from Rust.
 const HOST: &str = "$tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline";
@@ -226,7 +226,7 @@ pub struct PipelineSpec {
     pub raw_inputs: Vec<RawSpec>,
 }
 
-/// A state tensor: `(define-state name type (dims ...))`, dims in ggml order.
+/// A state tensor: `(define-state name type dim ...)`, dims in ggml order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateSpec {
     pub name: String,
@@ -510,6 +510,7 @@ impl LoadedProgram {
         ctx: *mut ggml_sys::ffi::ggml_context,
         weights: *mut ggml_sys::ffi::ggml_context,
         states: *mut ggml_sys::ffi::ggml_context,
+        device: &str,
         input_dims: &[Vec<i64>],
         graph_size: usize,
         taps: &Taps,
@@ -520,6 +521,7 @@ impl LoadedProgram {
             Value::Int(ctx as i64),
             Value::Int(weights as i64),
             Value::Int(states as i64),
+            Value::String(device.to_string()),
             Value::List(
                 input_dims.iter().map(|ne| Value::List(ne.iter().map(|&d| Value::Int(d)).collect())).collect(),
             ),

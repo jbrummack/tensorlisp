@@ -849,7 +849,8 @@ impl Inner {
         if ctx.is_null() {
             return Err(Error::Backend("failed to create the graph context".into()));
         }
-        match self.program.build(entry, ctx, self.file.tensors, self.states, &input_dims, GRAPH_SIZE, taps) {
+        let device = if unsafe { ggml_backend_is_cpu(self.backends[0]) } { "cpu" } else { "gpu" };
+        match self.program.build(entry, ctx, self.file.tensors, self.states, device, &input_dims, GRAPH_SIZE, taps) {
             Ok(built) => Ok(Graph {
                 ctx,
                 graph: built.graph,

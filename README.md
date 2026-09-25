@@ -116,6 +116,9 @@ A tensorlisp GGUF is a normal GGUF (weights as tensors) plus three keys:
   ggml order) and `(dtype t)` inspect tensors.
 - `(tap "name" t [rank])` returns `t` and marks it as an intermediate result
   that `tl run --taps` / `tl compare` (or `RunOptions::taps`) can read back.
+- `(device)` is `cpu` or `gpu` (the primary backend), for choosing kernels:
+  e.g. convolutions as im2col + matmul on the GPU, ggml's direct convolution
+  on the CPU (`ports/yolo11`).
 
 ### Entries and pipelines
 

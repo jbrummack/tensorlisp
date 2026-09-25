@@ -20,6 +20,11 @@
 (define %ctx (make-parameter 0))
 (define %weights (make-parameter 0))
 (define %states (make-parameter 0))
+;; Kind of the device the graph is built for: cpu or gpu.
+(define %device (make-parameter #f))
+
+(define (device)
+  (or (%device) (error 'device "the device is only known inside a model while its graph is built")))
 (define %graph (make-parameter 0))
 
 ;; The op being called and its (param . tensor) arguments, for reporting ggml
@@ -915,7 +920,7 @@
 ;; names to read back. Returns
 ;; (graph (input-address ...) (output ...) (tap ...) (tap-name ...)), where
 ;; outputs and taps are (name-string address rank).
-(define ($tl-build id entry ctx weights states input-dims graph-size taps)
+(define ($tl-build id entry ctx weights states device input-dims graph-size taps)
   (let ([m (hashtable-ref %models id #f)]
         [tap-slot (box '())])
     (unless m (error 'build "unknown model" id))
@@ -924,7 +929,7 @@
                (cons (cadr e) (caddr e)))])
     (set! %op 'inputs)
     (set! %pending '())
-    (parameterize ([%ctx ctx] [%weights weights] [%states states] [%taps tap-slot]
+    (parameterize ([%ctx ctx] [%weights weights] [%states states] [%taps tap-slot] [%device (string->symbol device)]
                    [%graph (ggml_new_graph_custom ctx graph-size #f)])
       (let* ([inputs (map (lambda (spec ne) (%new-input ctx spec ne))
                           (car m) input-dims)]

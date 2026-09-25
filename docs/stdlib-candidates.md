@@ -119,6 +119,21 @@ way; `+ eps` in the denominator like the reference.
   constant weight transforms into the file (`tl convert --offset`), avoid
   per-run weight math.
 
+### CNN pieces (from `ports/yolo11`)
+
+- `(conv2d x name stride)`: torch `Conv2d` with "same" padding; on the GPU as
+  im2col + one matmul (1x1: a transpose instead of im2col), on the CPU with
+  `ggml-conv-2d-direct` (each is ~3x faster on its device than the other).
+- `(conv2d-dw x name stride)`: depthwise with `ggml-conv-2d-dw-direct`.
+- `(channels x from n)` / concat on dim 2: channel slices of `[W, H, C, B]`.
+- `(dfl raw)`: distribution focal loss decoding (softmax over 16 bins, mean bin)
+  and anchor grids from `ggml-arange` + `ggml-repeat-4d`, so the head's output
+  is already in pixels.
+- Structure from weights: count repeated blocks with `weight?` instead of
+  hard-coding a size's depth.
+- Pickled PyTorch checkpoints can differ from current source (activations
+  are stored with the module): check the loaded model, not the code.
+
 ## Rank > 4
 
 ggml tensors have at most 4 dimensions. Neither TIPSv2 tower needed more
