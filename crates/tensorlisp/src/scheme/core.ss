@@ -15,9 +15,12 @@
   (nongenerative tensorlisp-tensor)
   (sealed #t))
 
-;; Graph context and weight context of the graph currently being built.
+;; Graph context, weight context and state context of the graph currently
+;; being built, and the graph itself (for effects).
 (define %ctx (make-parameter 0))
 (define %weights (make-parameter 0))
+(define %states (make-parameter 0))
+(define %graph (make-parameter 0))
 
 ;; The op being called and its (param . tensor) arguments, for reporting ggml
 ;; assertions. Set while the op's arguments are evaluated, cleared by %wrap
@@ -35,7 +38,7 @@
 (define (%tensor-ptr who t)
   (unless (tensor? t) (error who "expected a tensor" t))
   (let ([ctx (tensor-ctx t)])
-    (unless (or (eqv? ctx (%ctx)) (eqv? ctx (%weights)))
+    (unless (or (eqv? ctx (%ctx)) (eqv? ctx (%weights)) (eqv? ctx (%states)))
       (error who "tensor belongs to a graph that no longer exists" t))
     (tensor-ptr t)))
 
@@ -96,7 +99,7 @@
 (define %tensor-writer
   (record-writer (record-type-descriptor tensor)
     (lambda (t port wr)
-      (if (or (eqv? (tensor-ctx t) (%ctx)) (eqv? (tensor-ctx t) (%weights)))
+      (if (or (eqv? (tensor-ctx t) (%ctx)) (eqv? (tensor-ctx t) (%weights)) (eqv? (tensor-ctx t) (%states)))
           (fprintf port "#<tensor ~a ~s>" (dtype t) (shape t))
           (fprintf port "#<tensor (stale)>")))))
 
@@ -119,6 +122,45 @@
     (when (eqv? p 0) (error 'weight "no tensor with this name in the model file" name))
     (make-tensor p w)))
 
+;; State: tensors that keep their contents between runs (e.g. a KV cache),
+;; declared at the top level and allocated next to the weights, zeroed at load.
+;;
+;; (define-state "cache.k.0" f32 256 64)    ; name, f32 or f16, ggml dims (expressions)
+;;
+;; Inside a model, (state name) is the tensor; write it with an op that
+;; returns a view of it (ggml-set-rows, ggml-cpy into a view) wrapped in
+;; (effect t), which adds the write to the graph right away, so ops built
+;; afterwards read the new contents.
+
+(define-syntax define-state
+  (syntax-rules ()
+    [(_ name type dim ...) (%define-state! name 'type (list dim ...))]))
+
+(define (%define-state! name type dims)
+  (let ([slot (%loading)])
+    (unless slot (error 'define-state "state can only be declared while a program is loaded"))
+    (unless (string? name) (error 'define-state "the name must be a string" name))
+    (unless (memq type '(f32 f16)) (error 'define-state "type must be f32 or f16" type))
+    (unless (and (list? dims) (<= 1 (length dims) 4) (for-all (lambda (d) (and (fixnum? d) (> d 0))) dims))
+      (error 'define-state "dims must be a list of 1-4 positive integers" dims))
+    (when (assoc name (vector-ref slot 4)) (error 'define-state "state declared twice" name))
+    (vector-set! slot 4 (cons (list name type dims) (vector-ref slot 4)))))
+
+(define (state name)
+  (unless (string? name) (error 'state "expected a string" name))
+  (let ([ctx (%states)])
+    (when (eqv? ctx 0) (error 'state "state can only be used inside a model while its graph is built"))
+    (let ([p (ggml_get_tensor ctx name)])
+      (when (eqv? p 0) (error 'state "no state with this name; declare it with define-state" name))
+      (make-tensor p ctx))))
+
+;; Adds t (e.g. a write into state) to the graph now; returns t.
+(define (effect t)
+  (let ([g (%graph)])
+    (when (eqv? g 0) (error 'effect "effects can only be used inside a model while its graph is built"))
+    (ggml_build_forward_expand g (%tensor-ptr 'effect t))
+    t))
+
 ;; Taps: named intermediate tensors that can be read back on request, e.g. to
 ;; compare them with a reference implementation. (tap name t [rank]) returns t.
 
@@ -139,9 +181,10 @@
        (set-box! slot (cons (list name t rank) (unbox slot)))
        t)]))
 
-;; --- Preprocessing: host values (autopro, see host.rs). Host arrays are
-;; plain data on the Rust side, not graph tensors; preprocess returns them as
-;; the model's inputs.
+;; --- Pre- and postprocessing: host values (autopro, see host.rs). Host
+;; arrays are plain data on the Rust side, not graph tensors: preprocess
+;; returns them as the model's inputs, postprocess receives the model's
+;; outputs as host arrays.
 
 (define tl_host_error (foreign-procedure "tl_host_error" () string))
 (define tl_host_tokenizer (foreign-procedure "tl_host_tokenizer" (integer-64) integer-64))
@@ -170,6 +213,36 @@
 (define tl_host_tensor_affine (foreign-procedure "tl_host_tensor_affine" (integer-64 double double) integer-64))
 (define tl_host_tensor_reshape
   (foreign-procedure "tl_host_tensor_reshape" (integer-64 integer-64 integer-64 integer-64 integer-64) integer-64))
+(define tl_host_tensor_new (foreign-procedure "tl_host_tensor_new" (integer-64) integer-64))
+(define tl_host_tensor_set (foreign-procedure "tl_host_tensor_set" (integer-64 integer-64 double) integer-64))
+(define tl_host_tensor_len (foreign-procedure "tl_host_tensor_len" (integer-64) integer-64))
+(define tl_host_tensor_get (foreign-procedure "tl_host_tensor_get" (integer-64 integer-64) double))
+(define tl_host_tensor_slice
+  (foreign-procedure "tl_host_tensor_slice" (integer-64 integer-64 integer-64 integer-64) integer-64))
+(define tl_host_tensor_transpose (foreign-procedure "tl_host_tensor_transpose" (integer-64) integer-64))
+(define tl_host_tensor_take (foreign-procedure "tl_host_tensor_take" (integer-64 integer-64) integer-64))
+(define tl_host_tensor_argmax (foreign-procedure "tl_host_tensor_argmax" (integer-64) integer-64))
+(define tl_host_boxes_convert (foreign-procedure "tl_host_boxes_convert" (integer-64 int int) integer-64))
+(define tl_host_nms (foreign-procedure "tl_host_nms" (integer-64 integer-64 integer-64 double) integer-64))
+(define tl_host_detect
+  (foreign-procedure "tl_host_detect"
+    (integer-64 integer-64 int double double int int integer-64 integer-64) integer-64))
+(define tl_host_boxes_scale (foreign-procedure "tl_host_boxes_scale" (integer-64 double double) integer-64))
+(define tl_host_boxes_clip (foreign-procedure "tl_host_boxes_clip" (integer-64 double double) integer-64))
+(define tl_host_boxes_unletterbox
+  (foreign-procedure "tl_host_boxes_unletterbox" (integer-64 integer-64 integer-64 integer-64 integer-64) integer-64))
+(define tl_host_image_letterbox
+  (foreign-procedure "tl_host_image_letterbox"
+    (integer-64 integer-64 integer-64 integer-64 integer-64 integer-64 int) integer-64))
+(define tl_host_dbscan (foreign-procedure "tl_host_dbscan" (integer-64 double integer-64 int) integer-64))
+(define tl_host_run_begin (foreign-procedure "tl_host_run_begin" (integer-64 string) integer-64))
+(define tl_host_run_input (foreign-procedure "tl_host_run_input" (integer-64 string integer-64) integer-64))
+(define tl_host_run_exec (foreign-procedure "tl_host_run_exec" (integer-64) integer-64))
+(define tl_host_run_output_name (foreign-procedure "tl_host_run_output_name" (integer-64 integer-64) string))
+(define tl_host_run_output (foreign-procedure "tl_host_run_output" (integer-64 integer-64) integer-64))
+(define tl_host_detokenize (foreign-procedure "tl_host_detokenize" (integer-64 integer-64 int) string))
+(define tl_host_token_id (foreign-procedure "tl_host_token_id" (integer-64 string) integer-64))
+(define tl_host_cluster_centroids (foreign-procedure "tl_host_cluster_centroids" (integer-64 integer-64) integer-64))
 
 ;; kind: bytes, tokenizer, image, audio or array.
 (define-record-type host
@@ -238,6 +311,21 @@
                                   (int-or 'max-length) (int-or 'pad-to) (int-or 'pad-id)))])
     (values ids (make-host (+ (host-id ids) 1) 'array))))
 
+;; Text from token ids (an array or a list), e.g. generated tokens.
+(define (detokenize tok ids . opts)
+  (let* ([o (%options 'detokenize opts '((skip-special . #t)))]
+         [text (tl_host_detokenize (%host-id 'detokenize 'tokenizer tok)
+                                   (%host-id 'detokenize 'array (if (list? ids) (list->array ids) ids))
+                                   (if (%opt o 'skip-special) 1 0))])
+    (unless text (error 'detokenize (tl_host_error)))
+    text))
+
+;; Id of a token (e.g. a special token such as "<eos>"), or #f.
+(define (token-id tok token)
+  (unless (string? token) (error 'token-id "expected a string" token))
+  (let ([id (tl_host_token_id (%host-id 'token-id 'tokenizer tok) token)])
+    (and (>= id 0) id)))
+
 ;; Images (8-bit RGB; resizing reproduces Pillow)
 
 (define (%filter who f)
@@ -276,6 +364,18 @@
   (%host 'image-center-crop 'image
     (tl_host_image_center_crop (%host-id 'image-center-crop 'image img)
                                (%int 'image-center-crop 'width width) (%int 'image-center-crop 'height height))))
+
+;; Fits the image into width x height keeping its aspect ratio, centered on
+;; 'fill (YOLO input, Ultralytics' LetterBox geometry).
+(define (image-letterbox img width height . opts)
+  (let* ([o (%options 'image-letterbox opts '((fill . (114 114 114)) (filter . bilinear)))]
+         [fill (%opt o 'fill)])
+    (unless (and (list? fill) (= (length fill) 3) (for-all (lambda (c) (and (fixnum? c) (<= 0 c 255))) fill))
+      (error 'image-letterbox "fill must be a list of 3 integers 0-255" fill))
+    (%host 'image-letterbox 'image
+      (tl_host_image_letterbox (%host-id 'image-letterbox 'image img)
+                               (%int 'image-letterbox 'width width) (%int 'image-letterbox 'height height)
+                               (car fill) (cadr fill) (caddr fill) (%filter 'image-letterbox (%opt o 'filter))))))
 
 ;; [3, H, W] (or [H, W, 3]) array: x * scale, then (x - mean) / std per channel.
 (define (image->array img . opts)
@@ -362,6 +462,127 @@
     (%host 'array-reshape 'array
       (tl_host_tensor_reshape (%host-id 'array-reshape 'array x) (car d) (cadr d) (caddr d) (cadddr d)))))
 
+;; Array access and manipulation
+
+(define (array-length x) (tl_host_tensor_len (%host-id 'array-length 'array x)))
+
+;; All elements in row-major order.
+(define (array->list x)
+  (let ([id (%host-id 'array->list 'array x)])
+    (map (lambda (i) (tl_host_tensor_get id i)) (iota (tl_host_tensor_len id)))))
+
+;; A 1-d array from a list of numbers.
+(define (list->array xs)
+  (unless (and (list? xs) (for-all real? xs)) (error 'list->array "expected a list of numbers" xs))
+  (let ([a (%host 'list->array 'array (tl_host_tensor_new (length xs)))])
+    (let loop ([xs xs] [i 0])
+      (unless (null? xs)
+        (tl_host_tensor_set (host-id a) i (inexact (car xs)))
+        (loop (cdr xs) (+ i 1))))
+    a))
+
+(define (%integer who name v)
+  (unless (fixnum? v) (error who (format "~a must be an integer" name) v))
+  v)
+
+;; x[start:end] along 'axis (default 0); negative bounds count from the end,
+;; end #f is the end.
+(define (array-slice x start end . opts)
+  (let ([o (%options 'array-slice opts '((axis . 0)))])
+    (%host 'array-slice 'array
+      (tl_host_tensor_slice (%host-id 'array-slice 'array x) (%int 'array-slice 'axis (%opt o 'axis))
+                            (%integer 'array-slice 'start start)
+                            (if end (%integer 'array-slice 'end end) (greatest-fixnum))))))
+
+;; Axes reversed ([a, b] -> [b, a]).
+(define (array-transpose x)
+  (%host 'array-transpose 'array (tl_host_tensor_transpose (%host-id 'array-transpose 'array x))))
+
+(define (%index-array who xs)
+  (if (list? xs) (list->array xs) xs))
+
+;; Entries along axis 0 at indices (an array or a list), e.g. kept detections.
+(define (array-take x indices)
+  (%host 'array-take 'array
+    (tl_host_tensor_take (%host-id 'array-take 'array x) (%host-id 'array-take 'array (%index-array 'array-take indices)))))
+
+;; Index of the largest value along the last axis.
+(define (array-argmax x)
+  (%host 'array-argmax 'array (tl_host_tensor_argmax (%host-id 'array-argmax 'array x))))
+
+;; Detection (boxes are [n, 4] arrays; torchvision / Ultralytics semantics)
+
+(define (%box-format who f)
+  (case f [(xyxy) 0] [(xywh) 1] [(cxcywh) 2]
+    [else (error who "box format must be xyxy, xywh or cxcywh" f)]))
+
+(define (boxes-convert boxes from to)
+  (%host 'boxes-convert 'array
+    (tl_host_boxes_convert (%host-id 'boxes-convert 'array boxes)
+                           (%box-format 'boxes-convert from) (%box-format 'boxes-convert to))))
+
+;; Greedy NMS on xyxy boxes: kept indices by descending score. With 'classes
+;; (array or list), boxes of different classes don't suppress each other.
+(define (nms boxes scores . opts)
+  (let ([o (%options 'nms opts '((iou . 0.5) (classes . #f)))])
+    (%host 'nms 'array
+      (tl_host_nms (%host-id 'nms 'array boxes) (%host-id 'nms 'array scores)
+                   (let ([c (%opt o 'classes)]) (if c (%host-id 'nms 'array (%index-array 'nms c)) 0))
+                   (%real 'nms 'iou (%opt o 'iou))))))
+
+;; Detector head to detections, like Ultralytics' non_max_suppression: boxes
+;; [n, 4] (format 'format), class-scores [n, classes] (probabilities).
+;; Returns four arrays: boxes [k, 4] xyxy, scores [k], classes [k] and the
+;; row of each detection in the input [k], best first.
+(define (detect boxes class-scores . opts)
+  (let* ([o (%options 'detect opts
+              '((format . cxcywh) (score-threshold . 0.25) (iou . 0.45) (class-agnostic . #f)
+                (multi-label . #f) (max-candidates . 30000) (max . 300)))]
+         [first (%host 'detect 'array
+                  (tl_host_detect (%host-id 'detect 'array boxes) (%host-id 'detect 'array class-scores)
+                                  (%box-format 'detect (%opt o 'format))
+                                  (%real 'detect 'score-threshold (%opt o 'score-threshold))
+                                  (%real 'detect 'iou (%opt o 'iou))
+                                  (if (%opt o 'class-agnostic) 1 0) (if (%opt o 'multi-label) 1 0)
+                                  (%int 'detect 'max-candidates (%opt o 'max-candidates))
+                                  (%int 'detect 'max (%opt o 'max))))]
+         [id (host-id first)])
+    (values first (make-host (+ id 1) 'array) (make-host (+ id 2) 'array) (make-host (+ id 3) 'array))))
+
+;; x coordinates times sx, y times sy (e.g. normalized boxes to pixels).
+(define (boxes-scale boxes sx sy)
+  (%host 'boxes-scale 'array
+    (tl_host_boxes_scale (%host-id 'boxes-scale 'array boxes) (%real 'boxes-scale 'sx sx) (%real 'boxes-scale 'sy sy))))
+
+(define (boxes-clip boxes width height)
+  (%host 'boxes-clip 'array
+    (tl_host_boxes_clip (%host-id 'boxes-clip 'array boxes) (%real 'boxes-clip 'width width) (%real 'boxes-clip 'height height))))
+
+;; xyxy boxes on a letterboxed (model-width x model-height) input back onto
+;; the original image, clipped (the inverse of image-letterbox).
+(define (boxes-unletterbox boxes model-width model-height width height)
+  (let ([i (lambda (name v) (%int 'boxes-unletterbox name v))])
+    (%host 'boxes-unletterbox 'array
+      (tl_host_boxes_unletterbox (%host-id 'boxes-unletterbox 'array boxes)
+                                 (i 'model-width model-width) (i 'model-height model-height)
+                                 (i 'width width) (i 'height height)))))
+
+;; Clustering
+
+;; DBSCAN (scikit-learn semantics) on the rows of x [n, d]: a label per row,
+;; -1 for noise. 'metric: euclidean or cosine.
+(define (dbscan x eps min-samples . opts)
+  (let ([o (%options 'dbscan opts '((metric . euclidean)))])
+    (%host 'dbscan 'array
+      (tl_host_dbscan (%host-id 'dbscan 'array x) (%real 'dbscan 'eps eps) (%int 'dbscan 'min-samples min-samples)
+                      (case (%opt o 'metric) [(euclidean) 0] [(cosine) 1]
+                        [else (error 'dbscan "metric must be euclidean or cosine" (%opt o 'metric))])))))
+
+;; Mean row per cluster: [clusters, d] (noise ignored).
+(define (cluster-centroids x labels)
+  (%host 'cluster-centroids 'array
+    (tl_host_cluster_centroids (%host-id 'cluster-centroids 'array x) (%host-id 'cluster-centroids 'array labels))))
+
 ;; (preprocess ([text string] [photo image]) body ... (model-inputs [ids array] ...))
 ;; Raw input kinds: string, image, audio, array. Runs per example on the host;
 ;; each result array is one example of the model input (the batch dimension
@@ -379,11 +600,28 @@
   (let ([slot (%loading)])
     (unless slot (error 'preprocess "preprocess can only be used while a program is loaded"))
     (when (vector-ref slot 1) (error 'preprocess "a program can define only one preprocess"))
-    (for-each (lambda (s)
-                (unless (and (symbol? (car s)) (memq (cadr s) '(string image audio array)))
-                  (error 'preprocess "raw inputs look like [name kind], kind: string, image, audio or array" s)))
-              spec)
+    (%check-raw-spec 'preprocess spec)
     (vector-set! slot 1 (cons spec proc))))
+
+;; (postprocess (name ...) body ... (results [name value] ...))
+;; Each name is a model output (one example of it: the batch dimension is
+;; split off) or a raw input of preprocess. Values are host arrays, numbers
+;; or lists of numbers. Runs per example on the host.
+(define-syntax results
+  (syntax-rules ()
+    [(_ [name expr] ...) (list (cons 'name expr) ...)]))
+
+(define-syntax postprocess
+  (syntax-rules ()
+    [(_ (name ...) body ...)
+     (%register-postprocess! '(name ...) (lambda (name ...) body ...))]))
+
+(define (%register-postprocess! names proc)
+  (let ([slot (%loading)])
+    (unless slot (error 'postprocess "postprocess can only be used while a program is loaded"))
+    (when (vector-ref slot 2) (error 'postprocess "a program can define only one postprocess"))
+    (unless (for-all symbol? names) (error 'postprocess "arguments must be names of outputs or raw inputs" names))
+    (vector-set! slot 2 (cons names proc))))
 
 ;; Model definition
 ;;
@@ -394,6 +632,11 @@
 ;; Input shapes are optional; a dimension may be #f or a symbol to accept any
 ;; size. The optional integer after an output is its rank (number of
 ;; dimensions); by default trailing dimensions of size 1 are dropped.
+;;
+;; A program may define several named entries, (model encode (inputs ...) ...),
+;; e.g. an encoder run once and a decoder run per step; an unnamed model is
+;; the entry `main`. The default entry (for preprocess, postprocess and runs
+;; that name none) is `main`, or else the first one defined.
 
 (define-syntax inputs (lambda (x) (syntax-violation 'inputs "misplaced auxiliary keyword" x)))
 
@@ -404,7 +647,9 @@
 (define-syntax model
   (syntax-rules (inputs)
     [(_ (inputs [name type dims ...] ...) body ...)
-     (%register-model! '((name type dims ...) ...) (lambda (name ...) body ...))]))
+     (%register-model! 'main '((name type dims ...) ...) (lambda (name ...) body ...))]
+    [(_ entry (inputs [name type dims ...] ...) body ...)
+     (%register-model! 'entry '((name type dims ...) ...) (lambda (name ...) body ...))]))
 
 (define %dtypes '(f32 i32))
 
@@ -420,20 +665,25 @@
                    (for-all (lambda (d) (or (not d) (symbol? d) (and (fixnum? d) (> d 0)))) dims))
         (error 'model "input dims must be a list of 1-4 positive integers, symbols or #f" dims)))))
 
-;; Set by the host while a program is evaluated: #((spec . builder) preprocess).
+;; Set by the host while a program is evaluated:
+;; #(entries preprocess postprocess pipelines states), entries, pipelines and
+;; states as reversed lists of (name ...).
 (define %loading (make-parameter #f))
 
-(define (%register-model! spec builder)
+(define (%register-model! entry spec builder)
   (let ([slot (%loading)])
     (cond
       [(not slot) (error 'model "model can only be used while a program is loaded")]
-      [(vector-ref slot 0) (error 'model "a program can define only one model")]
+      [(not (symbol? entry)) (error 'model "an entry name must be a symbol" entry)]
+      [(assq entry (vector-ref slot 0))
+       (error 'model (if (eq? entry 'main) "a program can define only one unnamed model" "duplicate entry name") entry)]
+      [(assq entry (vector-ref slot 3)) (error 'model "a pipeline already has this name" entry)]
       [else
        (for-each %check-input-spec spec)
        (let ([names (map car spec)])
          (unless (= (length names) (length (%dedupe names)))
            (error 'model "duplicate input names" names)))
-       (vector-set! slot 0 (cons spec builder))])))
+       (vector-set! slot 0 (cons (list entry spec builder) (vector-ref slot 0)))])))
 
 (define (%dedupe xs)
   (let loop ([xs xs] [seen '()])
@@ -441,6 +691,65 @@
       [(null? xs) (reverse seen)]
       [(memq (car xs) seen) (loop (cdr xs) seen)]
       [else (loop (cdr xs) (cons (car xs) seen))])))
+
+;; Pipelines: host code that runs entries, e.g. a generation loop.
+;;
+;; (pipeline caption ([photo image] [prompt string])
+;;   (let* ([enc (run encode [pixels ...] [ids ...])]
+;;          [dec (run decode [memory (output enc 'memory)] ...)])
+;;     (results [text (detokenize tok ...)])))
+;;
+;; (run entry [input array] ...) runs a model entry on host arrays (a missing
+;; leading batch dimension of 1 is added) and returns its outputs; (output r
+;; name) picks one. Results may also be strings.
+(define-syntax pipeline
+  (syntax-rules ()
+    [(_ name ([arg kind] ...) body ...)
+     (%register-pipeline! 'name '((arg kind) ...) (lambda (arg ...) body ...))]))
+
+(define (%register-pipeline! name spec proc)
+  (let ([slot (%loading)])
+    (unless slot (error 'pipeline "pipeline can only be used while a program is loaded"))
+    (when (or (assq name (vector-ref slot 3)) (assq name (vector-ref slot 0)))
+      (error 'pipeline "an entry or pipeline already has this name" name))
+    (%check-raw-spec 'pipeline spec)
+    (vector-set! slot 3 (cons (list name spec proc) (vector-ref slot 3)))))
+
+(define (%check-raw-spec who spec)
+  (for-each (lambda (s)
+              (unless (and (symbol? (car s)) (memq (cadr s) '(string image audio array)))
+                (error who "raw inputs look like [name kind], kind: string, image, audio or array" s)))
+            spec))
+
+;; The program a pipeline runs in (its id), while it runs.
+(define %current-program (make-parameter #f))
+
+(define-syntax run
+  (syntax-rules ()
+    [(_ entry [name expr] ...) (%run 'entry (list (cons 'name expr) ...))]))
+
+;; Returns ((output-name . array) ...).
+(define (%run entry inputs)
+  (let ([id (%current-program)])
+    (unless id (error 'run "run can only be used in a pipeline"))
+    (let ([r (tl_host_run_begin id (symbol->string entry))])
+      (when (eqv? r 0) (error 'run (tl_host_error)))
+      (for-each (lambda (i)
+                  (unless (symbol? (car i)) (error 'run "inputs look like [name array]" i))
+                  (when (eqv? (tl_host_run_input r (symbol->string (car i)) (%host-id 'run 'array (cdr i))) 0)
+                    (error 'run (tl_host_error))))
+                inputs)
+      (let ([n (- (tl_host_run_exec r) 1)])
+        (when (< n 0) (error (string->symbol (format "run ~a" entry)) (tl_host_error)))
+        (map (lambda (i)
+               (cons (string->symbol (tl_host_run_output_name r i))
+                     (%host 'run 'array (tl_host_run_output r i))))
+             (iota n))))))
+
+(define (output results name)
+  (let ([entry (assq name results)])
+    (unless entry (error 'output (format "no output ~s; outputs are ~s" name (map car results))))
+    (cdr entry)))
 
 ;; Environment programs are evaluated in: pure R6RS (plus the R5RS names like
 ;; quotient), a few pure Chez utilities, and (tensorlisp). No eval, ports,
@@ -458,18 +767,31 @@
 
 (define %models (make-eqv-hashtable))
 
-;; %models: id -> #(input-spec builder preprocess assets)
-(define (%model-spec m) (vector-ref m 0))
-(define (%model-builder m) (vector-ref m 1))
-(define (%model-preprocess m) (vector-ref m 2))
-(define (%model-assets m) (vector-ref m 3))
+;; %models: id -> #(entries preprocess assets postprocess pipelines), entries
+;; ((name spec builder) ...) and pipelines ((name spec proc) ...) in
+;; definition order.
+(define (%model-entries m) (vector-ref m 0))
+(define (%model-preprocess m) (vector-ref m 1))
+(define (%model-assets m) (vector-ref m 2))
+(define (%model-postprocess m) (vector-ref m 3))
+(define (%model-pipelines m) (vector-ref m 4))
+
+(define (%default-entry m)
+  (or (assq 'main (%model-entries m)) (car (%model-entries m))))
+
+(define (%raw-spec->strings spec)
+  (map (lambda (s) (list (symbol->string (car s)) (symbol->string (cadr s)))) spec))
 
 ;; Evaluates a program with its assets ((name . bytes-id) ...). Returns
-;; (inputs raw-inputs): inputs ((name-string dtype-string dims-or-#f) ...),
-;; raw-inputs ((name-string kind-string) ...) or #f without preprocess.
+;; (entries raw-inputs post-args pipelines):
+;; entries ((entry-name ((name-string dtype-string dims-or-#f) ...)) ...), default first;
+;; raw-inputs ((name-string kind-string) ...) or #f without preprocess;
+;; post-args (name-string ...) or #f without postprocess;
+;; pipelines ((name-string raw-inputs) ...);
+;; states ((name-string type-string (dim ...)) ...).
 (define ($tl-load-program id text assets)
   (let ([env (%program-environment)]
-        [slot (vector #f #f)]
+        [slot (vector '() #f #f '() '())]
         [port (open-input-string text)])
     (parameterize ([%loading slot] [%assets assets])
       (let loop ()
@@ -477,29 +799,42 @@
           (unless (eof-object? form)
             (eval form env)
             (loop)))))
-    (unless (vector-ref slot 0) (error 'load "the program does not define a model"))
-    (let ([model (vector-ref slot 0)] [pre (vector-ref slot 1)])
-      (hashtable-set! %models id (vector (car model) (cdr model) pre assets))
+    (when (null? (vector-ref slot 0)) (error 'load "the program does not define a model"))
+    (let* ([pre (vector-ref slot 1)]
+           [post (vector-ref slot 2)]
+           [m (vector (reverse (vector-ref slot 0)) pre assets post (reverse (vector-ref slot 3)))]
+           [default (%default-entry m)])
+      (hashtable-set! %models id m)
       (list
-        (map (lambda (spec)
-               (list (symbol->string (car spec))
-                     (symbol->string (cadr spec))
-                     (and (= (length spec) 3)
-                          (map (lambda (d) (and (fixnum? d) d)) (caddr spec)))))
-             (car model))
-        (and pre (map (lambda (s) (list (symbol->string (car s)) (symbol->string (cadr s)))) (car pre)))))))
+        (map (lambda (e)
+               (list (symbol->string (car e))
+                     (map (lambda (spec)
+                            (list (symbol->string (car spec))
+                                  (symbol->string (cadr spec))
+                                  (and (= (length spec) 3)
+                                       (map (lambda (d) (and (fixnum? d) d)) (caddr spec)))))
+                          (cadr e))))
+             (cons default (remq default (%model-entries m))))
+        (and pre (%raw-spec->strings (car pre)))
+        (and post (map symbol->string (car post)))
+        (map (lambda (p) (list (symbol->string (car p)) (%raw-spec->strings (cadr p))))
+             (%model-pipelines m))
+        (map (lambda (st) (list (car st) (symbol->string (cadr st)) (caddr st)))
+             (reverse (vector-ref slot 4)))))))
+
+(define (%host-arg a)
+  (if (string? a) a (make-host (cdr a) (if (eq? (car a) 'tensor) 'array (car a)))))
 
 ;; Runs preprocess on one example. raws: per raw input, a string or
-;; (kind . host-id). Returns ((input-name . array-id) ...) in input order.
+;; (kind . host-id). Returns ((input-name . array-id) ...) in the default
+;; entry's input order.
 (define ($tl-preprocess id raws)
   (let* ([m (hashtable-ref %models id #f)]
          [pre (and m (%model-preprocess m))])
     (unless pre (error 'preprocess "the program has no preprocess form"))
-    (let* ([args (map (lambda (spec raw)
-                        (if (string? raw) raw (make-host (cdr raw) (if (eq? (car raw) 'tensor) 'array (car raw)))))
-                      (car pre) raws)]
+    (let* ([args (map %host-arg raws)]
            [result (parameterize ([%assets (%model-assets m)]) (apply (cdr pre) args))]
-           [names (map car (%model-spec m))])
+           [names (map car (cadr (%default-entry m)))])
       (unless (and (list? result) (for-all pair? result))
         (error 'preprocess "the body must end in (model-inputs [name array] ...)" result))
       (map (lambda (name)
@@ -507,6 +842,41 @@
                (unless entry (error 'preprocess "no array for model input" name))
                (list (symbol->string name) (%host-id 'model-inputs 'array (cdr entry)))))
            names))))
+
+;; (results ...) of postprocess or a pipeline for the host:
+;; ((name-string kind payload) ...), kind "array" with a host id, "scalar"
+;; with a number, "vector" with a list of numbers or "text" with a string.
+(define (%export-results who result)
+  (unless (and (list? result) (for-all (lambda (r) (and (pair? r) (symbol? (car r)))) result))
+    (error who "the body must end in (results [name value] ...)" result))
+  (map (lambda (r)
+         (let ([name (symbol->string (car r))] [v (cdr r)])
+           (cond
+             [(host? v) (list name "array" (%host-id 'results 'array v))]
+             [(real? v) (list name "scalar" (inexact v))]
+             [(string? v) (list name "text" v)]
+             [(and (list? v) (for-all real? v)) (list name "vector" (map inexact v))]
+             [else (error 'results (format "~a must be an array, a number, a string or a list of numbers" name) v)])))
+       result))
+
+;; Runs postprocess on one example. args: per postprocess argument, a string
+;; or (kind . host-id).
+(define ($tl-postprocess id args)
+  (let* ([m (hashtable-ref %models id #f)]
+         [post (and m (%model-postprocess m))])
+    (unless post (error 'postprocess "the program has no postprocess form"))
+    (%export-results 'postprocess
+      (parameterize ([%assets (%model-assets m)])
+        (apply (cdr post) (map %host-arg args))))))
+
+;; Runs pipeline name on raw inputs (in its declared order, like preprocess).
+(define ($tl-pipeline id name raws)
+  (let* ([m (hashtable-ref %models id #f)]
+         [p (and m (assq (string->symbol name) (%model-pipelines m)))])
+    (unless p (error 'pipeline "the program has no pipeline with this name" name))
+    (%export-results 'pipeline
+      (parameterize ([%assets (%model-assets m)] [%current-program id])
+        (apply (caddr p) (map %host-arg raws))))))
 
 ;; Creates an input tensor for spec (name dtype ...) with ggml dims ne (1-4 sizes).
 (define (%new-input ctx spec ne)
@@ -540,23 +910,26 @@
         rank))
     (list name p rank)))
 
-;; Builds the whole graph for model id in ctx. input-dims holds the ggml dims
-;; of each input, in input order. taps is #t for all taps or a list of tap
+;; Builds the whole graph of entry (a string) of model id in ctx. input-dims
+;; holds the ggml dims of each input, in input order. taps is #t for all taps or a list of tap
 ;; names to read back. Returns
 ;; (graph (input-address ...) (output ...) (tap ...) (tap-name ...)), where
 ;; outputs and taps are (name-string address rank).
-(define ($tl-build id ctx weights input-dims graph-size taps)
+(define ($tl-build id entry ctx weights states input-dims graph-size taps)
   (let ([m (hashtable-ref %models id #f)]
         [tap-slot (box '())])
     (unless m (error 'build "unknown model" id))
-    (let ([m (cons (%model-spec m) (%model-builder m))])
+    (let ([m (let ([e (assq (string->symbol entry) (%model-entries m))])
+               (unless e (error 'build "unknown entry" entry))
+               (cons (cadr e) (caddr e)))])
     (set! %op 'inputs)
     (set! %pending '())
-    (parameterize ([%ctx ctx] [%weights weights] [%taps tap-slot])
+    (parameterize ([%ctx ctx] [%weights weights] [%states states] [%taps tap-slot]
+                   [%graph (ggml_new_graph_custom ctx graph-size #f)])
       (let* ([inputs (map (lambda (spec ne) (%new-input ctx spec ne))
                           (car m) input-dims)]
              [outs (apply (cdr m) (map (lambda (p) (make-tensor p ctx)) inputs))])
-        (unless (and (list? outs) (pair? outs))
+        (unless (list? outs)
           (error 'model "the model body must end in (outputs [name tensor] ...)" outs))
         (set! %op 'outputs)
         (let* ([outputs
@@ -575,7 +948,7 @@
                          taps))]
                [tap-results
                 (map (lambda (tp) (%result ctx 'tap (car tp) (cadr tp) (caddr tp))) selected)]
-               [graph (ggml_new_graph_custom ctx graph-size #f)])
+               [graph (%graph)])
           (for-each (lambda (r) (ggml_build_forward_expand graph (cadr r)))
                     (append outputs tap-results))
           (list graph inputs outputs tap-results (map car tapped))))))))

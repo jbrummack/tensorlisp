@@ -4,9 +4,10 @@ use std::{
     fs::File,
     mem::ManuallyDrop,
     os::unix::fs::FileExt,
+    ops::Deref,
     path::Path,
     ptr::null_mut,
-    sync::Mutex,
+    sync::{Arc, Mutex, Weak},
 };
 
 use ggml_sys::ffi::*;
@@ -18,7 +19,7 @@ use crate::{
     guard,
     program::Program,
     dtype::DType,
-    scheme::{InputSpec, LoadedProgram, RawKind, RawSpec, RawValue, Taps},
+    scheme::{EntrySpec, InputSpec, LoadedProgram, PipelineSpec, PostValue, RawKind, RawSpec, RawValue, ResultValue, StateSpec, Taps},
 };
 
 /// Options for [`Model::load_with`].
@@ -62,11 +63,13 @@ pub enum Device {
     Gpu,
 }
 
-/// A tensorlisp model: weights on the device plus the program that builds its graph.
+/// A tensorlisp model: weights on the device plus the program that builds its graphs.
 ///
-/// The graph for the current input shapes stays allocated and is recomputed
-/// directly while the shapes stay the same. A shape change rebuilds it, since
-/// resetting the scheduler invalidates every previously allocated graph.
+/// A program has one or more entries (`(model name (inputs ...) ...)`), all
+/// sharing the weights. Each entry's graph for its current input shapes stays
+/// allocated and is recomputed directly while the shapes stay the same; a
+/// shape change rebuilds it (each entry has its own scheduler, since
+/// resetting one invalidates every graph it allocated).
 ///
 /// ggml assertions become [`Error::Ggml`] where they can be caught: while the
 /// graph is built, and on the calling thread during allocation and compute.
@@ -75,8 +78,62 @@ pub enum Device {
 /// of freeing memory those threads may still use. Load it again to recover.
 /// Assertions on backend worker threads still abort the process.
 pub struct Model {
-    inputs: Vec<InputSpec>,
+    shared: Arc<Shared>,
+}
+
+pub struct Shared {
+    /// Default entry first.
+    entries: Vec<EntrySpec>,
+    pipelines: Vec<PipelineSpec>,
+    program_id: i64,
     inner: Mutex<Inner>,
+}
+
+impl Deref for Model {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+/// Loaded models by program id, for pipelines that run entries from Scheme.
+static MODELS: Mutex<Vec<(i64, Weak<Shared>)>> = Mutex::new(Vec::new());
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        MODELS.lock().unwrap().retain(|(id, _)| *id != self.program_id);
+    }
+}
+
+/// Runs an entry of the model whose program has id `program` (called by
+/// `(run ...)` in pipelines). A missing leading batch dimension of 1 is added.
+pub(crate) fn run_program_entry(
+    program: i64,
+    entry: &str,
+    inputs: Vec<(String, ArrayD<f32>)>,
+) -> Result<Vec<(String, ArrayD<f32>)>> {
+    let shared = MODELS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, _)| *id == program)
+        .and_then(|(_, weak)| weak.upgrade())
+        .ok_or_else(|| Error::Program("the model of this pipeline is gone".into()))?;
+    let model = Model { shared };
+    let spec = model.entry(Some(entry))?;
+    let inputs: Vec<(String, ArrayD<f32>)> = inputs
+        .into_iter()
+        .map(|(name, array)| {
+            let declared = spec.inputs.iter().find(|s| s.name == name).and_then(|s| s.dims.as_ref()).map(|d| d.len());
+            if declared == Some(array.ndim() + 1) {
+                (name, array.insert_axis(ndarray::Axis(0)))
+            } else {
+                (name, array)
+            }
+        })
+        .collect();
+    let views: Vec<(&str, ArrayViewD<f32>)> = inputs.iter().map(|(n, a)| (n.as_str(), a.view())).collect();
+    Ok(model.run_entry(entry, &views, &RunOptions::default())?.outputs)
 }
 
 /// Options for [`Model::run_with`].
@@ -86,11 +143,53 @@ pub struct RunOptions {
     pub taps: Taps,
 }
 
+/// Results of a postprocess or pipeline: arrays, or text (e.g. generated).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Array(ArrayD<f32>),
+    Text(String),
+}
+
+impl Value {
+    pub fn as_array(&self) -> Option<&ArrayD<f32>> {
+        match self {
+            Value::Array(a) => Some(a),
+            Value::Text(_) => None,
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Value::Text(t) => Some(t),
+            Value::Array(_) => None,
+        }
+    }
+}
+
+impl From<ResultValue> for Value {
+    fn from(v: ResultValue) -> Value {
+        match v {
+            ResultValue::Array(a) => Value::Array(a),
+            ResultValue::Text(t) => Value::Text(t),
+        }
+    }
+}
+
 /// Named results in the order the program declares them.
 #[derive(Debug, Clone, Default)]
 pub struct RunOutput {
     pub outputs: Vec<(String, ArrayD<f32>)>,
     pub taps: Vec<(String, ArrayD<f32>)>,
+}
+
+/// Result of [`Model::infer`]: the postprocessed results of each example,
+/// plus what the model computed for the whole batch.
+#[derive(Debug, Clone, Default)]
+pub struct Inference {
+    /// Per example, the `(results ...)` of the program's postprocess (in the
+    /// order it lists them), or the example's slice of every output without one.
+    pub examples: Vec<Vec<(String, Value)>>,
+    pub run: RunOutput,
 }
 
 /// The graph a program builds for given input shapes, without computing it.
@@ -127,6 +226,13 @@ struct Graph {
     tap_names: Vec<String>,
 }
 
+/// An entry's scheduler and allocated graph.
+struct EntryGraph {
+    sched: ggml_backend_sched_t,
+    /// The allocated graph and what it was built for.
+    graph: Option<(GraphKey, Graph)>,
+}
+
 struct Inner {
     program: LoadedProgram,
     /// Holds the weight tensors' metadata; ManuallyDrop so a poisoned model can leak it.
@@ -134,9 +240,11 @@ struct Inner {
     /// Primary device first, CPU last.
     backends: Vec<ggml_backend_t>,
     weights: ggml_backend_buffer_t,
-    sched: ggml_backend_sched_t,
-    /// The allocated graph and what it was built for.
-    graph: Option<(GraphKey, Graph)>,
+    /// `(define-state ...)` tensors (null without any) and their buffer on the primary device.
+    states: *mut ggml_context,
+    state_buffer: ggml_backend_buffer_t,
+    /// Per entry, created on first use.
+    graphs: HashMap<String, EntryGraph>,
     /// Set when an assertion fired during compute.
     poisoned: Option<String>,
 }
@@ -209,8 +317,9 @@ impl Model {
             file: ManuallyDrop::new(file),
             backends,
             weights: null_mut(),
-            sched: null_mut(),
-            graph: None,
+            states: null_mut(),
+            state_buffer: null_mut(),
+            graphs: HashMap::new(),
             poisoned: None,
         };
         inner.weights = guard::alloc_ctx_tensors(inner.file.tensors, inner.backends[0])?;
@@ -218,26 +327,62 @@ impl Model {
             return Err(Error::Backend("failed to allocate the weight buffer".into()));
         }
         load_weights(&inner.file, path)?;
+        inner.alloc_states()?;
 
-        inner.sched = unsafe {
-            ggml_backend_sched_new(
-                inner.backends.as_mut_ptr(),
-                null_mut(),
-                inner.backends.len() as i32,
-                GRAPH_SIZE,
-                false,
-                true,
-            )
-        };
-        if inner.sched.is_null() {
-            return Err(Error::Backend("failed to create the scheduler".into()));
-        }
-        Ok(Model { inputs: inner.program.inputs.clone(), inner: Mutex::new(inner) })
+        let shared = Arc::new(Shared {
+            entries: inner.program.entries.clone(),
+            pipelines: inner.program.pipelines.clone(),
+            program_id: inner.program.id(),
+            inner: Mutex::new(inner),
+        });
+        MODELS.lock().unwrap().push((shared.program_id, Arc::downgrade(&shared)));
+        Ok(Model { shared })
     }
 
-    /// Inputs declared by the program, in declaration order.
+    /// Inputs of the default entry (`main`, or the first one defined), in declaration order.
     pub fn inputs(&self) -> &[InputSpec] {
-        &self.inputs
+        &self.entries[0].inputs
+    }
+
+    /// The program's entries, the default first.
+    pub fn entries(&self) -> &[EntrySpec] {
+        &self.entries
+    }
+
+    /// The program's pipelines (host code that runs entries, e.g. generation).
+    pub fn pipelines(&self) -> &[PipelineSpec] {
+        &self.pipelines
+    }
+
+    /// Zeroes every `(define-state ...)` tensor, as after loading.
+    pub fn reset_state(&self) {
+        let inner = self.inner.lock().unwrap();
+        if !inner.state_buffer.is_null() {
+            unsafe { ggml_backend_buffer_clear(inner.state_buffer, 0) };
+        }
+    }
+
+    /// An entry by name, or the default one.
+    pub fn entry(&self, name: Option<&str>) -> Result<&EntrySpec> {
+        match name {
+            None => Ok(&self.entries[0]),
+            Some(name) => self.entries.iter().find(|e| e.name == name).ok_or_else(|| {
+                let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+                Error::Input(format!("no entry {name:?}; entries: {}", names.join(", ")))
+            }),
+        }
+    }
+
+    /// Runs pipeline `name` on one example of its raw inputs.
+    pub fn pipeline(&self, name: &str, example: Vec<(String, RawInput)>) -> Result<Vec<(String, Value)>> {
+        let spec = self.pipelines.iter().find(|p| p.name == name).ok_or_else(|| {
+            let names: Vec<&str> = self.pipelines.iter().map(|p| p.name.as_str()).collect();
+            Error::Input(format!("no pipeline {name:?}; pipelines: {}", names.join(", ")))
+        })?;
+        let values = raw_values(&spec.raw_inputs, example)?;
+        // Not under the lock: the pipeline runs entries, which take it.
+        let results = LoadedProgram::run_pipeline(self.program_id, name, values.into_iter().map(|(_, v)| v).collect())?;
+        Ok(results.into_iter().map(|(n, v)| (n, v.into())).collect())
     }
 
     /// Raw inputs of the program's `(preprocess ...)`, if it has one.
@@ -245,57 +390,132 @@ impl Model {
         self.inner.lock().unwrap().program.raw_inputs.clone()
     }
 
+    /// Arguments of the program's `(postprocess ...)`, if it has one: names
+    /// of model outputs or raw inputs.
+    pub fn postprocess_args(&self) -> Option<Vec<String>> {
+        self.inner.lock().unwrap().program.post_args.clone()
+    }
+
     /// Runs the program's `(preprocess ...)` on one example: one array per
-    /// model input (without the batch dimension), in input order.
+    /// input of the default entry (without the batch dimension), in input order.
     pub fn preprocess(&self, example: Vec<(String, RawInput)>) -> Result<Vec<(String, ArrayD<f32>)>> {
-        let inner = self.inner.lock().unwrap();
-        let specs = inner
-            .program
-            .raw_inputs
-            .clone()
+        let values = self.raw_values(example)?;
+        self.inner.lock().unwrap().program.preprocess(values.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// Checks an example against the preprocess's raw inputs and orders it like them.
+    fn raw_values(&self, example: Vec<(String, RawInput)>) -> Result<Vec<(String, RawValue)>> {
+        let specs = self
+            .raw_inputs()
             .ok_or_else(|| Error::Program("the program has no (preprocess ...) form".into()))?;
-        let mut example = example;
-        let expected = || specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
-        if let Some((name, _)) = example.iter().find(|(n, _)| !specs.iter().any(|s| s.name == *n)) {
-            return Err(Error::Input(format!("unknown raw input {name:?}, expected: {}", expected())));
-        }
-        let values = specs
-            .iter()
-            .map(|spec| {
-                let i = example
+        raw_values(&specs, example)
+    }
+
+    /// Runs the program's `(postprocess ...)` on batched model outputs (e.g.
+    /// [`RunOutput::outputs`]), once per example: each output's first
+    /// dimension is the batch. Fails if the postprocess needs raw inputs;
+    /// use [`Model::infer`] for those.
+    pub fn postprocess(&self, outputs: &[(String, ArrayD<f32>)]) -> Result<Vec<Vec<(String, Value)>>> {
+        self.postprocess_batch(outputs, None)
+    }
+
+    /// Like [`Model::postprocess`], with the raw examples the outputs were
+    /// computed from, for a postprocess that reads raw inputs.
+    pub fn postprocess_with_raw(
+        &self,
+        outputs: &[(String, ArrayD<f32>)],
+        examples: Vec<Vec<(String, RawInput)>>,
+    ) -> Result<Vec<Vec<(String, Value)>>> {
+        let raws = examples.into_iter().map(|e| self.raw_values(e)).collect::<Result<Vec<_>>>()?;
+        self.postprocess_batch(outputs, Some(raws))
+    }
+
+    /// Preprocesses raw examples, runs the model on them as one batch and
+    /// postprocesses each example. Without a postprocess, each example gets
+    /// its slice of every output.
+    pub fn infer(&self, examples: Vec<Vec<(String, RawInput)>>, options: &RunOptions) -> Result<Inference> {
+        let post_args = self.postprocess_args();
+        let mut kept = Vec::with_capacity(examples.len());
+        let mut processed = Vec::with_capacity(examples.len());
+        for example in examples {
+            let values = self.raw_values(example)?;
+            // Raw inputs the postprocess reads are kept for it.
+            kept.push(
+                values
                     .iter()
-                    .position(|(n, _)| *n == spec.name)
-                    .ok_or_else(|| Error::Input(format!("missing raw input {:?}, expected: {}", spec.name, expected())))?;
-                let (_, input) = example.swap_remove(i);
-                if input.kind() != spec.kind {
-                    return Err(Error::Input(format!("raw input {:?} must be {:?}", spec.name, spec.kind)));
-                }
-                Ok(match input {
-                    RawInput::Text(t) => RawValue::Text(t),
-                    RawInput::Image(i) => RawValue::Image(i.to_rgb8()),
-                    RawInput::Audio(a) => RawValue::Audio(a),
-                    RawInput::Array(a) => RawValue::Array(a),
-                })
+                    .filter(|(name, _)| post_args.as_ref().is_some_and(|args| args.contains(name)))
+                    .map(|(name, v)| (name.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            let values = values.into_iter().map(|(_, v)| v).collect();
+            processed.push(self.inner.lock().unwrap().program.preprocess(values)?);
+        }
+        let inputs = stack_examples(processed)?;
+        let views: Vec<(&str, ArrayViewD<f32>)> = inputs.iter().map(|(n, a)| (n.as_str(), a.view())).collect();
+        let run = self.run_with(&views, options)?;
+        let examples = self.postprocess_batch(&run.outputs, Some(kept))?;
+        Ok(Inference { examples, run })
+    }
+
+    fn postprocess_batch(
+        &self,
+        outputs: &[(String, ArrayD<f32>)],
+        raws: Option<Vec<Vec<(String, RawValue)>>>,
+    ) -> Result<Vec<Vec<(String, Value)>>> {
+        let post_args = self.postprocess_args();
+        let batch = match (&raws, outputs.first()) {
+            (Some(raws), _) => raws.len(),
+            (None, Some((_, a))) => *a.shape().first().ok_or_else(|| Error::Input("outputs are scalars; no batch dimension".into()))?,
+            (None, None) => return Err(Error::Input("no outputs to postprocess".into())),
+        };
+        for (name, a) in outputs {
+            if a.shape().first() != Some(&batch) {
+                return Err(Error::Input(format!(
+                    "postprocess splits outputs into {batch} examples along their first dimension, but {name:?} has shape {:?}",
+                    a.shape()
+                )));
+            }
+        }
+        let example = |i: usize| -> Vec<(String, ArrayD<f32>)> {
+            outputs.iter().map(|(n, a)| (n.clone(), a.index_axis(ndarray::Axis(0), i).to_owned())).collect()
+        };
+        let Some(args) = post_args else {
+            return Ok((0..batch)
+                .map(|i| example(i).into_iter().map(|(n, a)| (n, Value::Array(a))).collect())
+                .collect());
+        };
+        let mut raws = raws.map(|r| r.into_iter());
+        (0..batch)
+            .map(|i| {
+                let mut arrays = example(i);
+                let mut raw = raws.as_mut().and_then(|r| r.next()).unwrap_or_default();
+                let values = args
+                    .iter()
+                    .map(|name| {
+                        if let Some(j) = arrays.iter().position(|(n, _)| n == name) {
+                            return Ok(PostValue::Array(arrays.swap_remove(j).1));
+                        }
+                        if let Some(j) = raw.iter().position(|(n, _)| n == name) {
+                            return Ok(PostValue::Raw(raw.swap_remove(j).1));
+                        }
+                        let is_raw = self.raw_inputs().is_some_and(|specs| specs.iter().any(|s| s.name == *name));
+                        Err(Error::Input(if is_raw {
+                            format!("postprocess needs raw input {name:?}; run the model on raw inputs (Model::infer)")
+                        } else {
+                            let outputs: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
+                            format!("postprocess argument {name:?} is neither an output ({}) nor a raw input", outputs.join(", "))
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let results = self.inner.lock().unwrap().program.postprocess(values)?;
+                Ok(results.into_iter().map(|(n, v)| (n, v.into())).collect())
             })
-            .collect::<Result<Vec<_>>>()?;
-        inner.program.preprocess(values)
+            .collect()
     }
 
     /// Preprocesses every example and stacks them: one `[batch, ...]` array per model input.
     pub fn preprocess_batch(&self, examples: Vec<Vec<(String, RawInput)>>) -> Result<Vec<(String, ArrayD<f32>)>> {
-        let processed: Vec<Vec<(String, ArrayD<f32>)>> =
-            examples.into_iter().map(|e| self.preprocess(e)).collect::<Result<_>>()?;
-        let Some(first) = processed.first() else { return Err(Error::Input("no examples".into())) };
-        (0..first.len())
-            .map(|i| {
-                let name = first[i].0.clone();
-                let views: Vec<_> = processed.iter().map(|p| p[i].1.view()).collect();
-                let stacked = ndarray::stack(ndarray::Axis(0), &views).map_err(|_| {
-                    Error::Input(format!("preprocessed {name} differs in shape between examples; pad to a fixed size"))
-                })?;
-                Ok((name, stacked))
-            })
-            .collect()
+        stack_examples(examples.into_iter().map(|e| self.preprocess(e)).collect::<Result<_>>()?)
     }
 
     /// Preprocesses raw examples, stacks them into a batch and runs the model.
@@ -317,8 +537,16 @@ impl Model {
         Ok(self.run_with(inputs, &RunOptions::default())?.outputs.into_iter().collect())
     }
 
+    /// Runs the default entry.
     pub fn run_with(&self, inputs: &[(&str, ArrayViewD<f32>)], options: &RunOptions) -> Result<RunOutput> {
-        let ordered = self.order_inputs(inputs, |a| a.shape())?;
+        let name = self.entries[0].name.clone();
+        self.run_entry(&name, inputs, options)
+    }
+
+    /// Runs entry `name` on named inputs.
+    pub fn run_entry(&self, name: &str, inputs: &[(&str, ArrayViewD<f32>)], options: &RunOptions) -> Result<RunOutput> {
+        let spec = self.entry(Some(name))?;
+        let ordered = order_inputs(spec, inputs, |a| a.shape())?;
         let key: GraphKey = (ordered.iter().map(|a| a.shape().to_vec()).collect(), options.taps.clone());
 
         let mut guard = self.inner.lock().unwrap();
@@ -328,12 +556,13 @@ impl Model {
                 "the model is unusable after an earlier ggml assertion during compute ({reason}); load it again"
             )));
         }
-        if inner.graph.as_ref().is_none_or(|(k, _)| *k != key) {
-            inner.rebuild_graph(key)?;
+        if inner.graphs.get(name).and_then(|g| g.graph.as_ref()).is_none_or(|(k, _)| *k != key) {
+            inner.rebuild_graph(name, key)?;
         }
-        let (_, graph) = inner.graph.as_ref().unwrap();
+        let entry = &inner.graphs[name];
+        let (_, graph) = entry.graph.as_ref().unwrap();
 
-        for ((&t, array), spec) in graph.inputs.iter().zip(&ordered).zip(&self.inputs) {
+        for ((&t, array), spec) in graph.inputs.iter().zip(&ordered).zip(&spec.inputs) {
             let data = array.as_standard_layout();
             if spec.dtype == "i32" {
                 guard::tensor_set(t, &to_i32_bytes(&spec.name, data.as_slice().unwrap())?)?;
@@ -343,7 +572,7 @@ impl Model {
                 guard::tensor_set(t, bytes)?;
             }
         }
-        match guard::sched_graph_compute(inner.sched, graph.graph) {
+        match guard::sched_graph_compute(entry.sched, graph.graph) {
             Ok(ggml_status::GGML_STATUS_SUCCESS) => {}
             Ok(status) => {
                 let msg = unsafe { CStr::from_ptr(ggml_status_to_string(status)) }.to_string_lossy();
@@ -358,44 +587,97 @@ impl Model {
         Ok(RunOutput { outputs: read_results(&graph.outputs)?, taps: read_results(&graph.taps)? })
     }
 
-    /// Builds the graph for the given input shapes (ndarray order) without
-    /// allocating or computing it, and describes its nodes.
+    /// Builds the default entry's graph for the given input shapes (ndarray
+    /// order) without allocating or computing it, and describes its nodes.
     pub fn graph(&self, inputs: &[(&str, Vec<usize>)], taps: &Taps) -> Result<GraphInfo> {
-        let ordered = self.order_inputs(inputs, |s| s.as_slice())?;
+        let name = self.entries[0].name.clone();
+        self.graph_entry(&name, inputs, taps)
+    }
+
+    /// Like [`Model::graph`], for entry `name`.
+    pub fn graph_entry(&self, name: &str, inputs: &[(&str, Vec<usize>)], taps: &Taps) -> Result<GraphInfo> {
+        let spec = self.entry(Some(name))?;
+        let ordered = order_inputs(spec, inputs, |s| s.as_slice())?;
         let shapes: Vec<Vec<usize>> = ordered.into_iter().cloned().collect();
         let mut inner = self.inner.lock().unwrap();
-        let graph = inner.build_graph(&shapes, taps)?;
+        let graph = inner.build_graph(name, &shapes, taps)?;
         let info = describe(&graph);
         unsafe { ggml_free(graph.ctx) };
         Ok(info)
     }
+}
 
-    /// Matches named inputs to the declared inputs and checks dtype and shape.
-    fn order_inputs<'a, T>(&self, given: &'a [(&str, T)], shape_of: impl Fn(&T) -> &[usize]) -> Result<Vec<&'a T>> {
-        let expected = || self.inputs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
-        for (name, _) in given {
-            if !self.inputs.iter().any(|s| s.name == *name) {
-                return Err(Error::Input(format!("unknown input {name:?}, expected: {}", expected())));
-            }
+/// Matches named inputs to an entry's declared inputs and checks dtype and shape.
+fn order_inputs<'a, T>(spec: &EntrySpec, given: &'a [(&str, T)], shape_of: impl Fn(&T) -> &[usize]) -> Result<Vec<&'a T>> {
+    let inputs = &spec.inputs;
+    let expected = || inputs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+    for (name, _) in given {
+        if !inputs.iter().any(|s| s.name == *name) {
+            return Err(Error::Input(format!("unknown input {name:?} of entry {:?}, expected: {}", spec.name, expected())));
         }
-        self.inputs
-            .iter()
-            .map(|spec| {
-                let mut matches = given.iter().filter(|(n, _)| *n == spec.name);
-                let (_, value) = matches
-                    .next()
-                    .ok_or_else(|| Error::Input(format!("missing input {:?}, expected: {}", spec.name, expected())))?;
-                if matches.next().is_some() {
-                    return Err(Error::Input(format!("input {:?} given twice", spec.name)));
-                }
-                if spec.dtype != "f32" && spec.dtype != "i32" {
-                    return Err(Error::Input(format!("input {:?} has unsupported dtype {}", spec.name, spec.dtype)));
-                }
-                check_shape(spec, shape_of(value))?;
-                Ok(value)
-            })
-            .collect()
     }
+    inputs
+        .iter()
+        .map(|spec| {
+            let mut matches = given.iter().filter(|(n, _)| *n == spec.name);
+            let (_, value) = matches
+                .next()
+                .ok_or_else(|| Error::Input(format!("missing input {:?}, expected: {}", spec.name, expected())))?;
+            if matches.next().is_some() {
+                return Err(Error::Input(format!("input {:?} given twice", spec.name)));
+            }
+            if spec.dtype != "f32" && spec.dtype != "i32" {
+                return Err(Error::Input(format!("input {:?} has unsupported dtype {}", spec.name, spec.dtype)));
+            }
+            check_shape(spec, shape_of(value))?;
+            Ok(value)
+        })
+        .collect()
+}
+
+/// Checks an example against raw input specs and orders it like them.
+fn raw_values(specs: &[RawSpec], example: Vec<(String, RawInput)>) -> Result<Vec<(String, RawValue)>> {
+    let mut example = example;
+
+    let expected = || specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+    if let Some((name, _)) = example.iter().find(|(n, _)| !specs.iter().any(|s| s.name == *n)) {
+        return Err(Error::Input(format!("unknown raw input {name:?}, expected: {}", expected())));
+    }
+    specs
+        .iter()
+        .map(|spec| {
+            let i = example
+                .iter()
+                .position(|(n, _)| *n == spec.name)
+                .ok_or_else(|| Error::Input(format!("missing raw input {:?}, expected: {}", spec.name, expected())))?;
+            let (_, input) = example.swap_remove(i);
+            if input.kind() != spec.kind {
+                return Err(Error::Input(format!("raw input {:?} must be {:?}", spec.name, spec.kind)));
+            }
+            let value = match input {
+                RawInput::Text(t) => RawValue::Text(t),
+                RawInput::Image(i) => RawValue::Image(i.to_rgb8()),
+                RawInput::Audio(a) => RawValue::Audio(a),
+                RawInput::Array(a) => RawValue::Array(a),
+            };
+            Ok((spec.name.clone(), value))
+        })
+        .collect()
+}
+
+/// Stacks per-example arrays into `[batch, ...]` arrays.
+fn stack_examples(processed: Vec<Vec<(String, ArrayD<f32>)>>) -> Result<Vec<(String, ArrayD<f32>)>> {
+    let Some(first) = processed.first() else { return Err(Error::Input("no examples".into())) };
+    (0..first.len())
+        .map(|i| {
+            let name = first[i].0.clone();
+            let views: Vec<_> = processed.iter().map(|p| p[i].1.view()).collect();
+            let stacked = ndarray::stack(ndarray::Axis(0), &views).map_err(|_| {
+                Error::Input(format!("preprocessed {name} differs in shape between examples; pad to a fixed size"))
+            })?;
+            Ok((name, stacked))
+        })
+        .collect()
 }
 
 /// i32 inputs are passed as f32 arrays holding whole numbers.
@@ -495,27 +777,69 @@ fn check_shape(spec: &InputSpec, shape: &[usize]) -> Result<()> {
 }
 
 impl Inner {
-    /// Replaces the current graph with a newly built and allocated one.
-    fn rebuild_graph(&mut self, key: GraphKey) -> Result<()> {
-        unsafe { ggml_backend_sched_reset(self.sched) };
-        if let Some((_, old)) = self.graph.take() {
+    /// Creates the program's state tensors on the primary device, zeroed.
+    fn alloc_states(&mut self) -> Result<()> {
+        let specs: Vec<StateSpec> = self.program.states.clone();
+        if specs.is_empty() {
+            return Ok(());
+        }
+        let mem_size = unsafe { ggml_tensor_overhead() } * specs.len();
+        self.states = unsafe { ggml_init(ggml_init_params { mem_size, mem_buffer: null_mut(), no_alloc: true }) };
+        if self.states.is_null() {
+            return Err(Error::Backend("failed to create the state context".into()));
+        }
+        for spec in &specs {
+            let ty = if spec.dtype == "f16" { ggml_type::GGML_TYPE_F16 } else { ggml_type::GGML_TYPE_F32 };
+            let t = unsafe { ggml_new_tensor(self.states, ty, spec.dims.len() as i32, spec.dims.as_ptr()) };
+            let name = std::ffi::CString::new(spec.name.as_str()).map_err(|_| Error::Program("bad state name".into()))?;
+            unsafe { ggml_set_name(t, name.as_ptr()) };
+        }
+        self.state_buffer = guard::alloc_ctx_tensors(self.states, self.backends[0])?;
+        if self.state_buffer.is_null() {
+            return Err(Error::Backend("failed to allocate the state buffer".into()));
+        }
+        unsafe { ggml_backend_buffer_clear(self.state_buffer, 0) };
+        Ok(())
+    }
+
+    /// Replaces entry's current graph with a newly built and allocated one.
+    fn rebuild_graph(&mut self, entry: &str, key: GraphKey) -> Result<()> {
+        if !self.graphs.contains_key(entry) {
+            let sched = unsafe {
+                ggml_backend_sched_new(
+                    self.backends.as_mut_ptr(),
+                    null_mut(),
+                    self.backends.len() as i32,
+                    GRAPH_SIZE,
+                    false,
+                    true,
+                )
+            };
+            if sched.is_null() {
+                return Err(Error::Backend("failed to create the scheduler".into()));
+            }
+            self.graphs.insert(entry.to_string(), EntryGraph { sched, graph: None });
+        }
+        let sched = self.graphs[entry].sched;
+        unsafe { ggml_backend_sched_reset(sched) };
+        if let Some((_, old)) = self.graphs.get_mut(entry).unwrap().graph.take() {
             unsafe { ggml_free(old.ctx) };
         }
-        let graph = self.build_graph(&key.0, &key.1)?;
-        let allocated = guard::sched_alloc_graph(self.sched, graph.graph);
+        let graph = self.build_graph(entry, &key.0, &key.1)?;
+        let allocated = guard::sched_alloc_graph(sched, graph.graph);
         if !matches!(allocated, Ok(true)) {
             unsafe {
-                ggml_backend_sched_reset(self.sched);
+                ggml_backend_sched_reset(sched);
                 ggml_free(graph.ctx);
             }
             allocated?;
             return Err(Error::Backend("failed to allocate the graph".into()));
         }
-        self.graph = Some((key, graph));
+        self.graphs.get_mut(entry).unwrap().graph = Some((key, graph));
         Ok(())
     }
 
-    fn build_graph(&mut self, shapes: &[Vec<usize>], taps: &Taps) -> Result<Graph> {
+    fn build_graph(&mut self, entry: &str, shapes: &[Vec<usize>], taps: &Taps) -> Result<Graph> {
         let input_dims = shapes
             .iter()
             .map(|shape| Ok(ne_from_shape(shape)?[..shape.len()].to_vec()))
@@ -525,7 +849,7 @@ impl Inner {
         if ctx.is_null() {
             return Err(Error::Backend("failed to create the graph context".into()));
         }
-        match self.program.build(ctx, self.file.tensors, &input_dims, GRAPH_SIZE, taps) {
+        match self.program.build(entry, ctx, self.file.tensors, self.states, &input_dims, GRAPH_SIZE, taps) {
             Ok(built) => Ok(Graph {
                 ctx,
                 graph: built.graph,
@@ -550,14 +874,20 @@ impl Drop for Inner {
             return;
         }
         unsafe {
-            if let Some((_, graph)) = &self.graph {
-                ggml_free(graph.ctx);
-            }
-            if !self.sched.is_null() {
-                ggml_backend_sched_free(self.sched);
+            for entry in self.graphs.values() {
+                if let Some((_, graph)) = &entry.graph {
+                    ggml_free(graph.ctx);
+                }
+                ggml_backend_sched_free(entry.sched);
             }
             if !self.weights.is_null() {
                 ggml_backend_buffer_free(self.weights);
+            }
+            if !self.state_buffer.is_null() {
+                ggml_backend_buffer_free(self.state_buffer);
+            }
+            if !self.states.is_null() {
+                ggml_free(self.states);
             }
             for &backend in &self.backends {
                 ggml_backend_free(backend);

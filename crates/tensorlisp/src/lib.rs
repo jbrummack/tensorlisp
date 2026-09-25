@@ -22,15 +22,16 @@ mod scheme;
 
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use model::{Device, GraphInfo, LoadOptions, Model, NodeInfo, RawInput, RunOptions, RunOutput};
+pub use model::{Device, GraphInfo, Inference, LoadOptions, Model, NodeInfo, RawInput, RunOptions, RunOutput, Value};
 pub use program::Program;
-pub use scheme::{InputSpec, RawKind, RawSpec, Taps};
+pub use scheme::{EntrySpec, InputSpec, PipelineSpec, RawKind, RawSpec, StateSpec, Taps};
 
-/// Evaluates `program` without weights and returns its declared inputs;
-/// fails on syntax errors or a missing `(model ...)`.
-pub fn program_inputs(program: &Program, assets: Vec<(String, Vec<u8>)>) -> Result<Vec<InputSpec>> {
+/// Evaluates `program` without weights and returns its entries (default
+/// first) and pipelines; fails on syntax errors or a missing `(model ...)`.
+pub fn program_entries(program: &Program, assets: Vec<(String, Vec<u8>)>) -> Result<(Vec<EntrySpec>, Vec<PipelineSpec>)> {
     let Program::Text(text) = program;
-    Ok(scheme::LoadedProgram::load(text, assets)?.inputs.clone())
+    let loaded = scheme::LoadedProgram::load(text, assets)?;
+    Ok((loaded.entries.clone(), loaded.pipelines.clone()))
 }
 
 pub use autopro;

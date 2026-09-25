@@ -37,8 +37,10 @@ pub struct QuantizeArgs {
     /// Also convert tensors that are already quantized (loses precision twice).
     #[arg(long)]
     pub requantize: bool,
-    /// Input shape for building the program's graph, NAME=1,3,448,448 or
-    /// NAME=file.npy (repeatable; fixed declared shapes can be omitted).
+    /// Input shape for building the program's graphs, NAME=1,3,448,448 or
+    /// NAME=file.npy (repeatable; fixed declared shapes can be omitted). With
+    /// several entries, ENTRY:NAME=... sets one entry's input; an unprefixed
+    /// NAME applies to every entry that has it.
     #[arg(short, long = "input")]
     pub inputs: Vec<String>,
     /// Analyze this program instead of the one stored in the file.
@@ -76,6 +78,19 @@ fn weight_uses(graph: &GraphInfo, weights: &HashSet<&str>) -> HashMap<String, Ve
     uses
 }
 
+/// Whether a shape argument (numpy order, or a .npy file) fits an input's declared dims.
+fn shape_fits(spec: &tensorlisp::InputSpec, value: &str) -> bool {
+    let Some(dims) = &spec.dims else { return true };
+    let shape = if value.ends_with(".npy") {
+        crate::npy::read(value.as_ref()).map(|a| a.shape().to_vec()).ok()
+    } else {
+        crate::common::parse_shape(value).ok()
+    };
+    shape.is_none_or(|shape| {
+        shape.len() == dims.len() && shape.iter().rev().zip(dims).all(|(&n, d)| d.is_none_or(|d| d == n as i64))
+    })
+}
+
 /// Builds the program's graph and returns how it uses each weight.
 fn analyze(args: &QuantizeArgs, file: &GgufFile, names: &HashSet<&str>) -> Result<Option<HashMap<String, Vec<(String, usize)>>>> {
     if args.no_graph {
@@ -93,11 +108,40 @@ fn analyze(args: &QuantizeArgs, file: &GgufFile, names: &HashSet<&str>) -> Resul
     };
     let options = tensorlisp::LoadOptions { program: Some(program), assets: Vec::new() };
     let model = Model::load_with(&args.input, Device::Cpu, options).context("loading the program to analyze its graph")?;
-    let shapes = resolve_input_shapes(&model, &args.inputs)
-        .context("the graph is needed to see which weights feed matmuls (or pass --no-graph)")?;
-    let given: Vec<(&str, Vec<usize>)> = shapes.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();
-    let graph = model.graph(&given, &Taps::None).context("building the graph")?;
-    Ok(Some(weight_uses(&graph, names)))
+    // Every entry's graph: a weight is used however any entry uses it.
+    let mut uses: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    for entry in model.entries() {
+        let args_for_entry: Vec<String> = args
+            .inputs
+            .iter()
+            .filter_map(|arg| match arg.split_once('=').and_then(|(name, _)| name.split_once(':')) {
+                Some((e, _)) if e == entry.name => Some(arg[e.len() + 1..].to_string()),
+                Some(_) => None,
+                // Unprefixed shapes apply to every entry with that input whose
+                // declared dims accept them, unless ENTRY:NAME sets it for this one.
+                None => arg
+                    .split_once('=')
+                    .is_some_and(|(name, value)| {
+                        entry.inputs.iter().any(|i| i.name == name && shape_fits(i, value))
+                            && !args.inputs.iter().any(|a| a.starts_with(&format!("{}:{name}=", entry.name)))
+                    })
+                    .then(|| arg.clone()),
+            })
+            .collect();
+        let shapes = resolve_input_shapes(&model, Some(&entry.name), &args_for_entry).with_context(|| {
+            format!(
+                "entry {:?}: the graph is needed to see which weights feed matmuls (pass -i {}NAME=DIMS, or --no-graph)",
+                entry.name,
+                if model.entries().len() > 1 { format!("{}:", entry.name) } else { String::new() }
+            )
+        })?;
+        let given: Vec<(&str, Vec<usize>)> = shapes.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();
+        let graph = model.graph_entry(&entry.name, &given, &Taps::None).with_context(|| format!("building entry {:?}", entry.name))?;
+        for (weight, u) in weight_uses(&graph, names) {
+            uses.entry(weight).or_default().extend(u);
+        }
+    }
+    Ok(Some(uses))
 }
 
 /// Why a tensor keeps its type, or None to convert it.

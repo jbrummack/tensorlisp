@@ -150,3 +150,69 @@ fn porting_workflow() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn run_applies_the_postprocess() {
+    let dir = std::env::temp_dir().join(format!("tl-cli-post-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("argmax.ss"),
+        r#"(model (inputs [x f32 (4 batch)]) (outputs [y (ggml-scale x 2.0) 2]))
+           (postprocess (y) (results [best (array-argmax y)] [top (array-take (array-transpose (array-reshape y 4 1)) '(0))]))"#,
+    )
+    .unwrap();
+    let x = ArrayD::from_shape_vec(vec![2, 4], vec![0.1, 0.9, 0.3, 0.2, 5.0, 1.0, 2.0, 3.0]).unwrap();
+    npy::write(&dir.join("x.npy"), &x).unwrap();
+    let mut w = tensorlisp::gguf::GgufWriter::new();
+    w.set_program(&tensorlisp::Program::Text(std::fs::read_to_string(dir.join("argmax.ss")).unwrap())).unwrap();
+    w.write(&dir.join("argmax.gguf")).unwrap();
+
+    let (code, json) = tl_json(&dir, &["run", "argmax.gguf", "-i", "x=x.npy", "-o", "out"]);
+    assert_eq!(code, 0);
+    let results = json["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(find(&Value::Array(results[0].as_array().unwrap().clone()), "name", "best")["values"], serde_json::json!([1.0]));
+    assert_eq!(results[1][0]["values"], serde_json::json!([0.0]));
+    assert_eq!(results[1][1]["shape"], serde_json::json!([1, 4]));
+    assert!(dir.join("out/results/1/top.npy").exists());
+
+    let out = tl(&dir, &["run", "argmax.gguf", "-i", "x=x.npy"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("postprocess") && text.contains("example 1:") && text.contains("[10, 2, 4, 6]"), "{text}");
+    let (_, json) = tl_json(&dir, &["run", "argmax.gguf", "-i", "x=x.npy", "--no-post"]);
+    assert!(json["results"].is_null());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn run_entries_and_pipelines() {
+    let dir = std::env::temp_dir().join(format!("tl-cli-entries-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = r#"
+      (model double (inputs [x f32 (4 batch)]) (outputs [y (ggml-scale x 2.0) 2]))
+      (model halve (inputs [x f32 (4 batch)]) (outputs [y (ggml-scale x 0.5) 2]))
+      (pipeline describe ([word string])
+        (let ([y (output (run double [x (list->array '(1 2 3 4))]) 'y)])
+          (results [text (string-append word "!")] [sum (fold-left + 0 (array->list y))])))"#;
+    let mut w = tensorlisp::gguf::GgufWriter::new();
+    w.set_program(&tensorlisp::Program::Text(program.into())).unwrap();
+    w.write(&dir.join("e.gguf")).unwrap();
+    let x = ArrayD::from_shape_vec(vec![1, 4], vec![2.0, 4.0, 6.0, 8.0]).unwrap();
+    npy::write(&dir.join("x.npy"), &x).unwrap();
+
+    let (code, json) = tl_json(&dir, &["run", "e.gguf", "--entry", "halve", "-i", "x=x.npy"]);
+    assert_eq!(code, 0);
+    assert_eq!(json["outputs"][0]["stats"]["max"], 4.0);
+    let (code, json) = tl_json(&dir, &["check", "e.gguf", "--entry", "double", "-i", "x=1,4", "--summary"]);
+    assert_eq!(code, 0, "{json}");
+
+    let (code, json) = tl_json(&dir, &["run", "e.gguf", "--entry", "describe", "--raw", "word=hello", "-o", "out"]);
+    assert_eq!(code, 0, "{json}");
+    assert_eq!(json["results"][0][0]["text"], "hello!");
+    assert_eq!(json["results"][0][1]["values"], serde_json::json!([20.0]));
+    assert_eq!(std::fs::read_to_string(dir.join("out/results/0/text.txt")).unwrap(), "hello!");
+    let (code, json) = tl_json(&dir, &["run", "e.gguf", "--entry", "nope", "-i", "x=x.npy"]);
+    assert_eq!(code, 1);
+    assert!(json["error"].as_str().unwrap().contains("entries: double, halve"), "{json}");
+    std::fs::remove_dir_all(dir).unwrap();
+}

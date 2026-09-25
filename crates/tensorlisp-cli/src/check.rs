@@ -27,6 +27,9 @@ pub struct CheckArgs {
     /// Only show inputs, outputs and taps, not every node.
     #[arg(long)]
     pub summary: bool,
+    /// Entry to check (default: `main` or the first one).
+    #[arg(short, long)]
+    pub entry: Option<String>,
 }
 
 pub fn run(args: &CheckArgs, json: bool) -> Result<i32> {
@@ -38,10 +41,11 @@ pub fn run(args: &CheckArgs, json: bool) -> Result<i32> {
         assets: args.assets.clone(),
     })?;
 
-    let shapes = resolve_input_shapes(&model, &args.inputs)?;
+    let entry = model.entry(args.entry.as_deref())?.name.clone();
+    let shapes = resolve_input_shapes(&model, Some(&entry), &args.inputs)?;
 
     let given: Vec<(&str, Vec<usize>)> = shapes.iter().map(|(n, s)| (n.as_str(), s.clone())).collect();
-    let graph = model.graph(&given, &Taps::None).context("building the graph")?;
+    let graph = model.graph_entry(&entry, &given, &Taps::None).context("building the graph")?;
 
     if json {
         print_json(&json!({

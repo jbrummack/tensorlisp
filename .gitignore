@@ -3,3 +3,4 @@
 /models
 # ChezScheme install prefix produced by scripts/build-chez.sh
 /vendor/chez
+.env

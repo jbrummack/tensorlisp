@@ -117,6 +117,49 @@ A tensorlisp GGUF is a normal GGUF (weights as tensors) plus three keys:
 - `(tap "name" t [rank])` returns `t` and marks it as an intermediate result
   that `tl run --taps` / `tl compare` (or `RunOptions::taps`) can read back.
 
+### Entries and pipelines
+
+A program can define several named entries that share the weights, e.g. an
+encoder run once and a decoder run per generated token, and pipelines: host
+code that runs them (generation loops, multi-stage models).
+
+```scheme
+(model encode (inputs [ids i32 (_ 1)]) ... (outputs [memory ... 3]))
+(model decode (inputs [tokens i32 (_ 1)] [memory f32 (640 _ 1)]) ... (outputs [logits ... 2]))
+
+(pipeline generate ([prompt string])
+  (let-values ([(ids mask) (tokenize tok prompt)])
+    (let ([memory (output (run encode [ids ids]) 'memory)])
+      (let loop ([tokens (list bos)])
+        (let* ([r (run decode [tokens (list->array tokens)] [memory memory])]
+               [next (car (array->list (array-argmax (output r 'logits))))])
+          (if (= next eos)
+              (results [text (detokenize tok tokens)])
+              (loop (append tokens (list next)))))))))
+```
+
+- An unnamed `(model ...)` is the entry `main`. The default entry (for
+  `preprocess`, `postprocess` and runs that name none) is `main`, or else the
+  first one defined.
+- Each entry keeps its own graph allocated for its current input shapes, so
+  alternating between entries doesn't rebuild anything.
+- `(run entry [input array] ...)` runs an entry on host arrays and returns its
+  outputs; `(output r 'name)` picks one. A missing leading batch dimension of
+  1 is added.
+- State: `(define-state "name" f32 dim ...)` declares a tensor that keeps its
+  contents between runs (e.g. a KV cache), allocated next to the weights and
+  zeroed at load (`model.reset_state()` zeroes it again). In an entry,
+  `(state "name")` is the tensor; writes go through `(effect t)` (e.g.
+  `(effect (ggml-set-rows (state "k.0") k pos))`), which adds them to the
+  graph immediately, so ops built afterwards read the new contents. An entry
+  may have only effects: `(outputs)`.
+- Pipeline results may be strings as well as arrays and numbers.
+  `(detokenize tok ids)` and `(token-id tok "<eos>")` help with text.
+- Rust: `model.entries()`, `model.run_entry(name, inputs, &options)`,
+  `model.pipelines()`, `model.pipeline(name, raw_example)` (returns
+  `Value::Array` / `Value::Text` results).
+- See `ports/t5gemma2` for an image-to-text model built this way.
+
 ### ggml assertions
 
 A failing `GGML_ASSERT` becomes an error instead of aborting the process:
@@ -166,8 +209,47 @@ see `tl pack --asset`).
 - Audio: `audio-rate`, `audio-length`, `audio-resample`, `audio-pad`,
   `audio->array` (waveform + mask), `log-mel` (options `n-fft hop win mels
   f-min f-max power center scale norm log floor`), `whisper-features`.
+- Images for detectors: `(image-letterbox img w h 'fill (114 114 114))` (YOLO).
 - Arrays: `array-shape`, `array-affine`, `array-reshape`.
 - Rust: `model.run_raw(examples, &options)`, `model.preprocess(example)`.
+
+### Postprocessing
+
+`(postprocess (name ...) ... (results [name value] ...))` turns the model's
+outputs into results, per example, on the host. Each name is a model output
+(the example's slice: the first dimension is the batch) or a raw input of
+preprocess (e.g. the original image, for its size).
+
+```scheme
+;; YOLOv8-style head [84, 8400] -> detections on the original image
+(postprocess (head photo)
+  (let ([rows (array-transpose head)])
+    (let-values ([(boxes scores classes _) (detect (array-slice rows 0 4 'axis 1) (array-slice rows 4 #f 'axis 1)
+                                                   'score-threshold 0.25 'iou 0.45)])
+      (let ([size (image-size photo)])
+        (results [boxes (boxes-unletterbox boxes 640 640 (car size) (cadr size))]
+                 [scores scores] [classes classes])))))
+
+;; ViT patch tokens [1024, 768] -> segments (DBSCAN, cosine)
+(postprocess (patches)
+  (let ([labels (dbscan patches 0.08 8 'metric 'cosine)])
+    (results [segments (array-reshape labels 32 32)] [centroids (cluster-centroids patches labels)])))
+```
+
+- Detection: `detect` (Ultralytics `non_max_suppression`: options `format
+  score-threshold iou class-agnostic multi-label max-candidates max`; returns
+  boxes xyxy, scores, classes and source rows), `nms` (torchvision `nms` /
+  `batched_nms` with `'classes`), `boxes-convert` (`xyxy xywh cxcywh`),
+  `boxes-scale`, `boxes-clip`, `boxes-unletterbox`.
+- Clustering: `(dbscan x eps min-samples 'metric euclidean|cosine)` (scikit-learn
+  labels, -1 = noise; distances on BLAS, Accelerate on Apple),
+  `cluster-centroids`.
+- Arrays: `array-slice` (`'axis`, negative bounds), `array-transpose`,
+  `array-take` (rows at indices), `array-argmax` (last axis), `array-length`,
+  `array->list`, `list->array`. Results may also be numbers or lists of numbers.
+- Rust: `model.infer(examples, &options)` (preprocess, run, postprocess →
+  `Inference { examples, run }`), `model.postprocess(&outputs)`,
+  `model.postprocess_with_raw(&outputs, examples)`.
 
 ## CLI (`tl`)
 
@@ -195,6 +277,15 @@ tl run model-q8.gguf -i x=x.npy -o out/ --repeat 20        # outputs as .npy + t
 tl pack weights.gguf --program net.ss --asset tokenizer.model=tok.model -o model.gguf
 tl run model.gguf --raw text="a photo" --raw image=@cat.jpg  # through (preprocess ...)
 tl process model.gguf --raw image=@cat.jpg -o pre/          # only preprocess: arrays as .npy
+#   run applies the program's postprocess (results per example; small ones
+#   printed in full, -o writes out/results/<example>/NAME.npy; --no-post skips it)
+tl run model.gguf --entry decode -i ...                     # another entry (also check/compare)
+tl run model.gguf --entry caption --raw image=@bee.jpg --raw "prompt=..."   # a pipeline
+tl quantize model.gguf q8.gguf -t q8_0 -i ids=1,64 -i decode:tokens=1,64
+#   analyzes every entry; ENTRY:NAME= sets one entry's input
+tl convert m.safetensors --replace-prefix encoder.vision_tower.vision_model.=vision. ...
+#   shortens names past ggml's 63-byte limit; --offset 'GLOB=1' adds a constant
+#   (e.g. Gemma's 1 + w norms)
 ```
 
 Note: ggml's f16/bf16 matmuls round the activations to f16/bf16 as well, so

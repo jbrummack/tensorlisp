@@ -92,6 +92,33 @@ with `interpolate_offset` use `scale_factor` instead of `size`; not covered yet.
 transpose `[D, L, B]` to `[L, D, B]` first; counts come from the mask the same
 way; `+ eps` in the denominator like the reference.
 
+### Gemma-style pieces (from `ports/t5gemma2`)
+
+- `(rms-norm x name)`: Gemma's RMSNorm scales by `(1 + weight)`:
+  `(ggml-mul (ggml-rms-norm x eps) (ggml-scale-bias (weight name) 1.0 1.0))`.
+- `(attend q k v mask)`: multi-query / grouped attention without repeating K/V:
+  `ggml-mul-mat` broadcasts a single K head over the query heads.
+- `(rope x pos layer)`: `ggml-rope-ext` with mode 2 (NEOX, `rotate_half`);
+  HF "linear" rope scaling by `factor` is `freq_scale = 1/factor`.
+  `GGML_ROPE_TYPE_*` are `#define`s the codegen doesn't export.
+- `(distance-mask n-k n-q conditions)`: additive masks built in the graph from
+  `ggml-arange` positions and `ggml-step`, e.g. causal, sliding windows
+  (bidirectional ones too); no host-side mask inputs needed.
+- `(sandwich x p pre post f)`: Gemma 2/3 blocks norm before and after each sublayer.
+- `gelu`: ggml's CPU `ggml-gelu` uses an f16 lookup table (~1e-3 error); an
+  exact tanh GELU from ops for comparisons.
+- Placing image features into a token sequence: one `ggml-get-rows` over
+  `[token embeddings; image features; special embeddings]` with a host-computed
+  gather index, instead of a scatter.
+- Pipelines: `string-replace`, greedy decoding with a fixed-length decoder
+  (`at` input + `get-rows` to take one position's logits).
+- KV cache: one state tensor per layer holding self rows then cross rows
+  (no concat), `ggml-set-rows` at `pos` in an `effect`, `flash-attn-ext` with an
+  f16 mask `[n_kv, 1]` for the single query, argmax on the device.
+- Per-op overhead dominates single-token steps on Metal (~500 kernels): fold
+  constant weight transforms into the file (`tl convert --offset`), avoid
+  per-run weight math.
+
 ## Rank > 4
 
 ggml tensors have at most 4 dimensions. Neither TIPSv2 tower needed more

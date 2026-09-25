@@ -33,6 +33,15 @@ pub struct ConvertArgs {
     /// Rename a tensor, OLD=NEW, after stripping prefixes (repeatable).
     #[arg(long)]
     pub rename: Vec<String>,
+    /// Replace a name prefix, OLD=NEW, after stripping prefixes (repeatable;
+    /// the first match applies), e.g. to shorten names past ggml's 63 bytes.
+    #[arg(long)]
+    pub replace_prefix: Vec<String>,
+    /// Add a constant to every value of float tensors whose (original) name
+    /// matches, GLOB=VALUE (repeatable; the first match applies). E.g. Gemma's
+    /// RMSNorm scales by (1 + w): `--offset '*norm.weight=1'` stores 1 + w.
+    #[arg(long)]
+    pub offset: Vec<String>,
     /// Only convert tensors whose (original) name matches this glob (repeatable).
     #[arg(long)]
     pub include: Vec<String>,
@@ -153,9 +162,13 @@ fn convert_bytes(dtype: Dtype, stored: DType, bytes: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-fn rename(name: &str, args: &ConvertArgs, renames: &[(&str, &str)]) -> String {
+fn rename(name: &str, args: &ConvertArgs, renames: &[(&str, &str)], prefixes: &[(&str, &str)]) -> String {
     let stripped = args.strip_prefix.iter().find_map(|p| name.strip_prefix(p.as_str())).unwrap_or(name);
-    renames.iter().find(|(old, _)| *old == stripped).map_or(stripped, |(_, new)| new).to_string()
+    let replaced = prefixes
+        .iter()
+        .find_map(|(old, new)| stripped.strip_prefix(old).map(|rest| format!("{new}{rest}")))
+        .unwrap_or_else(|| stripped.to_string());
+    renames.iter().find(|(old, _)| *old == replaced).map_or(replaced.clone(), |(_, new)| new.to_string())
 }
 
 pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
@@ -167,10 +180,19 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
         other => bail!("unknown --dtype {other:?} (expected keep, f32, f16 or bf16)"),
     };
     let renames: Vec<_> = args.rename.iter().map(|r| split_assignment(r)).collect::<Result<_>>()?;
+    let prefixes: Vec<_> = args.replace_prefix.iter().map(|r| split_assignment(r)).collect::<Result<_>>()?;
+    let offsets: Vec<(&str, f32)> = args
+        .offset
+        .iter()
+        .map(|o| {
+            let (glob, value) = split_assignment(o)?;
+            Ok((glob, value.parse::<f32>().with_context(|| format!("--offset {o}: not a number"))?))
+        })
+        .collect::<Result<_>>()?;
     let program = args.program.as_ref().map(read_program).transpose()?;
     let assets = read_assets(&args.assets)?;
     if let Some(program) = &program {
-        tensorlisp::program_inputs(program, assets.clone()).context("the program is invalid")?;
+        tensorlisp::program_entries(program, assets.clone()).context("the program is invalid")?;
     }
 
     let files = safetensors_files(&args.inputs)?;
@@ -210,13 +232,21 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
             let shape = view.shape().to_vec();
             let stored = stored_type(dtype, shape.len(), &target)
                 .with_context(|| format!("tensor {name}: unsupported safetensors dtype {dtype:?}"))?;
-            let new_name = rename(&name, args, &renames);
+            let new_name = rename(&name, args, &renames, &prefixes);
             let data = view.data();
             let bytes_name = new_name.clone();
+            let offset = offsets.iter().find(|(g, _)| glob_match(g, &name)).map(|(_, v)| *v);
+            if offset.is_some() && !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64) {
+                bail!("--offset matches {name}, which is not a float tensor");
+            }
             writer
-                .add_tensor_with(&new_name, stored, &shape, move || {
-                    convert_bytes(dtype, stored, data)
-                        .map_err(|e| tensorlisp::Error::Input(format!("tensor {bytes_name}: {e}")))
+                .add_tensor_with(&new_name, stored, &shape, move || match offset {
+                    Some(offset) => {
+                        let values: Vec<f32> = to_f32(dtype, data).into_iter().map(|v| v + offset).collect();
+                        Ok(encode(stored, &values))
+                    }
+                    None => convert_bytes(dtype, stored, data)
+                        .map_err(|e| tensorlisp::Error::Input(format!("tensor {bytes_name}: {e}"))),
                 })
                 .with_context(|| format!("tensor {name}"))?;
             report.push((name, new_name, format!("{dtype:?}").to_lowercase(), stored, shape));
@@ -282,11 +312,16 @@ pub fn pack(args: &PackArgs, json: bool) -> Result<i32> {
         all_assets.retain(|(n, _)| n != name);
         all_assets.push((name.clone(), bytes.clone()));
     }
-    let inputs = tensorlisp::program_inputs(&program, all_assets).context("the program is invalid")?;
+    let (entries, pipelines) = tensorlisp::program_entries(&program, all_assets).context("the program is invalid")?;
     let output = args.output.as_ref().unwrap_or(&args.model);
     repack(&args.model, output, &program, &new_assets)?;
     if json {
-        print_json(&json!({ "output": output, "inputs": inputs.iter().map(|i| &i.name).collect::<Vec<_>>() }))?;
+        print_json(&json!({
+            "output": output,
+            "inputs": entries[0].inputs.iter().map(|i| &i.name).collect::<Vec<_>>(),
+            "entries": entries.iter().map(|e| json!({ "name": e.name, "inputs": e.inputs.iter().map(|i| &i.name).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+            "pipelines": pipelines.iter().map(|p| &p.name).collect::<Vec<_>>(),
+        }))?;
     } else {
         println!("stored {} in {}", args.program.display(), output.display());
     }

@@ -1,8 +1,9 @@
-//! Host values for preprocessing: tokenizers, images, audio and tensors that
-//! live on the Rust side (autopro) and are referenced from Scheme by id.
+//! Host values for pre- and postprocessing: tokenizers, images, audio and
+//! tensors that live on the Rust side (autopro) and are referenced from
+//! Scheme by id.
 //!
 //! Values created while a program loads belong to the model (e.g. its
-//! tokenizer); values created while preprocessing one example belong to that
+//! tokenizer); values created while processing one example belong to that
 //! call and are freed right after it. All calls happen on the Scheme thread.
 use std::{
     collections::HashMap,
@@ -12,12 +13,14 @@ use std::{
 };
 
 use autopro::{
+    cluster::{Dbscan, Metric, centroids},
+    detect::{BoxFormat, Detector},
     audio::{Audio, LogMode, MelNorm, MelScale, MelSpectrogram, WaveformProcessor, WhisperFeatures},
     image::{ChannelOrder, Filter, ImageProcessor, Layout, Size},
     text::{Padding, TextOptions, Tokenizer},
 };
 use image::RgbImage;
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{Array1, Array2, ArrayD, Axis, Ix2, IxDyn, Slice};
 
 pub(crate) enum HostValue {
     Bytes(Arc<Vec<u8>>),
@@ -25,6 +28,16 @@ pub(crate) enum HostValue {
     Image(RgbImage),
     Audio(Audio),
     Tensor(ArrayD<f32>),
+    /// A `(run entry ...)` being assembled or finished.
+    Run(Box<RunCall>),
+}
+
+pub(crate) struct RunCall {
+    program: i64,
+    entry: String,
+    inputs: Vec<(String, ArrayD<f32>)>,
+    /// After exec: output names and their host ids.
+    outputs: Vec<(CString, i64)>,
 }
 
 impl HostValue {
@@ -35,6 +48,7 @@ impl HostValue {
             HostValue::Image(_) => "image",
             HostValue::Audio(_) => "audio",
             HostValue::Tensor(_) => "tensor",
+            HostValue::Run(_) => "run",
         }
     }
 }
@@ -50,6 +64,8 @@ struct Registry {
     values: HashMap<i64, (Scope, HostValue)>,
     scope: Scope,
     error: CString,
+    /// Last text returned to Scheme (e.g. by detokenize); Chez copies it.
+    text: CString,
 }
 
 static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
@@ -61,6 +77,7 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
         values: HashMap::new(),
         scope: Scope::Call,
         error: CString::default(),
+        text: CString::default(),
     });
     f(registry)
 }
@@ -91,6 +108,11 @@ pub(crate) fn take_tensor(id: i64) -> Option<ArrayD<f32>> {
         }
         None => None,
     })
+}
+
+/// A copy of a tensor that must stay (e.g. one result listed twice).
+pub(crate) fn clone_tensor(id: i64) -> Option<ArrayD<f32>> {
+    tensor(id).ok()
 }
 
 /// Frees every value created by preprocessing calls.
@@ -132,6 +154,44 @@ fn tensor(id: i64) -> Result<ArrayD<f32>, String> {
         HostValue::Tensor(t) => Ok(t.clone()),
         _ => unreachable!(),
     })
+}
+
+fn matrix(id: i64, what: &str) -> Result<Array2<f32>, String> {
+    let t = tensor(id)?;
+    let shape = t.shape().to_vec();
+    t.into_dimensionality::<Ix2>().map_err(|_| format!("{what} must be a 2-d array, got shape {shape:?}"))
+}
+
+fn boxes(id: i64) -> Result<Array2<f32>, String> {
+    let b = matrix(id, "boxes")?;
+    if b.ncols() != 4 {
+        return Err(format!("boxes must be [n, 4], got {:?}", b.shape()));
+    }
+    Ok(b)
+}
+
+/// A 1-d array of whole numbers >= 0 (indices or classes).
+fn indices(id: i64, what: &str) -> Result<Vec<usize>, String> {
+    let t = tensor(id)?;
+    if t.ndim() != 1 {
+        return Err(format!("{what} must be a 1-d array, got shape {:?}", t.shape()));
+    }
+    t.iter()
+        .map(|&v| if v >= 0.0 && v.fract() == 0.0 { Ok(v as usize) } else { Err(format!("{what} must hold whole numbers >= 0, got {v}")) })
+        .collect()
+}
+
+fn box_format(code: i32) -> Result<BoxFormat, String> {
+    match code {
+        0 => Ok(BoxFormat::Xyxy),
+        1 => Ok(BoxFormat::Xywh),
+        2 => Ok(BoxFormat::Cxcywh),
+        _ => Err(format!("unknown box format {code}")),
+    }
+}
+
+fn to_f32<T: Copy + Into<f64>>(values: impl IntoIterator<Item = T>) -> ArrayD<f32> {
+    Array1::from_iter(values.into_iter().map(|v| v.into() as f32)).into_dyn()
 }
 
 /// Runs an FFI body: errors (and panics) become id 0 plus a message for
@@ -377,6 +437,301 @@ extern "C" fn tl_host_tensor_reshape(id: i64, d0: i64, d1: i64, d2: i64, d3: i64
     })
 }
 
+// --- Postprocessing and general array functions.
+
+/// A new 1-d array of `n` zeros, filled with `tl_host_tensor_set`.
+extern "C" fn tl_host_tensor_new(n: i64) -> i64 {
+    ffi(|| Ok(insert(HostValue::Tensor(ArrayD::zeros(IxDyn(&[n.max(0) as usize]))))))
+}
+
+extern "C" fn tl_host_tensor_set(id: i64, i: i64, v: f64) -> i64 {
+    ffi(|| {
+        with_registry(|r| match r.values.get_mut(&id) {
+            Some((_, HostValue::Tensor(t))) => {
+                let n = t.len();
+                let slot = t.as_slice_mut().and_then(|s| s.get_mut(i as usize)).ok_or_else(|| format!("index {i} out of {n}"))?;
+                *slot = v as f32;
+                Ok(1)
+            }
+            _ => Err(format!("host value {id} is not an array")),
+        })
+    })
+}
+
+extern "C" fn tl_host_tensor_len(id: i64) -> i64 {
+    ffi(|| get(id, |v| match expect_kind(v, "tensor")? {
+        HostValue::Tensor(t) => Ok(t.len() as i64),
+        _ => unreachable!(),
+    }))
+}
+
+/// Element `i` in row-major order. Errors can't be signalled; check the length first.
+extern "C" fn tl_host_tensor_get(id: i64, i: i64) -> f64 {
+    get(id, |v| match v {
+        HostValue::Tensor(t) => Ok(match t.as_slice() {
+            Some(s) => s.get(i as usize).copied(),
+            None => t.iter().nth(i as usize).copied(),
+        }
+        .map_or(f64::NAN, |v| v as f64)),
+        _ => Ok(f64::NAN),
+    })
+    .unwrap_or(f64::NAN)
+}
+
+/// x[start:end] along `axis`; negative bounds count from the end, end = i64::MAX means to the end.
+extern "C" fn tl_host_tensor_slice(id: i64, axis: i64, start: i64, end: i64) -> i64 {
+    ffi(|| {
+        let t = tensor(id)?;
+        let axis = usize::try_from(axis).ok().filter(|&a| a < t.ndim()).ok_or_else(|| format!("no axis {axis} in shape {:?}", t.shape()))?;
+        let n = t.shape()[axis] as i64;
+        let clamp = |v: i64| if v < 0 { (n + v).max(0) } else { v.min(n) };
+        let (start, end) = (clamp(start), clamp(end));
+        if start > end {
+            return Err(format!("empty slice {start}:{end} of axis {axis} (size {n})"));
+        }
+        Ok(insert(HostValue::Tensor(t.slice_axis(Axis(axis), Slice::from(start as usize..end as usize)).to_owned())))
+    })
+}
+
+extern "C" fn tl_host_tensor_transpose(id: i64) -> i64 {
+    ffi(|| Ok(insert(HostValue::Tensor(tensor(id)?.reversed_axes().as_standard_layout().into_owned()))))
+}
+
+/// Entries of `x` along axis 0 at the indices in the 1-d array `rows`.
+extern "C" fn tl_host_tensor_take(id: i64, rows: i64) -> i64 {
+    ffi(|| {
+        let t = tensor(id)?;
+        let rows = indices(rows, "indices")?;
+        let n = t.shape().first().copied().unwrap_or(0);
+        if let Some(bad) = rows.iter().find(|&&r| r >= n) {
+            return Err(format!("index {bad} out of range for {n} rows"));
+        }
+        Ok(insert(HostValue::Tensor(t.select(Axis(0), &rows))))
+    })
+}
+
+/// Index of the largest value along the last axis (first one on ties).
+extern "C" fn tl_host_tensor_argmax(id: i64) -> i64 {
+    ffi(|| {
+        let best = get(id, |v| match expect_kind(v, "tensor")? {
+            HostValue::Tensor(t) => argmax_last(t),
+            _ => unreachable!(),
+        })?;
+        Ok(insert(HostValue::Tensor(best)))
+    })
+}
+
+fn argmax_last(t: &ArrayD<f32>) -> Result<ArrayD<f32>, String> {
+    if t.ndim() == 0 || t.shape()[t.ndim() - 1] == 0 {
+        return Err(format!("argmax of an array of shape {:?}", t.shape()));
+    }
+    let last = Axis(t.ndim() - 1);
+    let best = t.map_axis(last, |lane| {
+        lane.iter().enumerate().fold((0, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) }).0 as f32
+    });
+    Ok(best)
+}
+
+extern "C" fn tl_host_boxes_convert(id: i64, from: i32, to: i32) -> i64 {
+    ffi(|| {
+        let b = boxes(id)?;
+        Ok(insert(HostValue::Tensor(autopro::detect::convert(b.view(), box_format(from)?, box_format(to)?).into_dyn())))
+    })
+}
+
+/// Kept indices (1-d array) by descending score; `classes` <= 0 means none.
+extern "C" fn tl_host_nms(boxes_id: i64, scores: i64, classes: i64, iou: f64) -> i64 {
+    ffi(|| {
+        let b = boxes(boxes_id)?;
+        let s = tensor(scores)?.into_dimensionality::<ndarray::Ix1>().map_err(|_| "scores must be a 1-d array".to_string())?;
+        if s.len() != b.nrows() {
+            return Err(format!("{} boxes but {} scores", b.nrows(), s.len()));
+        }
+        let classes = if classes > 0 { Some(indices(classes, "classes")?) } else { None };
+        if classes.as_ref().is_some_and(|c| c.len() != b.nrows()) {
+            return Err("one class per box".into());
+        }
+        let keep = autopro::detect::nms(b.view(), s.view(), classes.as_deref(), iou as f32);
+        Ok(insert(HostValue::Tensor(to_f32(keep.into_iter().map(|i| i as u32)))))
+    })
+}
+
+/// Returns boxes [n, 4] xyxy; scores, classes and indices [n] are id + 1, + 2, + 3.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn tl_host_detect(
+    boxes_id: i64,
+    scores: i64,
+    format: i32,
+    score_threshold: f64,
+    iou: f64,
+    agnostic: i32,
+    multi_label: i32,
+    max_candidates: i64,
+    max_detections: i64,
+) -> i64 {
+    ffi(|| {
+        let b = boxes(boxes_id)?;
+        let s = matrix(scores, "class scores")?;
+        if s.nrows() != b.nrows() {
+            return Err(format!("{} boxes but {} rows of class scores", b.nrows(), s.nrows()));
+        }
+        let detector = Detector {
+            format: box_format(format)?,
+            score_threshold: score_threshold as f32,
+            iou_threshold: iou as f32,
+            class_agnostic: agnostic != 0,
+            multi_label: multi_label != 0,
+            max_candidates: max_candidates as usize,
+            max_detections: max_detections as usize,
+        };
+        let d = detector.detect(b.view(), s.view());
+        let first = insert(HostValue::Tensor(d.boxes.into_dyn()));
+        insert(HostValue::Tensor(d.scores.into_dyn()));
+        insert(HostValue::Tensor(to_f32(d.classes.into_iter().map(|c| c as u32))));
+        insert(HostValue::Tensor(to_f32(d.indices.into_iter().map(|i| i as u32))));
+        Ok(first)
+    })
+}
+
+extern "C" fn tl_host_boxes_scale(id: i64, sx: f64, sy: f64) -> i64 {
+    ffi(|| Ok(insert(HostValue::Tensor(autopro::detect::scale(boxes(id)?.view(), sx as f32, sy as f32).into_dyn()))))
+}
+
+extern "C" fn tl_host_boxes_clip(id: i64, width: f64, height: f64) -> i64 {
+    ffi(|| {
+        let mut b = boxes(id)?;
+        autopro::detect::clip(&mut b, width as f32, height as f32);
+        Ok(insert(HostValue::Tensor(b.into_dyn())))
+    })
+}
+
+extern "C" fn tl_host_boxes_unletterbox(id: i64, mw: i64, mh: i64, ow: i64, oh: i64) -> i64 {
+    ffi(|| {
+        let b = autopro::detect::unletterbox(boxes(id)?.view(), (mw as u32, mh as u32), (ow as u32, oh as u32));
+        Ok(insert(HostValue::Tensor(b.into_dyn())))
+    })
+}
+
+extern "C" fn tl_host_image_letterbox(id: i64, width: i64, height: i64, r: i64, g: i64, b: i64, filter_code: i32) -> i64 {
+    ffi(|| {
+        let fill = [r, g, b].map(|c| c.clamp(0, 255) as u8);
+        let img = autopro::image::letterbox(&image(id)?, width as u32, height as u32, fill, filter(filter_code)?);
+        Ok(insert(HostValue::Image(img)))
+    })
+}
+
+/// Cluster label per row of x [n, d]; -1 is noise.
+extern "C" fn tl_host_dbscan(id: i64, eps: f64, min_samples: i64, metric: i32) -> i64 {
+    ffi(|| {
+        let x = matrix(id, "points")?;
+        let metric = if metric == 1 { Metric::Cosine } else { Metric::Euclidean };
+        let clustering = Dbscan { eps, min_samples: min_samples as usize, metric }.fit(x.view());
+        Ok(insert(HostValue::Tensor(to_f32(clustering.labels.iter().copied()))))
+    })
+}
+
+/// Mean row of x [n, d] per cluster label [n]: [clusters, d], noise ignored.
+extern "C" fn tl_host_cluster_centroids(id: i64, labels: i64) -> i64 {
+    ffi(|| {
+        let x = matrix(id, "points")?;
+        let labels = tensor(labels)?;
+        if labels.ndim() != 1 || labels.len() != x.nrows() {
+            return Err(format!("labels must be [{}], got {:?}", x.nrows(), labels.shape()));
+        }
+        let labels: Array1<i32> = labels.iter().map(|&v| v as i32).collect();
+        let n = labels.iter().copied().max().map_or(0, |m| (m + 1).max(0) as usize);
+        Ok(insert(HostValue::Tensor(centroids(x.view(), &labels, n).into_dyn())))
+    })
+}
+
+// --- Pipelines: running entries from Scheme, and text from tokens.
+
+extern "C" fn tl_host_run_begin(program: i64, entry: *const c_char) -> i64 {
+    ffi(|| {
+        let entry = text_arg(entry)?.to_string();
+        Ok(insert(HostValue::Run(Box::new(RunCall { program, entry, inputs: Vec::new(), outputs: Vec::new() }))))
+    })
+}
+
+extern "C" fn tl_host_run_input(run: i64, name: *const c_char, array: i64) -> i64 {
+    ffi(|| {
+        let name = text_arg(name)?.to_string();
+        let array = tensor(array)?;
+        with_registry(|r| match r.values.get_mut(&run) {
+            Some((_, HostValue::Run(call))) => {
+                call.inputs.push((name, array));
+                Ok(1)
+            }
+            _ => Err(format!("host value {run} is not a run")),
+        })
+    })
+}
+
+/// Runs the entry; returns the number of outputs + 1 (0 on error).
+extern "C" fn tl_host_run_exec(run: i64) -> i64 {
+    ffi(|| {
+        // Take the inputs out so the registry isn't locked while the model runs
+        // (which may build a graph through Scheme).
+        let (program, entry, inputs) = with_registry(|r| match r.values.get_mut(&run) {
+            Some((_, HostValue::Run(call))) => Ok((call.program, call.entry.clone(), std::mem::take(&mut call.inputs))),
+            _ => Err(format!("host value {run} is not a run")),
+        })?;
+        let outputs = crate::model::run_program_entry(program, &entry, inputs).map_err(|e| e.to_string())?;
+        let outputs: Vec<(CString, i64)> = outputs
+            .into_iter()
+            .map(|(name, array)| (CString::new(name).unwrap_or_default(), insert(HostValue::Tensor(array))))
+            .collect();
+        let n = outputs.len() as i64;
+        with_registry(|r| {
+            if let Some((_, HostValue::Run(call))) = r.values.get_mut(&run) {
+                call.outputs = outputs;
+            }
+        });
+        Ok(n + 1)
+    })
+}
+
+extern "C" fn tl_host_run_output_name(run: i64, i: i64) -> *const c_char {
+    with_registry(|r| match r.values.get(&run) {
+        Some((_, HostValue::Run(call))) => call.outputs.get(i as usize).map_or(std::ptr::null(), |(n, _)| n.as_ptr()),
+        _ => std::ptr::null(),
+    })
+}
+
+extern "C" fn tl_host_run_output(run: i64, i: i64) -> i64 {
+    ffi(|| {
+        with_registry(|r| match r.values.get(&run) {
+            Some((_, HostValue::Run(call))) => call.outputs.get(i as usize).map(|(_, id)| *id).ok_or_else(|| format!("no output {i}")),
+            _ => Err(format!("host value {run} is not a run")),
+        })
+    })
+}
+
+fn tokenizer(id: i64) -> Result<Arc<Tokenizer>, String> {
+    get(id, |v| match expect_kind(v, "tokenizer")? {
+        HostValue::Tokenizer(t) => Ok(t.clone()),
+        _ => unreachable!(),
+    })
+}
+
+/// Text of token ids (a 1-d array of whole numbers); null on error (see tl_host_error).
+extern "C" fn tl_host_detokenize(tok: i64, ids: i64, skip_special: i32) -> *const c_char {
+    let ok = ffi(|| {
+        let tokenizer = tokenizer(tok)?;
+        let ids: Vec<u32> = indices(ids, "token ids")?.into_iter().map(|i| i as u32).collect();
+        let text = tokenizer.decode(&ids, skip_special != 0).map_err(|e| e.to_string())?;
+        with_registry(|r| r.text = CString::new(text.replace('\0', "")).unwrap_or_default());
+        Ok(1)
+    });
+    if ok == 0 { std::ptr::null() } else { with_registry(|r| r.text.as_ptr()) }
+}
+
+/// Id of a token, or -1.
+extern "C" fn tl_host_token_id(tok: i64, token: *const c_char) -> i64 {
+    let (Ok(tokenizer), Ok(token)) = (tokenizer(tok), text_arg(token)) else { return -1 };
+    tokenizer.token_to_id(token).map_or(-1, |id| id as i64)
+}
+
 /// (name, address) of every host function, to register with Chez.
 pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
     vec![
@@ -399,5 +754,29 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_tensor_dim", tl_host_tensor_dim as *const _),
         ("tl_host_tensor_affine", tl_host_tensor_affine as *const _),
         ("tl_host_tensor_reshape", tl_host_tensor_reshape as *const _),
+        ("tl_host_tensor_new", tl_host_tensor_new as *const _),
+        ("tl_host_tensor_set", tl_host_tensor_set as *const _),
+        ("tl_host_tensor_len", tl_host_tensor_len as *const _),
+        ("tl_host_tensor_get", tl_host_tensor_get as *const _),
+        ("tl_host_tensor_slice", tl_host_tensor_slice as *const _),
+        ("tl_host_tensor_transpose", tl_host_tensor_transpose as *const _),
+        ("tl_host_tensor_take", tl_host_tensor_take as *const _),
+        ("tl_host_tensor_argmax", tl_host_tensor_argmax as *const _),
+        ("tl_host_boxes_convert", tl_host_boxes_convert as *const _),
+        ("tl_host_nms", tl_host_nms as *const _),
+        ("tl_host_detect", tl_host_detect as *const _),
+        ("tl_host_boxes_scale", tl_host_boxes_scale as *const _),
+        ("tl_host_boxes_clip", tl_host_boxes_clip as *const _),
+        ("tl_host_boxes_unletterbox", tl_host_boxes_unletterbox as *const _),
+        ("tl_host_image_letterbox", tl_host_image_letterbox as *const _),
+        ("tl_host_dbscan", tl_host_dbscan as *const _),
+        ("tl_host_cluster_centroids", tl_host_cluster_centroids as *const _),
+        ("tl_host_run_begin", tl_host_run_begin as *const _),
+        ("tl_host_run_input", tl_host_run_input as *const _),
+        ("tl_host_run_exec", tl_host_run_exec as *const _),
+        ("tl_host_run_output_name", tl_host_run_output_name as *const _),
+        ("tl_host_run_output", tl_host_run_output as *const _),
+        ("tl_host_detokenize", tl_host_detokenize as *const _),
+        ("tl_host_token_id", tl_host_token_id as *const _),
     ]
 }

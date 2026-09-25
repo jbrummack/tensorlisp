@@ -4,11 +4,11 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use ndarray::{ArrayD, ArrayViewD};
 use serde_json::json;
-use tensorlisp::{Model, RunOptions, Taps};
+use tensorlisp::{Model, RunOptions, Taps, Value};
 
 use crate::{
     ModelArgs,
-    common::{Stats, file_name, load_model, print_json, read_npy_args, read_raw_examples, shape_string, stats},
+    common::{Stats, file_name, load_model, print_json, read_npy_args, read_raw_examples, read_raw_examples_for, shape_string, stats},
     npy,
 };
 
@@ -32,6 +32,12 @@ pub struct RunArgs {
     /// Run this many times and report the mean time of the runs after the first.
     #[arg(long, default_value_t = 1)]
     pub repeat: usize,
+    /// Don't apply the program's postprocess; show only the raw outputs.
+    #[arg(long)]
+    pub no_post: bool,
+    /// Entry to run (default: `main` or the first one), or a pipeline (takes --raw).
+    #[arg(short, long)]
+    pub entry: Option<String>,
 }
 
 #[derive(Args)]
@@ -56,6 +62,9 @@ pub struct CompareArgs {
     /// Relative tolerance.
     #[arg(long, default_value_t = 1e-3)]
     pub rtol: f32,
+    /// Entry to run (default: `main` or the first one).
+    #[arg(short, long)]
+    pub entry: Option<String>,
 }
 
 #[derive(Args)]
@@ -130,6 +139,14 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
     let start = Instant::now();
     let model = load_model(&args.model)?;
     let load_time = start.elapsed();
+    if let Some(pipeline) = args.entry.as_deref().filter(|e| model.pipelines().iter().any(|p| p.name == *e)) {
+        return run_pipeline(&model, pipeline, args, load_time.as_secs_f64() * 1e3, json);
+    }
+    let entry = model.entry(args.entry.as_deref())?.name.clone();
+    let is_default = entry == model.entries()[0].name;
+    if !is_default && !args.raw.is_empty() {
+        bail!("--raw goes through preprocess, which feeds the default entry {:?}", model.entries()[0].name);
+    }
     let inputs = gather_inputs(&model, &args.inputs, &args.raw)?;
     let options = RunOptions { taps: parse_taps(&args.taps) };
 
@@ -137,11 +154,25 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
     let mut result = None;
     for _ in 0..args.repeat.max(1) {
         let start = Instant::now();
-        result = Some(model.run_with(&views(&inputs), &options)?);
+        result = Some(model.run_entry(&entry, &views(&inputs), &options)?);
         times.push(start.elapsed().as_secs_f64() * 1e3);
     }
     let result = result.unwrap();
     let mean_after_first = (times.len() > 1).then(|| times[1..].iter().sum::<f64>() / (times.len() - 1) as f64);
+
+    // Postprocess per example, with the raw inputs when there are any.
+    let post = match model.postprocess_args() {
+        Some(_) if !args.no_post && is_default => {
+            let start = Instant::now();
+            let examples = if args.raw.is_empty() {
+                model.postprocess(&result.outputs)?
+            } else {
+                model.postprocess_with_raw(&result.outputs, read_raw_examples(&model, &args.raw)?)?
+            };
+            Some((examples, start.elapsed().as_secs_f64() * 1e3))
+        }
+        _ => None,
+    };
 
     let mut written = Vec::new();
     if let Some(dir) = &args.output {
@@ -153,6 +184,10 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
         }
     }
     let file_of = |name: &str| written.iter().find(|(n, _)| n == name).map(|(_, p)| p.clone());
+    let result_files = match (&args.output, &post) {
+        (Some(dir), Some((examples, _))) => write_results(dir, examples)?,
+        _ => Vec::new(),
+    };
 
     if json {
         let entry = |(name, array): &(String, ArrayD<f32>)| {
@@ -165,6 +200,8 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
             "mean_run_ms": mean_after_first,
             "outputs": result.outputs.iter().map(entry).collect::<Vec<_>>(),
             "taps": result.taps.iter().map(entry).collect::<Vec<_>>(),
+            "postprocess_ms": post.as_ref().map(|(_, ms)| ms),
+            "results": post.as_ref().map(|(examples, _)| results_json(examples, &result_files)),
         }))?;
         return Ok(0);
     }
@@ -192,7 +229,151 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
     };
     print_group("outputs", &result.outputs);
     print_group("taps", &result.taps);
+    if let Some((examples, ms)) = &post {
+        println!("postprocess ({ms:.1} ms):");
+        print_results(examples, &result_files);
+    }
     Ok(0)
+}
+
+/// Runs a pipeline once per raw example and shows its results.
+fn run_pipeline(model: &Model, name: &str, args: &RunArgs, load_ms: f64, json: bool) -> Result<i32> {
+    if !args.inputs.is_empty() {
+        bail!("pipeline {name:?} takes raw inputs (--raw), not arrays");
+    }
+    let spec = model.pipelines().iter().find(|p| p.name == name).unwrap();
+    let examples = read_raw_examples_for(&spec.raw_inputs, &args.raw)?;
+    if examples.is_empty() {
+        let names: Vec<&str> = spec.raw_inputs.iter().map(|r| r.name.as_str()).collect();
+        bail!("pipeline {name:?} needs raw inputs: {}", names.join(", "));
+    }
+    let mut results = Vec::new();
+    let mut times = Vec::new();
+    for example in examples {
+        let start = Instant::now();
+        results.push(model.pipeline(name, example)?);
+        times.push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    let files = match &args.output {
+        Some(dir) => write_results(dir, &results)?,
+        None => Vec::new(),
+    };
+    if json {
+        print_json(&json!({
+            "device": model.device_name(),
+            "load_ms": load_ms,
+            "pipeline": name,
+            "run_ms": times,
+            "results": results_json(&results, &files),
+        }))?;
+        return Ok(0);
+    }
+    let times: Vec<String> = times.iter().map(|t| format!("{t:.1} ms")).collect();
+    println!("device {}, load {load_ms:.1} ms, pipeline {name}: {}", model.device_name(), times.join(", "));
+    print_results(&results, &files);
+    Ok(0)
+}
+
+/// Writes results to DIR/results/<example>/NAME.npy (arrays) or NAME.txt (text).
+fn write_results(dir: &std::path::Path, examples: &[Vec<(String, Value)>]) -> Result<Vec<Vec<PathBuf>>> {
+    examples
+        .iter()
+        .enumerate()
+        .map(|(i, example)| {
+            let dir = dir.join("results").join(i.to_string());
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            example
+                .iter()
+                .map(|(name, value)| {
+                    Ok(match value {
+                        Value::Array(array) => {
+                            let path = dir.join(format!("{}.npy", file_name(name)));
+                            npy::write(&path, array)?;
+                            path
+                        }
+                        Value::Text(text) => {
+                            let path = dir.join(format!("{}.txt", file_name(name)));
+                            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+                            path
+                        }
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn results_json(examples: &[Vec<(String, Value)>], files: &[Vec<PathBuf>]) -> Vec<Vec<serde_json::Value>> {
+    let file = |i: usize, j: usize| files.get(i).and_then(|f| f.get(j)).cloned();
+    examples
+        .iter()
+        .enumerate()
+        .map(|(i, example)| {
+            example
+                .iter()
+                .enumerate()
+                .map(|(j, (name, value))| match value {
+                    Value::Array(array) => json!({
+                        "name": name,
+                        "shape": array.shape(),
+                        // Small results (detections, labels, counts) are inlined.
+                        "values": (array.len() <= RESULT_VALUES_INLINE).then(|| array.iter().copied().collect::<Vec<_>>()),
+                        "stats": (array.len() > RESULT_VALUES_INLINE).then(|| stats(array)),
+                        "file": file(i, j),
+                    }),
+                    Value::Text(text) => json!({ "name": name, "text": text, "file": file(i, j) }),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn print_results(examples: &[Vec<(String, Value)>], files: &[Vec<PathBuf>]) {
+    for (i, example) in examples.iter().enumerate() {
+        if examples.len() > 1 {
+            println!("  example {i}:");
+        }
+        let indent = if examples.len() > 1 { "    " } else { "  " };
+        let width = example.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        for (j, (name, value)) in example.iter().enumerate() {
+            let file = files.get(i).and_then(|f| f.get(j)).map(|p| format!("  -> {}", p.display())).unwrap_or_default();
+            match value {
+                Value::Array(array) => {
+                    println!("{indent}{name:width$}  {:10} {}{file}", shape_string(array.shape()), preview(array))
+                }
+                Value::Text(text) => println!("{indent}{name:width$}  {text:?}{file}"),
+            }
+        }
+    }
+}
+
+/// Results with at most this many values are shown (and put in JSON) in full.
+const RESULT_VALUES_INLINE: usize = 64;
+
+/// A result's values: all of them if few (rows on their own lines for
+/// matrices, e.g. boxes), otherwise the first ones and stats.
+fn preview(array: &ArrayD<f32>) -> String {
+    let fmt = |v: &f32| if v.fract() == 0.0 && v.abs() < 1e7 { format!("{v}") } else { format!("{v:.4}") };
+    if array.len() > RESULT_VALUES_INLINE {
+        let Stats { min, max, mean, .. } = stats(array);
+        let first: Vec<String> = array.iter().take(8).map(fmt).collect();
+        return format!("[{}, …] min {min:.4} max {max:.4} mean {mean:.4}", first.join(", "));
+    }
+    match array.shape() {
+        [] => fmt(array.iter().next().unwrap()),
+        [_] => format!("[{}]", array.iter().map(fmt).collect::<Vec<_>>().join(", ")),
+        shape => {
+            let cols = shape[shape.len() - 1].max(1);
+            let rows: Vec<String> = array
+                .iter()
+                .map(fmt)
+                .collect::<Vec<_>>()
+                .chunks(cols)
+                .map(|row| format!("[{}]", row.join(", ")))
+                .collect();
+            rows.join(" ")
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -282,16 +463,17 @@ fn compare_arrays(kind: &'static str, name: &str, got: &ArrayD<f32>, want: &Arra
 }
 
 /// Output and tap names the program produces for these inputs.
-fn result_names(model: &Model, inputs: &[(String, ArrayD<f32>)]) -> Result<(Vec<String>, Vec<String>)> {
+fn result_names(model: &Model, entry: &str, inputs: &[(String, ArrayD<f32>)]) -> Result<(Vec<String>, Vec<String>)> {
     let shapes: Vec<(&str, Vec<usize>)> = inputs.iter().map(|(n, a)| (n.as_str(), a.shape().to_vec())).collect();
-    let graph = model.graph(&shapes, &Taps::None)?;
+    let graph = model.graph_entry(entry, &shapes, &Taps::None)?;
     Ok((graph.outputs.into_iter().map(|(n, _)| n).collect(), graph.taps))
 }
 
 pub fn compare(args: &CompareArgs, json: bool) -> Result<i32> {
     let model = load_model(&args.model)?;
+    let entry = model.entry(args.entry.as_deref())?.name.clone();
     let inputs = gather_inputs(&model, &args.inputs, &args.raw)?;
-    let (outputs, taps) = result_names(&model, &inputs)?;
+    let (outputs, taps) = result_names(&model, &entry, &inputs)?;
 
     let mut references = read_npy_args(&args.references)?;
     if let Some(dir) = &args.reference_dir {
@@ -316,7 +498,7 @@ pub fn compare(args: &CompareArgs, json: bool) -> Result<i32> {
     }
 
     let wanted_taps: Vec<String> = taps.iter().filter(|t| references.iter().any(|(n, _)| n == *t)).cloned().collect();
-    let result = model.run_with(&views(&inputs), &RunOptions { taps: Taps::Names(wanted_taps) })?;
+    let result = model.run_entry(&entry, &views(&inputs), &RunOptions { taps: Taps::Names(wanted_taps) })?;
 
     // Taps in definition order first: the first failing one is closest to where the port diverges.
     let mut comparisons = Vec::new();

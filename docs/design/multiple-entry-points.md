@@ -1,8 +1,12 @@
-# Multiple entry points per file (planned)
+# Multiple entry points per file
 
-Status: not implemented. Today a program defines exactly one `(model ...)`,
-so TIPSv2 ships as two files (`tipsv2-b14-text-*.gguf`,
-`tipsv2-b14-vision-*.gguf`) although it is one checkpoint.
+Status: implemented (named `(model name ...)` entries, one scheduler and live
+graph per entry, `(pipeline ...)` host code that runs entries, `--entry` on
+`run`/`check`/`compare`, `quantize` over every entry with `ENTRY:NAME=`
+shapes). First user: `ports/t5gemma2` (encoder + decoder + generation). Not
+done yet: listing entries in `tl inspect` without running Scheme
+(`TL_ENTRIES`), per-entry reference dirs, and merging the two TIPSv2 files.
+The rest of this document is the original proposal.
 
 ## Motivation
 

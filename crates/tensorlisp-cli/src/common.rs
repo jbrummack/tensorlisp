@@ -50,6 +50,11 @@ pub fn load_model(args: &ModelArgs) -> Result<Model> {
 /// examples to the batch.
 pub fn read_raw_examples(model: &Model, args: &[String]) -> Result<Vec<Vec<(String, RawInput)>>> {
     let specs = model.raw_inputs().context("the program has no (preprocess ...) form; pass arrays with -i")?;
+    read_raw_examples_for(&specs, args)
+}
+
+/// Like [`read_raw_examples`], for the given raw input specs (e.g. a pipeline's).
+pub fn read_raw_examples_for(specs: &[tensorlisp::RawSpec], args: &[String]) -> Result<Vec<Vec<(String, RawInput)>>> {
     let mut columns: Vec<(String, Vec<RawInput>)> = specs.iter().map(|s| (s.name.clone(), Vec::new())).collect();
     for arg in args {
         let (name, value) = split_assignment(arg)?;
@@ -218,7 +223,8 @@ fn declared_string(spec: &InputSpec) -> String {
 
 /// Input shapes (numpy order) from `NAME=1,3,224,224` / `NAME=file.npy`
 /// arguments, falling back to the program's fixed declared shapes.
-pub fn resolve_input_shapes(model: &Model, args: &[String]) -> Result<Vec<(String, Vec<usize>)>> {
+pub fn resolve_input_shapes(model: &Model, entry: Option<&str>, args: &[String]) -> Result<Vec<(String, Vec<usize>)>> {
+    let entry = model.entry(entry)?;
     let mut shapes: Vec<(String, Vec<usize>)> = args
         .iter()
         .map(|arg| {
@@ -227,7 +233,7 @@ pub fn resolve_input_shapes(model: &Model, args: &[String]) -> Result<Vec<(Strin
             Ok((name.to_string(), shape))
         })
         .collect::<Result<_>>()?;
-    for spec in model.inputs() {
+    for spec in &entry.inputs {
         if shapes.iter().any(|(n, _)| *n == spec.name) {
             continue;
         }
