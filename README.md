@@ -23,7 +23,9 @@ experiments/
   gguf-loader/     archived first GGUF loader (superseded by tensorlisp::gguf and `tl`)
 ports/             real model ports: program, PyTorch reference script, nix flake
   tipsv2/          TIPSv2 B/14 text and vision encoders (match PyTorch, run on Metal)
-docs/              design notes, e.g. stdlib-candidates.md
+  t5gemma2/        T5Gemma 2 270M-270M: image captioning / text generation, KV cache
+  yolo11/          YOLO11n object detection (Ultralytics)
+docs/              stdlib.md (the (tl ...) libraries), porting-notes.md, design notes
 examples/          tensorlisp programs (*.tl)
 scripts/           build helpers
 vendor/
@@ -84,19 +86,22 @@ A tensorlisp GGUF is a normal GGUF (weights as tensors) plus three keys:
 ### Programs
 
 ```scheme
-(define (linear x name)
-  (ggml-add (ggml-mul-mat (weight (string-append name ".weight")) x)
-            (weight (string-append name ".bias"))))
+(import (tl nn))
 
 (model (inputs [x f32 (784 batch)])
-  (define h (ggml-relu (linear x "fc1")))
-  (outputs [logits (linear h "fc2") 2]))
+  (define h (ggml-relu (nn:linear x "fc1")))
+  (outputs [logits (nn:linear h "fc2") 2]))
 ```
 
 - Programs run in a sandbox: R6RS `(rnrs base)`, `lists`, `control`, fixnum
   and flonum arithmetic, the R5RS `quotient remainder modulo
   exact->inexact inexact->exact`, Chez's `iota list-head format fold-left
   fold-right`, plus `(tensorlisp)`. No eval, ports, files or FFI.
+- The stdlib (`docs/stdlib.md`): `(import (tl tensor) (tl nn) (tl attn) (tl vision) (tl util))`
+  at the top of a program binds `tensor:dim`, `nn:linear`, `nn:conv2d`,
+  `attn:sdpa`, `attn:rope`, `vision:dfl`, `util:string-replace`, ... —
+  PyTorch-semantics layers, attention, masks and layout helpers, each tested
+  against direct implementations. All ports use it.
 - **Shapes inside Scheme are in ggml order**, innermost first: a numpy array
   of shape `(batch, 784)` is `(784 batch)`. The Rust API uses ndarray order;
   the memory layout is the same.

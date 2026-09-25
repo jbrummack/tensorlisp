@@ -97,6 +97,8 @@
     (let loop ([i (- (ggml_n_dims p) 1)] [nbs '()])
       (if (< i 0) nbs (loop (- i 1) (cons (tl_tensor_nb p i) nbs))))))
 
+(define (contiguous? t) (ggml_is_contiguous (%tensor-ptr 'contiguous? t)))
+
 (define (dtype t)
   (string->symbol (ggml_type_name (tl_tensor_type (%tensor-ptr 'dtype t)))))
 
@@ -757,16 +759,46 @@
     (cdr entry)))
 
 ;; Environment programs are evaluated in: pure R6RS (plus the R5RS names like
-;; quotient), a few pure Chez utilities, and (tensorlisp). No eval, ports,
-;; files or foreign-procedure.
-(define (%program-environment)
+;; quotient), a few pure Chez utilities, (tensorlisp), and the stdlib
+;; libraries the program imports. No eval, ports, files or foreign-procedure.
+(define (%program-environment imports)
   (copy-environment
-    (environment '(rnrs base) '(rnrs lists) '(rnrs control)
-                 '(rnrs arithmetic fixnums) '(rnrs arithmetic flonums)
-                 '(only (rnrs r5rs) quotient remainder modulo exact->inexact inexact->exact)
-                 '(only (chezscheme) iota list-head format fold-left fold-right)
-                 '(tensorlisp))
+    (apply environment
+      '(rnrs base) '(rnrs lists) '(rnrs control)
+      '(rnrs arithmetic fixnums) '(rnrs arithmetic flonums)
+      '(only (rnrs r5rs) quotient remainder modulo exact->inexact inexact->exact)
+      '(only (chezscheme) iota list-head format fold-left fold-right)
+      '(tensorlisp)
+      imports)
     #t))
+
+;; The stdlib: (tl name) binds its exports as name:export unless the import
+;; spec says otherwise (prefix, only, rename, except).
+(define %stdlib '(tensor nn attn vision util))
+
+;; Import specs of the program's leading (import ...) forms, checked and with
+;; the canonical prefixes applied.
+(define (%program-imports forms)
+  (define (library-name spec)
+    (cond
+      [(and (pair? spec) (memq (car spec) '(prefix only except rename)) (pair? (cdr spec)))
+       (library-name (cadr spec))]
+      [(and (pair? spec) (eq? (car spec) 'library) (pair? (cdr spec))) (cadr spec)]
+      [else spec]))
+  (define (check spec)
+    (let ([name (library-name spec)])
+      (unless (and (list? name) (= (length name) 2) (eq? (car name) 'tl) (memq (cadr name) %stdlib))
+        (error 'import (format "only the stdlib can be imported: ~a" (map (lambda (n) (list 'tl n)) %stdlib)) name))
+      (if (equal? spec name)
+          `(prefix ,name ,(string->symbol (format "~a:" (cadr name))))
+          spec)))
+  (apply append
+    (map (lambda (form)
+           (unless (list? form) (error 'import "expected (import library ...)" form))
+           (map check (cdr form)))
+         forms)))
+
+(define (%import-form? form) (and (pair? form) (eq? (car form) 'import)))
 
 ;; Host entry points, called from Rust.
 
@@ -795,15 +827,22 @@
 ;; pipelines ((name-string raw-inputs) ...);
 ;; states ((name-string type-string (dim ...)) ...).
 (define ($tl-load-program id text assets)
-  (let ([env (%program-environment)]
-        [slot (vector '() #f #f '() '())]
-        [port (open-input-string text)])
+  (let* ([port (open-input-string text)]
+         [forms (let loop ([acc '()])
+                  (let ([form (read port)])
+                    (if (eof-object? form) (reverse acc) (loop (cons form acc)))))]
+         [imports (let loop ([forms forms] [acc '()])
+                    (if (and (pair? forms) (%import-form? (car forms)))
+                        (loop (cdr forms) (cons (car forms) acc))
+                        (reverse acc)))]
+         [body (list-tail forms (length imports))]
+         [env (%program-environment (%program-imports imports))]
+         [slot (vector '() #f #f '() '())])
+    (for-each (lambda (form)
+                (when (%import-form? form) (error 'import "imports must come before everything else" form)))
+              body)
     (parameterize ([%loading slot] [%assets assets])
-      (let loop ()
-        (let ([form (read port)])
-          (unless (eof-object? form)
-            (eval form env)
-            (loop)))))
+      (for-each (lambda (form) (eval form env)) body))
     (when (null? (vector-ref slot 0)) (error 'load "the program does not define a model"))
     (let* ([pre (vector-ref slot 1)]
            [post (vector-ref slot 2)]
@@ -956,6 +995,8 @@
                [graph (%graph)])
           (for-each (lambda (r) (ggml_build_forward_expand graph (cadr r)))
                     (append outputs tap-results))
+          ;; Inputs the body doesn't use still get memory, so they can be set.
+          (for-each (lambda (t) (ggml_build_forward_expand graph t)) inputs)
           (list graph inputs outputs tap-results (map car tapped))))))))
 
 (define ($tl-unload id)

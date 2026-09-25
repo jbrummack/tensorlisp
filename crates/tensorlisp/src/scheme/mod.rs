@@ -20,8 +20,17 @@ use crate::error::{Error, Result};
 
 const CORE: &str = include_str!("core.ss");
 
+/// The stdlib libraries, `(tl name)`, in dependency order (see docs/stdlib.md).
+const STDLIB: &[(&str, &str)] = &[
+    ("tensor", include_str!("stdlib/tensor.ss")),
+    ("util", include_str!("stdlib/util.ss")),
+    ("nn", include_str!("stdlib/nn.ss")),
+    ("attn", include_str!("stdlib/attn.ss")),
+    ("vision", include_str!("stdlib/vision.ss")),
+];
+
 /// Names exported to programs by `(tensorlisp)`, besides generated ops and constants.
-const PUBLIC: &str = "tensor? shape strides dtype weight weight? model inputs outputs tap \
+const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? model inputs outputs tap \
     preprocess model-inputs host? asset tokenizer tokenize \
     image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array \
     audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
@@ -29,7 +38,7 @@ const PUBLIC: &str = "tensor? shape strides dtype weight weight? model inputs ou
     postprocess results pipeline run output detokenize token-id define-state state effect device array-length array->list list->array array-slice array-transpose array-take array-argmax \
     image-letterbox boxes-convert nms detect boxes-scale boxes-clip boxes-unletterbox dbscan cluster-centroids";
 /// Host entry points, only visible from Rust.
-const HOST: &str = "$tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline";
+const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline";
 
 extern "C" fn tl_tensor_ne(t: *const ggml_tensor, i: i32) -> i64 {
     unsafe { (*t).ne[i as usize] }
@@ -74,6 +83,11 @@ fn boot() -> Result<Scheme> {
         }
     }
     scheme.eval(&library_source())?;
+    for (name, source) in STDLIB {
+        scheme
+            .eval(source)
+            .map_err(|e| Error::Program(format!("stdlib (tl {name}) failed to load: {e}")))?;
+    }
 
     // ggml assertions on this thread raise Scheme errors (see core.ss).
     crate::guard::install();
