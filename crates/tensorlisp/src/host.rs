@@ -17,6 +17,7 @@ use autopro::{
     detect::{BoxFormat, Detector},
     audio::{Audio, LogMode, MelNorm, MelScale, MelSpectrogram, WaveformProcessor, WhisperFeatures},
     image::{ChannelOrder, Filter, ImageProcessor, Layout, Size},
+    ocr::{DbDecoder, Quad},
     text::{Padding, TextOptions, Tokenizer},
 };
 use image::RgbImage;
@@ -28,6 +29,8 @@ pub(crate) enum HostValue {
     Image(RgbImage),
     Audio(Audio),
     Tensor(ArrayD<f32>),
+    /// Strings by index, e.g. a CTC recognizer's characters.
+    Vocabulary(Arc<Vec<String>>),
     /// A `(run entry ...)` being assembled or finished.
     Run(Box<RunCall>),
 }
@@ -48,6 +51,7 @@ impl HostValue {
             HostValue::Image(_) => "image",
             HostValue::Audio(_) => "audio",
             HostValue::Tensor(_) => "tensor",
+            HostValue::Vocabulary(_) => "vocabulary",
             HostValue::Run(_) => "run",
         }
     }
@@ -213,6 +217,9 @@ fn opt(v: i64) -> Option<usize> {
     (v >= 0).then_some(v as usize)
 }
 
+/// Not a Pillow filter: torch's bilinear without antialiasing (OpenCV-like).
+const FILTER_BILINEAR_NO_ANTIALIAS: i32 = 6;
+
 fn filter(code: i32) -> Result<Filter, String> {
     Filter::from_pil(code as i64).ok_or_else(|| format!("unknown filter code {code}"))
 }
@@ -294,7 +301,12 @@ extern "C" fn tl_host_image_resize(id: i64, kind: i32, a: i64, b: i64, c: i64, f
         if w == 0 || h == 0 {
             return Err(format!("resize to {w}x{h}"));
         }
-        Ok(insert(HostValue::Image(autopro::image::resize(&img, w, h, filter(filter_code)?))))
+        let resized = if filter_code == FILTER_BILINEAR_NO_ANTIALIAS {
+            autopro::image::resize_bilinear_no_antialias(&img, w, h)
+        } else {
+            autopro::image::resize(&img, w, h, filter(filter_code)?)
+        };
+        Ok(insert(HostValue::Image(resized)))
     })
 }
 
@@ -644,6 +656,128 @@ extern "C" fn tl_host_cluster_centroids(id: i64, labels: i64) -> i64 {
     })
 }
 
+// --- OCR: text boxes from DB probability maps, text-line crops, CTC decoding.
+
+/// A probability map [H, W], possibly with leading dimensions of size 1.
+fn prob_map(id: i64) -> Result<Array2<f32>, String> {
+    let t = tensor(id)?;
+    let shape = t.shape().to_vec();
+    let n = shape.len();
+    if n < 2 || shape[..n - 2].iter().any(|&d| d != 1) {
+        return Err(format!("expected a probability map [H, W] (or [1, .., H, W]), got shape {shape:?}"));
+    }
+    Ok(t.into_shape_with_order((shape[n - 2], shape[n - 1])).map_err(|e| e.to_string())?)
+}
+
+fn quads(id: i64) -> Result<Vec<Quad>, String> {
+    let t = tensor(id)?;
+    if t.ndim() != 3 || t.shape()[1..] != [4, 2] {
+        return Err(format!("text boxes must be [n, 4, 2], got {:?}", t.shape()));
+    }
+    let t = t.as_standard_layout();
+    Ok(t.as_slice().unwrap().chunks(8).map(|c| [[c[0], c[1]], [c[2], c[3]], [c[4], c[5]], [c[6], c[7]]]).collect())
+}
+
+/// Returns boxes [n, 4, 2] (corners tl, tr, br, bl as x, y); scores [n] are id + 1.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn tl_host_text_boxes(
+    prob: i64,
+    width: i64,
+    height: i64,
+    threshold: f64,
+    box_threshold: f64,
+    max_candidates: i64,
+    unclip_ratio: f64,
+    min_size: f64,
+) -> i64 {
+    ffi(|| {
+        let map = prob_map(prob)?;
+        let decoder = DbDecoder {
+            threshold: threshold as f32,
+            box_threshold: box_threshold as f32,
+            max_candidates: max_candidates.max(0) as usize,
+            unclip_ratio: unclip_ratio as f32,
+            min_size: min_size as f32,
+        };
+        let found = decoder.decode(map.view(), width as u32, height as u32);
+        let flat: Vec<f32> = found.boxes.iter().flatten().flatten().copied().collect();
+        let boxes = ArrayD::from_shape_vec(IxDyn(&[found.boxes.len(), 4, 2]), flat).map_err(|e| e.to_string())?;
+        let first = insert(HostValue::Tensor(boxes));
+        insert(HostValue::Tensor(to_f32(found.scores)));
+        Ok(first)
+    })
+}
+
+/// Reading order of text boxes [n, 4, 2]: indices [n].
+extern "C" fn tl_host_text_boxes_order(id: i64) -> i64 {
+    ffi(|| {
+        let order = autopro::ocr::sort_boxes(&quads(id)?);
+        Ok(insert(HostValue::Tensor(to_f32(order.into_iter().map(|i| i as u32)))))
+    })
+}
+
+/// The straightened text line in box `i` of boxes [n, 4, 2].
+extern "C" fn tl_host_image_crop_text(img: i64, boxes: i64, i: i64) -> i64 {
+    ffi(|| {
+        let quads = quads(boxes)?;
+        let quad = usize::try_from(i).ok().and_then(|i| quads.get(i)).ok_or_else(|| format!("no box {i} of {}", quads.len()))?;
+        let crop = autopro::ocr::crop_text_line(&image(img)?, quad);
+        if crop.width() == 0 || crop.height() == 0 {
+            return Err(format!("box {i} is empty"));
+        }
+        Ok(insert(HostValue::Image(crop)))
+    })
+}
+
+/// Greedy CTC decoding of probabilities [T, classes] (leading 1s allowed):
+/// class ids [k]; the mean probability [1] is id + 1.
+extern "C" fn tl_host_ctc_greedy(probs: i64) -> i64 {
+    ffi(|| {
+        let (ids, score) = autopro::ocr::ctc_greedy(prob_map(probs)?.view());
+        let first = insert(HostValue::Tensor(to_f32(ids.into_iter().map(|i| i as u32))));
+        insert(HostValue::Tensor(to_f32([score])));
+        Ok(first)
+    })
+}
+
+fn vocabulary(id: i64) -> Result<Arc<Vec<String>>, String> {
+    get(id, |v| match expect_kind(v, "vocabulary")? {
+        HostValue::Vocabulary(v) => Ok(v.clone()),
+        _ => unreachable!(),
+    })
+}
+
+/// A vocabulary from UTF-8 text, one entry per line.
+extern "C" fn tl_host_vocabulary(bytes: i64) -> i64 {
+    ffi(|| {
+        let data = get(bytes, |v| match expect_kind(v, "bytes")? {
+            HostValue::Bytes(b) => Ok(b.clone()),
+            _ => unreachable!(),
+        })?;
+        let text = std::str::from_utf8(&data).map_err(|_| "the vocabulary is not UTF-8".to_string())?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        Ok(insert(HostValue::Vocabulary(Arc::new(text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l).to_string()).collect()))))
+    })
+}
+
+extern "C" fn tl_host_vocabulary_size(id: i64) -> i64 {
+    ffi(|| Ok(vocabulary(id)?.len() as i64))
+}
+
+/// The entries at ids (a 1-d array), concatenated; null on error.
+extern "C" fn tl_host_vocabulary_text(vocab: i64, ids: i64) -> *const c_char {
+    let ok = ffi(|| {
+        let v = vocabulary(vocab)?;
+        let mut text = String::new();
+        for i in indices(ids, "ids")? {
+            text.push_str(v.get(i).ok_or_else(|| format!("id {i} is outside the vocabulary ({} entries)", v.len()))?);
+        }
+        with_registry(|r| r.text = CString::new(text.replace('\0', "")).unwrap_or_default());
+        Ok(1)
+    });
+    if ok == 0 { std::ptr::null() } else { with_registry(|r| r.text.as_ptr()) }
+}
+
 // --- Pipelines: running entries from Scheme, and text from tokens.
 
 extern "C" fn tl_host_run_begin(program: i64, entry: *const c_char) -> i64 {
@@ -778,5 +912,12 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_run_output", tl_host_run_output as *const _),
         ("tl_host_detokenize", tl_host_detokenize as *const _),
         ("tl_host_token_id", tl_host_token_id as *const _),
+        ("tl_host_text_boxes", tl_host_text_boxes as *const _),
+        ("tl_host_text_boxes_order", tl_host_text_boxes_order as *const _),
+        ("tl_host_image_crop_text", tl_host_image_crop_text as *const _),
+        ("tl_host_ctc_greedy", tl_host_ctc_greedy as *const _),
+        ("tl_host_vocabulary", tl_host_vocabulary as *const _),
+        ("tl_host_vocabulary_size", tl_host_vocabulary_size as *const _),
+        ("tl_host_vocabulary_text", tl_host_vocabulary_text as *const _),
     ]
 }

@@ -213,7 +213,9 @@ see `tl pack --asset`).
 - Images: `image-size`, `image-resize` (static), `image-resize-shortest`,
   `image-resize-longest`, `image-resize-multiple` (dynamic), `image-center-crop`,
   `(image->array img 'scale s 'mean (...) 'std (...) 'channels rgb|bgr 'layout chw|hwc)`.
-  Filters: `nearest bilinear bicubic lanczos box hamming` (Pillow-exact).
+  Filters: `nearest bilinear bicubic lanczos box hamming` (Pillow-exact), and
+  `bilinear-no-antialias` (torch's `antialias=False` on 8-bit images, bit-exact;
+  close to OpenCV's `INTER_LINEAR`: downscaling skips pixels).
 - Audio: `audio-rate`, `audio-length`, `audio-resample`, `audio-pad`,
   `audio->array` (waveform + mask), `log-mel` (options `n-fft hop win mels
   f-min f-max power center scale norm log floor`), `whisper-features`.
@@ -252,6 +254,14 @@ preprocess (e.g. the original image, for its size).
 - Clustering: `(dbscan x eps min-samples 'metric euclidean|cosine)` (scikit-learn
   labels, -1 = noise; distances on BLAS, Accelerate on Apple),
   `cluster-centroids`.
+- OCR (PaddleOCR / transformers PP-OCR semantics, OpenCV-exact geometry):
+  `(text-boxes prob width height 'threshold 'box-threshold 'max-candidates
+  'unclip-ratio 'min-size)` (DB probability map → quads `[n, 4, 2]` on the
+  original image and scores), `text-boxes-order` (reading order),
+  `(image-crop-text img boxes i)` (straightened line, bicubic perspective
+  warp), `(ctc-greedy probs)` → ids and mean probability, `vocabulary`
+  (one entry per line, e.g. an asset), `vocabulary-text`, `vocabulary-size`.
+  See `ports/ppocrv6`.
 - Arrays: `array-slice` (`'axis`, negative bounds), `array-transpose`,
   `array-take` (rows at indices), `array-argmax` (last axis), `array-length`,
   `array->list`, `list->array`. Results may also be numbers or lists of numbers.

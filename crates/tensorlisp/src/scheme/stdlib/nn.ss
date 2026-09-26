@@ -6,9 +6,9 @@
 ;; [W, H, C, B] (torch's NCHW memory layout). Options are 'name value pairs.
 (library (tl nn)
   (export linear layer-norm rms-norm embedding gelu gelu-tanh gelu-tanh-exact
-          conv2d conv2d-depthwise patch-embed upsample-nearest max-pool avg-pool
+          conv2d conv2d-depthwise conv-transpose2d patch-embed upsample-nearest max-pool avg-pool
           sinusoidal-positions masked-mean)
-  (import (rnrs) (only (chezscheme) format quotient remainder) (tensorlisp runtime) (tl tensor))
+  (import (rnrs) (only (chezscheme) format quotient remainder iota) (tensorlisp runtime) (tl tensor))
 
   (define (param prefix name) (string-append prefix "." name))
 
@@ -58,52 +58,120 @@
                              (sqrt (/ 2.0 3.141592653589793)))])
       (ggml-mul (ggml-scale x 0.5) (ggml-scale-bias (ggml-tanh inner) 1.0 1.0))))
 
-  ;; torch.nn.Conv2d (groups = 1) on x [W, H, C, B] -> [W', H', C_out, B].
-  ;; 'stride (1), 'padding (default kernel/2, "same" for odd kernels),
-  ;; 'method: auto (im2col on GPUs, direct on the CPU: each ~3x faster on its
-  ;; device than the other), im2col (patches + one matmul) or direct.
-  (define (conv2d x prefix . opts)
-    (let* ([o (%options 'nn:conv2d opts '((stride . 1) (padding . #f) (method . auto)))]
-           [kernel (weight (param prefix "weight"))]                  ; [k, k, C_in, C_out]
-           [k (dim kernel 0)] [c-in (dim kernel 2)] [c-out (dim kernel 3)]
-           [s (%int 'nn:conv2d 'stride (%opt o 'stride))]
-           [p (let ([p (%opt o 'padding)]) (if p (%int 'nn:conv2d 'padding p) (quotient k 2)))]
-           [method (case (%opt o 'method)
-                     [(auto) (if (eq? (device) 'gpu) 'im2col 'direct)]
-                     [(im2col direct) (%opt o 'method)]
-                     [else (error 'nn:conv2d "method must be auto, im2col or direct" (%opt o 'method))])]
-           [y (if (eq? method 'direct)
-                  (ggml-conv-2d-direct kernel x s s p p 1 1)
-                  (im2col-conv x kernel k c-in c-out s p))])
-      (add-bias y (let ([b (optional prefix "bias")]) (and b (ggml-reshape-3d b 1 1 c-out))))))
+  ;; A per-axis option in PyTorch's order: an integer n (both axes) or a list
+  ;; (height width). Returns the values for x (width) and y (height).
+  (define (axes who name v)
+    (cond
+      [(fixnum? v) (values v v)]
+      [(and (list? v) (= (length v) 2) (for-all fixnum? v)) (values (cadr v) (car v))]
+      [else (error who (format "~a must be an integer or a list (height width)" name) v)]))
 
-  (define (im2col-conv x kernel k c-in c-out s p)
+  ;; Default padding: kernel/2 per axis ("same" for odd kernels, stride 1).
+  (define (padding who o kw kh)
+    (let ([p (%opt o 'padding)])
+      (if p (axes who 'padding p) (values (quotient kw 2) (quotient kh 2)))))
+
+  (define (conv-bias prefix c-out)
+    (let ([b (optional prefix "bias")]) (and b (ggml-reshape-3d b 1 1 c-out))))
+
+  ;; torch.nn.Conv2d (groups = 1) on x [W, H, C, B] -> [W', H', C_out, B].
+  ;; Kernels may be non-square. 'stride (1) and 'padding (kernel/2, "same"
+  ;; for odd kernels) are an integer or a list (height width) like PyTorch's
+  ;; tuples. 'method: auto (im2col on GPUs, direct on the CPU: each ~3x
+  ;; faster on its device than the other), im2col (patches + one matmul;
+  ;; in bands of output rows when the patches would exceed 256 MiB) or direct.
+  (define (conv2d x prefix . opts)
+    (let*-values ([(o) (%options 'nn:conv2d opts '((stride . 1) (padding . #f) (method . auto)))]
+                  [(kernel) (weight (param prefix "weight"))]          ; [kw, kh, C_in, C_out]
+                  [(kw kh c-in c-out) (values (dim kernel 0) (dim kernel 1) (dim kernel 2) (dim kernel 3))]
+                  [(sx sy) (axes 'nn:conv2d 'stride (%opt o 'stride))]
+                  [(px py) (padding 'nn:conv2d o kw kh)]
+                  [(method) (case (%opt o 'method)
+                              [(auto) (if (eq? (device) 'gpu) 'im2col 'direct)]
+                              [(im2col direct) (%opt o 'method)]
+                              [else (error 'nn:conv2d "method must be auto, im2col or direct" (%opt o 'method))])])
+      (add-bias (if (eq? method 'direct)
+                    (ggml-conv-2d-direct kernel x sx sy px py 1 1)
+                    (im2col-conv x kernel kw kh c-in c-out sx sy px py))
+                (conv-bias prefix c-out))))
+
+  ;; im2col's columns take 4 * kw * kh * C_in bytes per output pixel (10 GB
+  ;; for a 9x9 conv over 256 channels at 400 x 304 pixels). Beyond this they
+  ;; are made and multiplied in bands of output rows, one after the other,
+  ;; so the allocator reuses the memory.
+  (define im2col-limit (* 256 1024 1024))
+
+  (define (im2col-conv x kernel kw kh c-in c-out sx sy px py)
+    (let* ([w-out (+ 1 (quotient (- (+ (dim x 0) (* 2 px)) kw) sx))]
+           [h-out (+ 1 (quotient (- (+ (dim x 1) (* 2 py)) kh) sy))]
+           [row-bytes (* 4 kw kh c-in w-out (dim x 3))]
+           [rows (max 1 (quotient im2col-limit row-bytes))])
+      (if (>= rows h-out)
+          (im2col-matmul x kernel kw kh c-in c-out sx sy px py)
+          (let ([padded (if (= px py 0) x (ggml-pad-ext x px px py py 0 0 0 0))])
+            (let loop ([r 0] [bands '()])
+              (if (>= r h-out)
+                  (concat (reverse bands) 1)
+                  (let* ([n (min rows (- h-out r))]
+                         [band (ggml-cont (slice padded 1 (* r sy) (+ (* (- n 1) sy) kh)))])
+                    (loop (+ r n) (cons (im2col-matmul band kernel kw kh c-in c-out sx sy 0 0) bands)))))))))
+
+  (define (im2col-matmul x kernel kw kh c-in c-out sx sy px py)
     (let* ([batch (dim x 3)]
-           [pointwise? (and (= k 1) (= s 1) (= p 0))]
-           ;; [k*k*C, W', H', B]; for 1x1 convolutions the pixels with channels innermost.
+           [k (* kw kh c-in)]
+           [pointwise? (and (= kw kh sx sy 1) (= px py 0))]
+           ;; [kw*kh*C, W', H', B]; for 1x1 convolutions the pixels with channels innermost.
            [cols (if pointwise?
                      (ggml-cont (ggml-permute (ggml-reshape-3d x (* (dim x 0) (dim x 1)) c-in batch) 1 0 2 3))
-                     (ggml-im2col kernel x s s p p 1 1 #t GGML_TYPE_F32))]
+                     (ggml-im2col kernel x sx sy px py 1 1 #t GGML_TYPE_F32))]
            [w-out (if pointwise? (dim x 0) (dim cols 1))]
            [h-out (if pointwise? (dim x 1) (dim cols 2))]
            [n (* w-out h-out batch)]
            ;; [W'H'B, C_out] = [W', H', B, C_out] in memory; the kernel is the
            ;; second matmul operand, which must be f32.
-           [y (ggml-mul-mat (ggml-reshape-2d cols (* k k c-in) n)
-                            (ggml-reshape-2d (as-f32 kernel) (* k k c-in) c-out))])
+           [y (ggml-mul-mat (ggml-reshape-2d cols k n) (ggml-reshape-2d (as-f32 kernel) k c-out))])
       (if (= batch 1)
           (ggml-reshape-4d y w-out h-out c-out 1)
           (ggml-cont (ggml-permute (ggml-reshape-4d y w-out h-out batch c-out) 0 1 3 2)))))
 
-  ;; Depthwise Conv2d (groups = channels, weight [C, 1, k, k] in torch).
+  ;; Depthwise Conv2d (groups = channels, weight [C, 1, kh, kw] in torch);
+  ;; 'stride and 'padding like conv2d.
   (define (conv2d-depthwise x prefix . opts)
-    (let* ([o (%options 'nn:conv2d-depthwise opts '((stride . 1) (padding . #f)))]
-           [kernel (weight (param prefix "weight"))]                  ; [k, k, 1, C]
-           [k (dim kernel 0)]
-           [s (%int 'nn:conv2d-depthwise 'stride (%opt o 'stride))]
-           [p (let ([p (%opt o 'padding)]) (if p (%int 'nn:conv2d-depthwise 'padding p) (quotient k 2)))])
-      (add-bias (ggml-conv-2d-dw-direct kernel x s s p p 1 1)
-                (let ([b (optional prefix "bias")]) (and b (ggml-reshape-3d b 1 1 (dim kernel 3)))))))
+    (let*-values ([(o) (%options 'nn:conv2d-depthwise opts '((stride . 1) (padding . #f)))]
+                  [(kernel) (weight (param prefix "weight"))]          ; [kw, kh, 1, C]
+                  [(sx sy) (axes 'nn:conv2d-depthwise 'stride (%opt o 'stride))]
+                  [(px py) (padding 'nn:conv2d-depthwise o (dim kernel 0) (dim kernel 1))])
+      (add-bias (ggml-conv-2d-dw-direct kernel x sx sy px py 1 1) (conv-bias prefix (dim kernel 3)))))
+
+  ;; torch.nn.ConvTranspose2d (groups 1, padding 0, weight [C_in, C_out, kh, kw]
+  ;; in torch) on x [W, H, C_in, 1] -> [(W-1)*s + kw, (H-1)*s + kh, C_out, 1].
+  ;; 'stride (1) is the same on both axes. Batch 1 only (ggml's CPU kernel
+  ;; ignores the batch). Kernel = stride (upsampling, no overlap) is a matmul
+  ;; and a pixel shuffle; other kernels use ggml's op, which is very slow on
+  ;; Metal.
+  (define (conv-transpose2d x prefix . opts)
+    (let* ([o (%options 'nn:conv-transpose2d opts '((stride . 1)))]
+           [kernel (weight (param prefix "weight"))]                  ; [kw, kh, C_out, C_in]
+           [s (%int 'nn:conv-transpose2d 'stride (%opt o 'stride))])
+      (unless (= (dim x 3) 1) (error 'nn:conv-transpose2d "batch must be 1" (shape x)))
+      (add-bias (if (= (dim kernel 0) (dim kernel 1) s)
+                    (unpatchify x kernel s)
+                    (ggml-conv-transpose-2d-p0 (as-f32 kernel) x s))
+                (conv-bias prefix (dim kernel 2)))))
+
+  ;; Each pixel times the kernel [k, k, C_out, C_in] becomes a k x k patch.
+  (define (unpatchify x kernel k)
+    (let* ([w (dim x 0)] [h (dim x 1)] [c-in (dim x 2)] [c-out (dim kernel 2)] [n (* w h)]
+           [pixels (ggml-cont (ggml-transpose (ggml-reshape-2d x n c-in)))]                     ; [C_in, W*H]
+           [taps (ggml-cont (ggml-transpose (ggml-reshape-2d (as-f32 kernel) (* k k c-out) c-in)))] ; [C_in, k*k*C_out]
+           [y (ggml-mul-mat pixels taps)]                             ; [W*H, k*k*C_out]: [w, h, kx, ky, C_out]
+           [es (stride y 0)]
+           ;; Kernel row ky: [w, h, kx, C_out] -> [kx + k*w, 1, h, C_out].
+           [row (lambda (ky)
+                  (let ([v (ggml-view-4d y w h k c-out (* w es) (* n es) (* k k n es) (* ky k n es))])
+                    (ggml-reshape-4d (ggml-cont (ggml-permute v 1 2 0 3)) (* k w) 1 h c-out)))])
+      ;; Rows interleaved: [k*w, k (ky), h, C_out] is [k*w, k*h, C_out] in memory.
+      (ggml-reshape-4d (concat (map row (iota k)) 1) (* k w) (* k h) c-out 1)))
 
   ;; ViT patch embedding (Conv2d with kernel = stride = patch) on an image
   ;; [W, H, C, B] -> tokens [D, W/p * H/p, B], row-major over the patch grid.

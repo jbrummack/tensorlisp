@@ -136,19 +136,20 @@ fn norms_and_embedding() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// torch Conv2d (NCHW), groups 1 or depthwise.
-fn conv_ref(x: &ArrayD<f32>, w: &ArrayD<f32>, b: &ArrayD<f32>, stride: usize, pad: usize, depthwise: bool) -> ArrayD<f32> {
+/// torch Conv2d (NCHW), groups 1 or depthwise; stride and padding are (height, width).
+fn conv_ref(x: &ArrayD<f32>, w: &ArrayD<f32>, b: &ArrayD<f32>, stride: (usize, usize), pad: (usize, usize), depthwise: bool) -> ArrayD<f32> {
     let (n, c, h, wd) = (x.shape()[0], x.shape()[1], x.shape()[2], x.shape()[3]);
-    let (o, k) = (w.shape()[0], w.shape()[2]);
-    let (ho, wo) = ((h + 2 * pad - k) / stride + 1, (wd + 2 * pad - k) / stride + 1);
+    let (o, kh, kw) = (w.shape()[0], w.shape()[2], w.shape()[3]);
+    let (ho, wo) = ((h + 2 * pad.0 - kh) / stride.0 + 1, (wd + 2 * pad.1 - kw) / stride.1 + 1);
     ArrayD::from_shape_fn(IxDyn(&[n, o, ho, wo]), |i| {
         let (bi, oi, y, xx) = (i[0], i[1], i[2], i[3]);
         let mut acc = b[[oi]];
         for ci in 0..(if depthwise { 1 } else { c }) {
             let channel = if depthwise { oi } else { ci };
-            for ky in 0..k {
-                for kx in 0..k {
-                    let (iy, ix) = ((y * stride + ky) as isize - pad as isize, (xx * stride + kx) as isize - pad as isize);
+            for ky in 0..kh {
+                for kx in 0..kw {
+                    let iy = (y * stride.0 + ky) as isize - pad.0 as isize;
+                    let ix = (xx * stride.1 + kx) as isize - pad.1 as isize;
                     if iy >= 0 && ix >= 0 && (iy as usize) < h && (ix as usize) < wd {
                         acc += w[[oi, ci, ky, kx]] * x[[bi, channel, iy as usize, ix as usize]];
                     }
@@ -157,6 +158,29 @@ fn conv_ref(x: &ArrayD<f32>, w: &ArrayD<f32>, b: &ArrayD<f32>, stride: usize, pa
         }
         acc
     })
+}
+
+/// torch ConvTranspose2d (NCHW, padding 0), weight [C_in, C_out, kh, kw].
+fn conv_transpose_ref(x: &ArrayD<f32>, w: &ArrayD<f32>, b: &ArrayD<f32>, stride: usize) -> ArrayD<f32> {
+    let (n, c, h, wd) = (x.shape()[0], x.shape()[1], x.shape()[2], x.shape()[3]);
+    let (o, kh, kw) = (w.shape()[1], w.shape()[2], w.shape()[3]);
+    let mut y = ArrayD::from_shape_fn(IxDyn(&[n, o, (h - 1) * stride + kh, (wd - 1) * stride + kw]), |i| b[[i[1]]]);
+    for bi in 0..n {
+        for ci in 0..c {
+            for iy in 0..h {
+                for ix in 0..wd {
+                    for oi in 0..o {
+                        for ky in 0..kh {
+                            for kx in 0..kw {
+                                y[[bi, oi, iy * stride + ky, ix * stride + kx]] += x[[bi, ci, iy, ix]] * w[[ci, oi, ky, kx]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    y
 }
 
 #[test]
@@ -169,23 +193,51 @@ fn convolutions_and_pooling() {
                  [pointwise (nn:conv2d x "c1" 'method 'im2col) 4]
                  [depthwise (nn:conv2d-depthwise x "dw") 4]
                  [maxpool (nn:max-pool x 3 'stride 1 'padding 1) 4]
-                 [up (nn:upsample-nearest x 2) 4]))
+                 [up (nn:upsample-nearest x 2) 4]
+                 [tall-im2col (nn:conv2d x "c51" 'stride '(2 1) 'method 'im2col) 4]
+                 [tall-direct (nn:conv2d x "c51" 'stride '(2 1) 'method 'direct) 4]
+                 [wide (nn:conv2d x "c13" 'padding '(0 1) 'method 'im2col) 4]
+                 [depthwise-wide (nn:conv2d-depthwise x "dw17") 4]
+                 [depthwise-strided (nn:conv2d-depthwise x "dw" 'stride '(2 1)) 4]))
+      (model transpose (inputs [x f32 (9 7 3 1)])
+        (outputs [y (nn:conv-transpose2d x "t2" 'stride 2) 4]
+                 [overlap (nn:conv-transpose2d x "t3" 'stride 2) 4]))
     "#;
     let (w3, b3) = (noise(&[5, 3, 3, 3], 1), noise(&[5], 2));
     let (w1, b1) = (noise(&[4, 3, 1, 1], 3), noise(&[4], 4));
     let (wd, bd) = (noise(&[3, 1, 3, 3], 5), noise(&[3], 6));
+    let (w51, b51) = (noise(&[4, 3, 5, 1], 8), noise(&[4], 9));
+    let (w13, b13) = (noise(&[2, 3, 1, 3], 10), noise(&[2], 11));
+    let (wd17, bd17) = (noise(&[3, 1, 1, 7], 12), noise(&[3], 13));
+    let (wt2, bt2) = (noise(&[3, 4, 2, 2], 14), noise(&[4], 15));
+    let (wt3, bt3) = (noise(&[3, 2, 3, 3], 16), noise(&[2], 17));
     let (model, path) = load(
         "conv",
         program,
-        &[("c3.weight", &w3), ("c3.bias", &b3), ("c1.weight", &w1), ("c1.bias", &b1), ("dw.weight", &wd), ("dw.bias", &bd)],
+        &[
+            ("c3.weight", &w3), ("c3.bias", &b3), ("c1.weight", &w1), ("c1.bias", &b1), ("dw.weight", &wd), ("dw.bias", &bd),
+            ("c51.weight", &w51), ("c51.bias", &b51), ("c13.weight", &w13), ("c13.bias", &b13),
+            ("dw17.weight", &wd17), ("dw17.bias", &bd17), ("t2.weight", &wt2), ("t2.bias", &bt2),
+            ("t3.weight", &wt3), ("t3.bias", &bt3),
+        ],
     );
     let x = noise(&[2, 3, 7, 9], 7);
     let out = run(&model, "conv", &[("x", &x)]);
-    let want = conv_ref(&x, &w3, &b3, 2, 1, false);
+    let want = conv_ref(&x, &w3, &b3, (2, 2), (1, 1), false);
     close(&out[0], &want, 1e-5);
     close(&out[1], &want, 1e-5);
-    close(&out[2], &conv_ref(&x, &w1, &b1, 1, 0, false), 1e-5);
-    close(&out[3], &conv_ref(&x, &wd, &bd, 1, 1, true), 1e-5);
+    close(&out[2], &conv_ref(&x, &w1, &b1, (1, 1), (0, 0), false), 1e-5);
+    close(&out[3], &conv_ref(&x, &wd, &bd, (1, 1), (1, 1), true), 1e-5);
+    let tall = conv_ref(&x, &w51, &b51, (2, 1), (2, 0), false);
+    close(&out[6], &tall, 1e-5);
+    close(&out[7], &tall, 1e-5);
+    close(&out[8], &conv_ref(&x, &w13, &b13, (1, 1), (0, 1), false), 1e-5);
+    close(&out[9], &conv_ref(&x, &wd17, &bd17, (1, 1), (0, 3), true), 1e-5);
+    close(&out[10], &conv_ref(&x, &wd, &bd, (2, 1), (1, 1), true), 1e-5);
+    let x1 = x.slice(ndarray::s![0..1, .., .., ..]).to_owned().into_dyn();
+    let transposed = run(&model, "transpose", &[("x", &x1)]);
+    close(&transposed[0], &conv_transpose_ref(&x1, &wt2, &bt2, 2), 1e-5);
+    close(&transposed[1], &conv_transpose_ref(&x1, &wt3, &bt3, 2), 1e-5);
     let maxpool = ArrayD::from_shape_fn(IxDyn(&[2, 3, 7, 9]), |i| {
         let mut m = f32::NEG_INFINITY;
         for dy in -1..=1isize {
@@ -200,6 +252,22 @@ fn convolutions_and_pooling() {
     });
     close(&out[4], &maxpool, 0.0);
     close(&out[5], &ArrayD::from_shape_fn(IxDyn(&[2, 3, 14, 18]), |i| x[[i[0], i[1], i[2] / 2, i[3] / 2]]), 0.0);
+    std::fs::remove_file(path).unwrap();
+}
+
+/// im2col in bands of output rows (9x9 over 256 channels at 64 x 64 is ~340 MiB of patches).
+#[test]
+fn banded_im2col_convolution() {
+    let program = r#"
+      (import (tl nn))
+      (model (inputs [x f32 (64 64 256 1)])
+        (outputs [banded (nn:conv2d x "c9" 'method 'im2col) 4]
+                 [direct (nn:conv2d x "c9" 'method 'direct) 4]))
+    "#;
+    let (w, b) = (noise(&[4, 256, 9, 9], 21), noise(&[4], 22));
+    let (model, path) = load("banded", program, &[("c9.weight", &w), ("c9.bias", &b)]);
+    let out = run(&model, "main", &[("x", &noise(&[1, 256, 64, 64], 23))]);
+    close(&out[0], &out[1], 1e-3);
     std::fs::remove_file(path).unwrap();
 }
 

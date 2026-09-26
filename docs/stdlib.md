@@ -73,8 +73,9 @@ implementation of the PyTorch semantics).
 | `(nn:gelu x)` | `nn.GELU()` (erf) | |
 | `(nn:gelu-tanh x)` | `GELU(approximate="tanh")` | ggml's kernel: f16 table on the CPU (~1e-3), exact on GPUs |
 | `(nn:gelu-tanh-exact x)` | same | exact everywhere, a few more ops (for comparisons) |
-| `(nn:conv2d x prefix 'stride 1 'padding k/2 'method 'auto)` | `nn.Conv2d` (groups 1) | `[W, H, C, B]` → `[W', H', C_out, B]`; `'method`: `auto` (im2col + matmul on GPUs, direct kernel on the CPU — each ~3x faster on its device), `im2col`, `direct` |
-| `(nn:conv2d-depthwise x prefix 'stride 1 'padding k/2)` | `nn.Conv2d(groups=C)` | |
+| `(nn:conv2d x prefix 'stride 1 'padding k/2 'method 'auto)` | `nn.Conv2d` (groups 1) | `[W, H, C, B]` → `[W', H', C_out, B]`; kernels may be non-square; `'stride` / `'padding` an integer or `(height width)` like PyTorch's tuples (padding defaults to kernel/2 per axis); `'method`: `auto` (im2col + matmul on GPUs, direct kernel on the CPU — each ~3x faster on its device), `im2col` (in bands of output rows when the patches would exceed 256 MiB), `direct` |
+| `(nn:conv2d-depthwise x prefix 'stride 1 'padding k/2)` | `nn.Conv2d(groups=C)` | stride / padding / kernels as `conv2d` |
+| `(nn:conv-transpose2d x prefix 'stride 1)` | `nn.ConvTranspose2d` (groups 1, padding 0) | batch 1; kernel = stride (upsampling) runs as a matmul + pixel shuffle, others through ggml's op (very slow on Metal) |
 | `(nn:patch-embed image prefix patch)` | ViT `Conv2d(kernel=stride=patch)` | → tokens `[D, patches, B]`, row-major; f32 im2col (`ggml-conv-2d` would round pixels to f16) |
 | `(nn:upsample-nearest x factor)` | `nn.Upsample(mode="nearest")` | |
 | `(nn:max-pool x k 'stride k 'padding 0)` | `nn.MaxPool2d` | |

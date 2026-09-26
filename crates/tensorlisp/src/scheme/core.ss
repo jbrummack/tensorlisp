@@ -250,6 +250,15 @@
 (define tl_host_detokenize (foreign-procedure "tl_host_detokenize" (integer-64 integer-64 int) string))
 (define tl_host_token_id (foreign-procedure "tl_host_token_id" (integer-64 string) integer-64))
 (define tl_host_cluster_centroids (foreign-procedure "tl_host_cluster_centroids" (integer-64 integer-64) integer-64))
+(define tl_host_text_boxes
+  (foreign-procedure "tl_host_text_boxes"
+    (integer-64 integer-64 integer-64 double double integer-64 double double) integer-64))
+(define tl_host_text_boxes_order (foreign-procedure "tl_host_text_boxes_order" (integer-64) integer-64))
+(define tl_host_image_crop_text (foreign-procedure "tl_host_image_crop_text" (integer-64 integer-64 integer-64) integer-64))
+(define tl_host_ctc_greedy (foreign-procedure "tl_host_ctc_greedy" (integer-64) integer-64))
+(define tl_host_vocabulary (foreign-procedure "tl_host_vocabulary" (integer-64) integer-64))
+(define tl_host_vocabulary_size (foreign-procedure "tl_host_vocabulary_size" (integer-64) integer-64))
+(define tl_host_vocabulary_text (foreign-procedure "tl_host_vocabulary_text" (integer-64 integer-64) string))
 
 ;; kind: bytes, tokenizer, image, audio or array.
 (define-record-type host
@@ -333,12 +342,14 @@
   (let ([id (tl_host_token_id (%host-id 'token-id 'tokenizer tok) token)])
     (and (>= id 0) id)))
 
-;; Images (8-bit RGB; resizing reproduces Pillow)
+;; Images (8-bit RGB; resizing reproduces Pillow, except bilinear-no-antialias:
+;; torch's bilinear interpolation without antialiasing, close to OpenCV's
+;; INTER_LINEAR, which skips pixels when downscaling)
 
 (define (%filter who f)
   (case f
-    [(nearest) 0] [(lanczos) 1] [(bilinear) 2] [(bicubic) 3] [(box) 4] [(hamming) 5]
-    [else (error who "filter must be nearest, bilinear, bicubic, lanczos, box or hamming" f)]))
+    [(nearest) 0] [(lanczos) 1] [(bilinear) 2] [(bicubic) 3] [(box) 4] [(hamming) 5] [(bilinear-no-antialias) 6]
+    [else (error who "filter must be nearest, bilinear, bicubic, lanczos, box, hamming or bilinear-no-antialias" f)]))
 
 (define (image-size img)
   (let ([id (%host-id 'image-size 'image img)])
@@ -589,6 +600,62 @@
 (define (cluster-centroids x labels)
   (%host 'cluster-centroids 'array
     (tl_host_cluster_centroids (%host-id 'cluster-centroids 'array x) (%host-id 'cluster-centroids 'array labels))))
+
+;; OCR (PaddleOCR semantics)
+
+;; Text boxes from a DB probability map prob [H, W] (or [1, 1, H, W]) of an
+;; image resized from width x height: two arrays, boxes [n, 4, 2] (corners
+;; top-left, top-right, bottom-right, bottom-left as x, y on the original
+;; image) and scores [n]. Options as transformers' / PaddleOCR's DB
+;; postprocessing: 'threshold (pixels that are text), 'box-threshold (mean
+;; probability of a box), 'max-candidates, 'unclip-ratio (how far boxes
+;; grow), 'min-size (shorter side, map pixels).
+(define (text-boxes prob width height . opts)
+  (let* ([o (%options 'text-boxes opts
+              '((threshold . 0.3) (box-threshold . 0.6) (max-candidates . 1000) (unclip-ratio . 1.5) (min-size . 3)))]
+         [r (lambda (name) (%real 'text-boxes name (%opt o name)))]
+         [first (%host 'text-boxes 'array
+                  (tl_host_text_boxes (%host-id 'text-boxes 'array prob)
+                                      (%int 'text-boxes 'width width) (%int 'text-boxes 'height height)
+                                      (r 'threshold) (r 'box-threshold)
+                                      (%int 'text-boxes 'max-candidates (%opt o 'max-candidates))
+                                      (r 'unclip-ratio) (r 'min-size)))])
+    (values first (make-host (+ (host-id first) 1) 'array))))
+
+;; Reading order of text boxes [n, 4, 2]: indices [n], top to bottom, left
+;; to right within a line (PaddleOCR's sort_quad_boxes).
+(define (text-boxes-order boxes)
+  (%host 'text-boxes-order 'array (tl_host_text_boxes_order (%host-id 'text-boxes-order 'array boxes))))
+
+;; The text line in box i of boxes [n, 4, 2], straightened (PaddleOCR's
+;; min-area-rectangle crop: perspective warp, bicubic; rotated 90 degrees
+;; counterclockwise when 1.5 times taller than wide).
+(define (image-crop-text img boxes i)
+  (%host 'image-crop-text 'image
+    (tl_host_image_crop_text (%host-id 'image-crop-text 'image img) (%host-id 'image-crop-text 'array boxes)
+                             (%integer 'image-crop-text 'i i))))
+
+;; Greedy CTC decoding of per-step probabilities [T, classes] (or [1, T,
+;; classes]; class 0 is the blank): two values, the class ids (an array) and
+;; their mean probability (0 without any).
+(define (ctc-greedy probs)
+  (let ([ids (%host 'ctc-greedy 'array (tl_host_ctc_greedy (%host-id 'ctc-greedy 'array probs)))])
+    (values ids (tl_host_tensor_get (+ (host-id ids) 1) 0))))
+
+;; Strings by index from UTF-8 text with one entry per line (bytes, e.g. an
+;; asset), such as a recognizer's characters.
+(define (vocabulary source)
+  (%host 'vocabulary 'vocabulary (tl_host_vocabulary (%host-id 'vocabulary 'bytes source))))
+
+(define (vocabulary-size v)
+  (tl_host_vocabulary_size (%host-id 'vocabulary-size 'vocabulary v)))
+
+;; The entries at ids (an array or a list), concatenated.
+(define (vocabulary-text v ids)
+  (let ([text (tl_host_vocabulary_text (%host-id 'vocabulary-text 'vocabulary v)
+                                       (%host-id 'vocabulary-text 'array (if (list? ids) (list->array ids) ids)))])
+    (unless text (error 'vocabulary-text (tl_host_error)))
+    text))
 
 ;; (preprocess ([text string] [photo image]) body ... (model-inputs [ids array] ...))
 ;; Raw input kinds: string, image, audio, array. Runs per example on the host;

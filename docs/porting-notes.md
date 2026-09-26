@@ -1,7 +1,7 @@
 # Porting notes
 
 Patterns and pitfalls from the ports (`ports/tipsv2`, `ports/t5gemma2`,
-`ports/yolo11`) that aren't stdlib functions (see `docs/stdlib.md` for
+`ports/yolo11`, `ports/ppocrv6`) that aren't stdlib functions (see `docs/stdlib.md` for
 those): model-specific structure, performance lessons, and traps.
 
 ## Patterns
@@ -25,6 +25,22 @@ those): model-specific structure, performance lessons, and traps.
 - **Per-op overhead** dominates small steps on Metal (~500 kernels per decoded
   token): fold constant weight transforms into the file (`tl convert
   --offset`), avoid per-run weight math, prefer fused ops (flash attention).
+- **Batch norms folded at export**: `reference.py` folds each BN into the
+  convolution before it (`ports/yolo11` via Ultralytics' `fuse()`,
+  `ports/ppocrv6` by hand; a `ConvTranspose2d` weight is `[in, out, k, k]`, so
+  its BN scales dim 1).
+- **Two models, one file**: export both state dicts with prefixes (`det.`,
+  `rec.`) from the reference script and shorten names there (ggml's 63
+  bytes); pipelines then run both entries (`ports/ppocrv6`).
+- **Per-shape graphs**: an entry's graph is rebuilt whenever an input shape
+  changes (e.g. one text line per width in `ports/ppocrv6`); fine at
+  ~100 rebuilds, keep shapes fixed where the reference does.
+- **Postprocessing that must match OpenCV**: port the OpenCV code, not the
+  math. `ports/ppocrv6`'s DB boxes are bit-exact only with OpenCV's hull
+  order (Sklansky chains, then a cyclic shift by input index), its float32
+  rotating calipers, `fillPoly`'s fixed-point spans and clang's FMA
+  contraction on arm64 (`a*b + c` fused, `-ffp-contract=on`): a corner at
+  1242.9999 instead of 1243 floors to another row and moves a box score by 0.1.
 - **Zero-padded tap names** (`(format "layer.~2,'0d" i)`) keep `tl compare`
   output and reference files sorted.
 
@@ -81,3 +97,16 @@ A `(fold t i)` / `(unfold t i n)` pair would make that less error-prone.
   ~1000). Compare Metal runs with `--rtol 1e-2 --atol 1e-2` and look at
   cosine similarity.
 - **bf16/f16 weights** round activations too (see README).
+- **im2col memory**: patches take `4 * kw * kh * C_in` bytes per output pixel
+  (10 GB for PP-OCRv6's 9x9 neck convs at 400 x 304); `nn:conv2d` makes them
+  in bands of rows beyond 256 MiB. ggml's Metal direct conv is ~20x slower
+  than banded im2col there.
+- **`ggml-conv-transpose-2d-p0` on Metal** took ~50 s for PP-OCRv6's two
+  2x2/2 head convs at 1216 x 1600; kernel = stride is a matmul + pixel
+  shuffle (`nn:conv-transpose2d` does that).
+- **transformers' processors aren't PaddleOCR's**: its PP-OCR detector resizes
+  float images (torchvision, antialiased), grows boxes by a polygon offset
+  instead of pyclipper, and its recognizer resizes 8-bit images with
+  `antialias=False` (torch's separable int16 path, `bilinear-no-antialias`).
+  The port follows transformers; Pillow's 8-bit resize of the detector input
+  still moves a few map pixels across the threshold.
