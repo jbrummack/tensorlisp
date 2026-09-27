@@ -10,7 +10,10 @@ ggml-codegen.workspace = true
 
 [build-dependencies]
 bindgen = "0.72.1"
-cc = "1.4.3"
+# "parallel" isn't on by default upstream: without it cc-rs compiles every
+# object file (all 141+ of ggml-cuda's) strictly one at a time regardless of
+# CPU count or cargo's -j/NUM_JOBS.
+cc = { version = "1.4.3", features = ["parallel"] }
 
 [features]
 default = ["platform-backends"]
@@ -18,3 +21,6 @@ default = ["platform-backends"]
 # Turn default features off to pick backends explicitly.
 platform-backends = []
 metal = []
+# Needs the CUDA Toolkit (CUDA_PATH/CUDA_HOME/CUDA_ROOT); not implied by
+# platform-backends since its presence isn't guaranteed by the OS alone.
+cuda = []

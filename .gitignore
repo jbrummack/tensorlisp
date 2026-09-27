@@ -3,4 +3,30 @@
 /models
 # ChezScheme install prefix produced by scripts/build-chez.sh
 /vendor/chez
+# Persistent cache for the compiled ggml-cuda static lib (see build.rs);
+# survives `cargo clean`/toolchain switches, unlike target/'s OUT_DIR.
+/.ggml-cuda-cache
 .env
+
+# Python (reference.py envs, e.g. under ports/*/)
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Downloaded HF model repos, exported weights, and reference-run outputs
+# under ports/*/ (e.g. ports/ppocrv6/det, ports/yolo11/model, ports/*/out)
+*.safetensors
+*.gguf
+*.npy
+*.onnx
+ports/*/model/
+ports/*/models/
+ports/*/out/
+ports/*/det/
+ports/*/rec/
+ports/*/*.png
+ports/*/*.jpg
+ports/*/*.jpeg

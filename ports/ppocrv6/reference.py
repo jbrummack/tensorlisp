@@ -207,7 +207,7 @@ for n, i in enumerate(order):
                   "crop": [crop.shape[1], crop.shape[0]], "input_width": pixels.shape[-1]})
 
 json.dump({"size": [rgb.shape[1], rgb.shape[0]], "input": list(x.shape[2:]), "db": db, "lines": lines},
-          open(os.path.join(data, "ocr.json"), "w"), indent=1, ensure_ascii=False)
+          open(os.path.join(data, "ocr.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
 print(f"det input {tuple(x.shape)}, {len(lines)} lines")
 for line in lines[:8]:
     print(f"{line['score']:.3f} {line['text_score']:.3f} {line['text']}")

@@ -3,7 +3,6 @@ use std::{
     ffi::CStr,
     fs::File,
     mem::ManuallyDrop,
-    os::unix::fs::FileExt,
     ops::Deref,
     path::Path,
     ptr::null_mut,
@@ -284,7 +283,7 @@ fn load_weights(file: &GgufFile, path: &Path) -> Result<()> {
         let name = file.tensor_name(i);
         let t = file.tensor(name)?.ok_or_else(|| Error::Gguf(format!("tensor {name} missing from context")))?;
         buf.resize(unsafe { ggml_nbytes(t) }, 0);
-        data.read_exact_at(&mut buf, file.tensor_file_offset(i) as u64)?;
+        crate::gguf::read_exact_at(&data, &mut buf, file.tensor_file_offset(i) as u64)?;
         guard::tensor_set(t, &buf)?;
     }
     Ok(())

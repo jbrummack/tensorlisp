@@ -86,7 +86,7 @@ fn mlp_cpu() {
 
 #[test]
 fn mlp_gpu() {
-    if ggml_sys::HAS_METAL {
+    if ggml_sys::HAS_METAL || ggml_sys::HAS_CUDA {
         run_mlp(Device::Gpu);
     }
 }

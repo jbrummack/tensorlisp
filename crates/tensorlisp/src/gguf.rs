@@ -18,6 +18,34 @@ use crate::{
     program::{FORMAT_VERSION, Program, TL_ASSET_PREFIX, TL_BIN, TL_TXT, TL_VER},
 };
 
+/// Reads exactly `buf.len()` bytes at `offset`, without moving the file's
+/// shared cursor (so this is safe to call concurrently on the same `File`).
+#[cfg(unix)]
+pub(crate) fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+pub(crate) fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "failed to fill whole buffer"))
+    }
+}
+
 /// ggml tensors have at most four dimensions.
 pub const MAX_DIMS: usize = 4;
 
@@ -228,9 +256,8 @@ impl GgufFile {
 
     /// Reads tensor `i`'s raw bytes from the file at `path` (this file).
     pub fn read_tensor_bytes(&self, path: impl AsRef<Path>, i: i64) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
         let mut buf = vec![0u8; unsafe { gguf_get_tensor_size(self.gguf, i) }];
-        std::fs::File::open(path)?.read_exact_at(&mut buf, self.tensor_file_offset(i) as u64)?;
+        read_exact_at(&std::fs::File::open(path)?, &mut buf, self.tensor_file_offset(i) as u64)?;
         Ok(buf)
     }
 

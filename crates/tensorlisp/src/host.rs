@@ -16,11 +16,11 @@ use autopro::{
     cluster::{Dbscan, Metric, centroids},
     detect::{BoxFormat, Detector},
     audio::{Audio, LogMode, MelNorm, MelScale, MelSpectrogram, WaveformProcessor, WhisperFeatures},
-    image::{ChannelOrder, Filter, ImageProcessor, Layout, Size},
+    image::{ChannelOrder, Filter, ImageProcessor, Layout, Size, TileProcessor},
     ocr::{DbDecoder, Quad},
     text::{Padding, TextOptions, Tokenizer},
 };
-use image::RgbImage;
+use image::{DynamicImage, RgbImage};
 use ndarray::{Array1, Array2, ArrayD, Axis, Ix2, IxDyn, Slice};
 
 pub(crate) enum HostValue {
@@ -632,6 +632,50 @@ extern "C" fn tl_host_image_letterbox(id: i64, width: i64, height: i64, r: i64, 
     })
 }
 
+/// Docling-style image splitting (Idefics3/SmolVLM `do_image_splitting`):
+/// downscale to fit `resize_longest_edge`, split into non-overlapping
+/// `tile_edge` x `tile_edge` tiles, append one more tile - the whole image
+/// resized down - as a low-resolution global view. Returns the tiles stacked
+/// on a new leading axis, `[n, 3, tile_edge, tile_edge]`; rows and cols
+/// (id + 1, + 2) are both 0 when the image was small enough not to split (a
+/// single tile, the resized whole image).
+#[allow(clippy::too_many_arguments)]
+extern "C" fn tl_host_image_tile(
+    id: i64,
+    resize_longest_edge: i64,
+    tile_edge: i64,
+    do_splitting: i32,
+    scale: f64,
+    normalize: i32,
+    m0: f64,
+    m1: f64,
+    m2: f64,
+    s0: f64,
+    s1: f64,
+    s2: f64,
+    filter_code: i32,
+) -> i64 {
+    ffi(|| {
+        let img = DynamicImage::ImageRgb8(image(id)?);
+        let processor = TileProcessor {
+            resize_longest_edge: resize_longest_edge as u32,
+            tile_edge: tile_edge as u32,
+            filter: filter(filter_code)?,
+            do_image_splitting: do_splitting != 0,
+            rescale: (scale >= 0.0).then_some(scale),
+            normalize: (normalize != 0).then_some(([m0 as f32, m1 as f32, m2 as f32], [s0 as f32, s1 as f32, s2 as f32])),
+            channel_order: ChannelOrder::Rgb,
+        };
+        let tiles = processor.process(&img);
+        let views: Vec<_> = tiles.tiles.iter().map(|t| t.view()).collect();
+        let stacked = ndarray::stack(Axis(0), &views).map_err(|e| e.to_string())?;
+        let first = insert(HostValue::Tensor(stacked.into_dyn()));
+        insert(HostValue::Tensor(ArrayD::from_elem(IxDyn(&[1]), tiles.rows as f32)));
+        insert(HostValue::Tensor(ArrayD::from_elem(IxDyn(&[1]), tiles.cols as f32)));
+        Ok(first)
+    })
+}
+
 /// Cluster label per row of x [n, d]; -1 is noise.
 extern "C" fn tl_host_dbscan(id: i64, eps: f64, min_samples: i64, metric: i32) -> i64 {
     ffi(|| {
@@ -903,6 +947,7 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_boxes_clip", tl_host_boxes_clip as *const _),
         ("tl_host_boxes_unletterbox", tl_host_boxes_unletterbox as *const _),
         ("tl_host_image_letterbox", tl_host_image_letterbox as *const _),
+        ("tl_host_image_tile", tl_host_image_tile as *const _),
         ("tl_host_dbscan", tl_host_dbscan as *const _),
         ("tl_host_cluster_centroids", tl_host_cluster_centroids as *const _),
         ("tl_host_run_begin", tl_host_run_begin as *const _),

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 description = "Runtime: loads a tensorlisp program + weights from GGUF and runs it on ggml."
 
+[features]
+cuda = ["ggml-sys/cuda"]
+
 [dependencies]
 chez.workspace = true
 ggml-sys.workspace = true

@@ -32,7 +32,7 @@ const STDLIB: &[(&str, &str)] = &[
 /// Names exported to programs by `(tensorlisp)`, besides generated ops and constants.
 const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? model inputs outputs tap \
     preprocess model-inputs host? asset tokenizer tokenize \
-    image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array \
+    image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array image-tile \
     audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
     array-shape array-affine array-reshape \
     postprocess results pipeline run output detokenize token-id define-state state effect device array-length array->list list->array array-slice array-transpose array-take array-argmax \

@@ -8,6 +8,9 @@ description = "`tl`: inspect, convert, check, run, compare and quantize tensorli
 name = "tl"
 path = "src/main.rs"
 
+[features]
+cuda = ["tensorlisp/cuda"]
+
 [dependencies]
 tensorlisp = { path = "../tensorlisp" }
 anyhow.workspace = true

@@ -22,7 +22,7 @@ use syn::{Expr, ForeignItem, GenericArgument, Item, PathArguments, ReturnType, T
 const DATA_WRITING_OPS: &[&str] = &["ggml_new_i32", "ggml_new_f32"];
 
 /// Declared in the headers but not implemented anywhere in ggml.
-const UNIMPLEMENTED: &[&str] = &["ggml_threadpool_get_n_threads"];
+const UNIMPLEMENTED: &[&str] = &["ggml_threadpool_get_n_threads", "ggml_backend_cuda_allreduce_tensor"];
 
 /// How a C type crosses into Scheme.
 #[derive(Clone, Debug, PartialEq)]
@@ -67,7 +67,16 @@ impl<'a> Types<'a> {
                     let unsigned = e.attrs.iter().any(|a| {
                         a.path().is_ident("repr") && quote!(#a).to_string().contains("u32")
                     });
-                    enums.insert(e.ident.to_string(), if unsigned { "unsigned-32" } else { "int" });
+                    // Whether bindgen picks a u32 or i32 repr for a given enum
+                    // depends on the C compiler's own (platform-defined) choice
+                    // of underlying type, not anything about ggml itself: GCC/
+                    // Clang pick unsigned for these non-negative-valued enums,
+                    // MSVC picks signed. Either way it's a plain 4-byte integer
+                    // holding a small non-negative constant, so "integer-32" is
+                    // exactly as correct as "unsigned-32" here — unlike the
+                    // literal "int" this used to fall back to, which isn't a
+                    // real Chez foreign-type name at all.
+                    enums.insert(e.ident.to_string(), if unsigned { "unsigned-32" } else { "integer-32" });
                 }
                 _ => {}
             }

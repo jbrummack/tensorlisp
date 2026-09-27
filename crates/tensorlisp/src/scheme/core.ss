@@ -241,6 +241,9 @@
 (define tl_host_image_letterbox
   (foreign-procedure "tl_host_image_letterbox"
     (integer-64 integer-64 integer-64 integer-64 integer-64 integer-64 int) integer-64))
+(define tl_host_image_tile
+  (foreign-procedure "tl_host_image_tile"
+    (integer-64 integer-64 integer-64 int double int double double double double double double int) integer-64))
 (define tl_host_dbscan (foreign-procedure "tl_host_dbscan" (integer-64 double integer-64 int) integer-64))
 (define tl_host_run_begin (foreign-procedure "tl_host_run_begin" (integer-64 string) integer-64))
 (define tl_host_run_input (foreign-procedure "tl_host_run_input" (integer-64 string integer-64) integer-64))
@@ -394,6 +397,37 @@
       (tl_host_image_letterbox (%host-id 'image-letterbox 'image img)
                                (%int 'image-letterbox 'width width) (%int 'image-letterbox 'height height)
                                (car fill) (cadr fill) (caddr fill) (%filter 'image-letterbox (%opt o 'filter))))))
+
+;; Docling-style image splitting (Idefics3/SmolVLM `do_image_splitting`):
+;; downscale to fit 'resize-longest-edge, split into non-overlapping
+;; tile-edge x tile-edge tiles, plus one more tile - the whole image resized
+;; down - as a low-resolution global view (or, with 'do-split #f, just that
+;; one squared-down tile). Returns three values: the tiles as one array
+;; [n, 3, tile-edge, tile-edge] (already rescaled/normalized, ready for the
+;; vision tower), rows and cols (both 0 when the image wasn't split).
+(define (image-tile img resize-longest-edge tile-edge . opts)
+  (let* ([o (%options 'image-tile opts
+              '((do-split . #t) (scale . 1/255) (mean . #f) (std . #f) (filter . lanczos)))]
+         [triple (lambda (name)
+                   (let ([v (%opt o name)])
+                     (unless (and (list? v) (= (length v) 3) (for-all real? v))
+                       (error 'image-tile (format "~a must be a list of 3 numbers" name) v))
+                     (map inexact v)))]
+         [normalize? (or (%opt o 'mean) (%opt o 'std))]
+         [mean (if normalize? (triple 'mean) '(0.0 0.0 0.0))]
+         [std (if normalize? (triple 'std) '(1.0 1.0 1.0))]
+         [scale (%opt o 'scale)]
+         [first (%host 'image-tile 'array
+                  (tl_host_image_tile (%host-id 'image-tile 'image img)
+                                      (%int 'image-tile 'resize-longest-edge resize-longest-edge)
+                                      (%int 'image-tile 'tile-edge tile-edge)
+                                      (if (%opt o 'do-split) 1 0)
+                                      (if scale (%real 'image-tile 'scale scale) -1.0)
+                                      (if normalize? 1 0)
+                                      (car mean) (cadr mean) (caddr mean) (car std) (cadr std) (caddr std)
+                                      (%filter 'image-tile (%opt o 'filter))))]
+         [id (host-id first)])
+    (values first (make-host (+ id 1) 'array) (make-host (+ id 2) 'array))))
 
 ;; [3, H, W] (or [H, W, 3]) array: x * scale, then (x - mean) / std per channel.
 (define (image->array img . opts)

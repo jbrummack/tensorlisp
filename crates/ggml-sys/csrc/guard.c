@@ -6,9 +6,16 @@
 
 #include "ggml-impl.h"
 
-static _Thread_local jmp_buf * tl_jump;
-static _Thread_local char tl_message[2048];
-static _Thread_local tl_abort_handler tl_handler;
+/* MSVC's default (pre-C11) mode doesn't accept the _Thread_local keyword. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define TL_THREAD_LOCAL __declspec(thread)
+#else
+#define TL_THREAD_LOCAL _Thread_local
+#endif
+
+static TL_THREAD_LOCAL jmp_buf * tl_jump;
+static TL_THREAD_LOCAL char tl_message[2048];
+static TL_THREAD_LOCAL tl_abort_handler tl_handler;
 
 /* ggml prefixes messages with __FILE__, an absolute build path; keep the file name. */
 static const char * short_message(const char * message) {
