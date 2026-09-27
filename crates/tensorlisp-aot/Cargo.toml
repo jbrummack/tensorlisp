@@ -1,0 +1,13 @@
+[package]
+name = "tensorlisp-aot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tensorlisp = { path = "../tensorlisp" }
+coreml-rs = { path = "../../../coreml-rs" }
+cg-leafnode = { path = "../../../cg-leafnode" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ndarray = "0.17.2"
