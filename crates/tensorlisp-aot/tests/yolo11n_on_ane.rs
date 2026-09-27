@@ -90,7 +90,66 @@ fn layer_09_sppf_matches_cpu() {
     assert_tap_matches_cpu("layer.09", 64);
 }
 
-// layer.11 (the first FPN upsample) sits downstream of layer.10 (`c2psa`,
-// which needs TRANSPOSE/PERMUTE/CONT -- not implemented yet), so `UPSCALE`
-// is proven separately, on a small synthetic model with no attention
-// dependency: see `tests/pool_upsample_on_ane.rs::upsample_nearest_matches_cpu`.
+/// layer.10 is C2PSA: cv1, channel-split, a chain of PSA attention blocks
+/// (Ultralytics `Attention`: fused qkv conv, per-head split via
+/// RESHAPE/TRANSPOSE/CONT, `attn:sdpa`'s own MUL_MAT/SOFT_MAX/MUL_MAT/
+/// PERMUTE/CONT, a depthwise positional conv, residual adds, an FFN), cv2.
+/// Exercises TRANSPOSE, PERMUTE, CONT and SOFT_MAX end to end against real
+/// weights for the first time.
+#[test]
+fn layer_10_c2psa_matches_cpu() {
+    assert_tap_matches_cpu("layer.10", 64);
+}
+
+// layer.11 (the first FPN upsample) sits downstream of layer.10 (`c2psa`),
+// so `UPSCALE` is also proven separately, on a small synthetic model with
+// no attention dependency: see
+// `tests/pool_upsample_on_ane.rs::upsample_nearest_matches_cpu`.
+
+/// layer.22 is the last neck block, downstream of every earlier layer
+/// including layer.10's attention -- proves the whole backbone + FPN neck
+/// (upsample, concat, c3k2) compiles and runs together, not just each
+/// piece in isolation.
+#[test]
+fn layer_22_neck_matches_cpu() {
+    assert_tap_matches_cpu("layer.22", 64);
+}
+
+/// The complete model, ANE-compiled end to end: every layer, the full
+/// neck, and the detection head (`vision:dfl`/`decode-ltrb`, exercising
+/// ARANGE, REPEAT, SCALE and the VIEW column-select pattern for the first
+/// time), compared against the same `head` output `tl run` itself would
+/// print.
+#[test]
+fn full_model_matches_cpu() {
+    let path = model_path();
+    if !path.exists() {
+        eprintln!("skipping: {path:?} not present");
+        return;
+    }
+    let size = 64;
+    let tl_model = Model::load(&path, Device::Cpu).unwrap();
+    let input = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 3, size, size]), deterministic_image(size)).unwrap();
+
+    let info = tl_model.graph(&[("image", vec![1, 3, size, size])], &Taps::default()).unwrap();
+    let (func, output_names) =
+        tensorlisp_aot::lower_graph(&path, &info, &[("image", vec![1, 3, size as u64, size as u64])], Opset::Ios17)
+            .unwrap_or_else(|e| panic!("lower full graph: {e}"));
+
+    let mut program = Program::new();
+    program.add_function("main", func).unwrap();
+    let spec = program.to_model("main").unwrap();
+    let loaded = CoreMlModel::load(&spec, &LoadOptions { compute_units: ComputeUnits::CpuAndNeuralEngine, ..Default::default() })
+        .unwrap_or_else(|e| panic!("failed to load MIL model: {e}"));
+
+    let image_flat: Vec<f32> = input.iter().copied().collect();
+    let mil_out = loaded.predict(&[("image", ArrayRef::new(&[1, 3, size, size], &image_flat).unwrap())]).unwrap();
+    let mil_head = mil_out[&output_names["head"]].to_f32();
+
+    let cpu_out = tl_model.run(&[("image", input.view())]).unwrap();
+    let cpu_head: Vec<f32> = cpu_out["head"].iter().copied().collect();
+
+    assert_eq!(mil_head.len(), cpu_head.len(), "mil {} vs cpu {}", mil_head.len(), cpu_head.len());
+    let max_diff = mil_head.iter().zip(cpu_head.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_diff < 1e-2, "head mismatch, max abs diff {max_diff}");
+}

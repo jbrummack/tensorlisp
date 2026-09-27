@@ -327,10 +327,41 @@ fn lower_conv_2d(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
 fn lower_conv_2d_dw(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
     let a = ctx.src(0)?;
     let b = ctx.src(1)?;
+    // CoreML's conv op accepts an unbatched (rank-3, [C, H, W]) `x` fine
+    // when `groups == 1` (every other conv in this model, already proven
+    // against real taps) -- but a *grouped* conv (`groups > 1`, only ever
+    // true for a depthwise conv here) requires the full rank-4 [N, C, H,
+    // W]: without an explicit batch axis, CoreML's compiler can't tell
+    // the grouped channel axis apart from a spatial one ("Variadic
+    // dimension ... unexpected length 1; expected 2"). pad_rank adds the
+    // batch axis back (as 1) only when it's missing, a pure reshape.
+    let b = pad_rank(ctx.func, &b, 4)?;
     let ty = ty_like(ctx.node, rank_of(&b));
     let (s0, s1, p0, p1, d0, d1) = conv_params(ctx.node);
     let groups = ctx.node.ne[2];
     Ok(conv2d(ctx.func, &b, &a, [s1, s0], [p1, p0], [d1, d0], groups, ty))
+}
+
+/// Reshapes `x` to add leading axes of 1 until it reaches `rank`, if it
+/// isn't there already -- a pure, value-preserving reshape, not new data.
+/// Some MIL ops (grouped conv, tile) need their *input*'s own declared
+/// rank to actually match what the op structurally expects (a fixed
+/// number of `reps` entries, an unambiguous batch/group axis, ...); unlike
+/// elementwise ops, they don't auto-broadcast a lower-rank input the way
+/// `ty_like`-only padding (used everywhere else in this file) assumes.
+fn pad_rank(func: &mut Function, x: &Var, rank: usize) -> Result<Var, AotError> {
+    if rank_of(x) >= rank {
+        return Ok(x.clone());
+    }
+    let Some(dims) = x.ty().as_tensor().and_then(TensorType::fixed_shape) else {
+        return Ok(x.clone());
+    };
+    let mut shape: Vec<i32> = dims.iter().map(|&d| d as i32).collect();
+    while shape.len() < rank {
+        shape.insert(0, 1);
+    }
+    let ty = TensorType::new(DataType::Float32, shape.iter().map(|&d| d as u64));
+    Ok(func.op(MilOp::Reshape).input("x", x).input("shape", shape).output(ty).build()?)
 }
 
 /// ggml_concat(a, b, dim): binary only (variadic concats in the Scheme
@@ -340,8 +371,17 @@ fn lower_conv_2d_dw(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
 fn lower_concat(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
     let a = ctx.src(0)?;
     let b = ctx.src(1)?;
-    let rank = rank_of(&a).max(rank_of(&b));
+    // Ground truth for the target rank is this node's own reported output
+    // rank, not just the operands' -- one operand alone can be truncated
+    // more aggressively than the concatenated result is (e.g. a `[a, 1]`
+    // column reshape reporting rank 1, concatenated with others into a
+    // genuinely rank-2 `[a, 4]` result). MIL's `concat` needs every input
+    // to already be exactly that rank (unlike an elementwise op, it
+    // doesn't auto-broadcast a lower-rank operand against the others).
+    let rank = ctx.node.ne.len().max(rank_of(&a)).max(rank_of(&b));
     let ty = ty_like(ctx.node, rank);
+    let a = pad_rank(ctx.func, &a, rank)?;
+    let b = pad_rank(ctx.func, &b, rank)?;
     let dim = ctx.node.op_params[0] as i64;
     let axis = rank as i64 - 1 - dim;
     Ok(ctx.func.op(MilOp::Concat).inputs("values", vec![&a, &b]).input("axis", axis as i32).input("interleave", false).output(ty))
@@ -408,10 +448,241 @@ fn lower_upscale(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
 /// node (MIL `slice_by_size` then takes it from there).
 fn lower_view(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
     let x = ctx.src(0)?;
+    // `ggml_view_1d` (the only other VIEW producer besides `tensor:slice`
+    // in this codebase) always passes n_dims=1 to `ggml_view_impl`, so its
+    // node's own reported rank is always exactly 1 -- `tensor:slice`'s own
+    // view_4d never reports rank 1 in this model (channel-split views
+    // always keep W/H, both > 1). See `lower_view_column_select`'s own doc
+    // comment for why this can't instead be told apart by comparing ranks
+    // against the *source*'s rank (every source here is inflated by a
+    // leading batch=1 axis from the very first op onward, so a source's
+    // "true" ggml rank isn't recoverable from its MIL var's rank alone).
+    if ctx.node.ne.len() == 1 {
+        return lower_view_column_select(ctx, x);
+    }
     let rank = rank_of(&x);
     let (begin, size) = slice_params(ctx.node, rank);
     let ty = ty_like(ctx.node, rank);
     Ok(ctx.func.op(MilOp::SliceBySize).input("x", &x).input("begin", begin).input("size", size).output(ty))
+}
+
+/// `vision.ss`'s `decode-ltrb`, via a direct `(ggml-view-1d dist a (* j
+/// (stride dist 1)))`: picks one index `j` along `dist`'s higher axis (a
+/// rank-2, contiguous `[a, 4]` tensor) and flattens that axis away
+/// entirely, keeping the other (innermost) axis in full -- so the view
+/// node's own `ne`/`nb` (rank 1) don't carry enough information to recover
+/// which source axis was fixed or at what index the way a same-rank
+/// `tensor:slice` view's do (see `slice_params`'s doc comment): a rank-1
+/// `nb`/`ne` pair is consistent with infinitely many higher-rank offsets.
+/// This instead assumes `x` is standard-contiguous (true for every value
+/// this call site actually feeds -- it's always a freshly
+/// `ggml-reshape-2d`'d matmul result) and derives the fixed axis's index
+/// directly from `view_offs` and `x`'s own declared (MIL) shape -- whose
+/// *last* axis is always ggml's own axis 0 regardless of how many extra
+/// leading (padding) axes came along with it, so indexing from the end
+/// rather than assuming a specific rank is what actually makes this robust
+/// to that padding.
+fn lower_view_column_select(ctx: LowerCtx<'_>, x: Var) -> Result<OpBuilder<'_>, AotError> {
+    let dims = x.ty().as_tensor().and_then(TensorType::fixed_shape).ok_or_else(|| AotError::UnsupportedOp {
+        index: ctx.index,
+        op: "VIEW needs a fully-known source shape".to_string(),
+    })?;
+    if dims.len() < 2 {
+        return Err(AotError::UnsupportedOp { index: ctx.index, op: format!("VIEW column-select needs a source of rank >= 2, got {dims:?}") });
+    }
+    let rank = dims.len();
+    let inner = dims[rank - 1]; // ggml's own axis 0, kept in full.
+    if inner != ctx.node.ne[0] as u64 {
+        return Err(AotError::UnsupportedOp {
+            index: ctx.index,
+            op: format!("VIEW keeps {} elements but source's inner axis is {inner}", ctx.node.ne[0]),
+        });
+    }
+    let elem_size = 4u64; // f32 throughout this lowering pass.
+    let offset_elems = ctx.node.view_offs as u64 / elem_size;
+    if offset_elems % inner != 0 {
+        return Err(AotError::UnsupportedOp {
+            index: ctx.index,
+            op: format!("VIEW offset {offset_elems} elements doesn't align to inner axis size {inner}"),
+        });
+    }
+    let outer_index = (offset_elems / inner) as i32;
+    let mut begin = vec![0i32; rank];
+    begin[rank - 2] = outer_index;
+    let mut size = vec![1i32; rank];
+    size[rank - 1] = inner as i32;
+    let mut sliced_ty_dims = vec![1u64; rank];
+    sliced_ty_dims[rank - 1] = inner;
+    let sliced = ctx
+        .func
+        .op(MilOp::SliceBySize)
+        .input("x", &x)
+        .input("begin", begin)
+        .input("size", size)
+        .output(TensorType::new(DataType::Float32, sliced_ty_dims))
+        .build()?;
+    let out_len = ctx.node.ne[0] as u64;
+    Ok(ctx.func.op(MilOp::Reshape).input("x", &sliced).input("shape", vec![out_len as i32]).output(TensorType::new(DataType::Float32, [out_len])))
+}
+
+/// `ggml_arange(ctx, start, stop, step)`: a fresh leaf tensor, no sources;
+/// `op_params` are `[start, stop, step]` as raw `f32` bit patterns (see
+/// `NodeInfo::op_params`'s own doc comment). MIL's `range_1d` (declared
+/// arg names `start`/`end`/`step`, coremltools' own ordering) covers this
+/// directly; the output length is already ground truth in `node.ne[0]`, so
+/// there's no need to recompute it (and risk an off-by-one from float
+/// rounding) from `start`/`stop`/`step` the way ggml itself does.
+fn lower_arange(ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let start = f32::from_bits(ctx.node.op_params[0] as u32);
+    let stop = f32::from_bits(ctx.node.op_params[1] as u32);
+    let step = f32::from_bits(ctx.node.op_params[2] as u32);
+    let n = ctx.node.ne[0] as u64;
+    let range_op: MilOp = "range_1d".parse().map_err(|_| AotError::UnsupportedOp { index: ctx.index, op: "range_1d missing from the MIL catalogue".to_string() })?;
+    Ok(ctx.func.op(range_op).input("start", start).input("end", stop).input("step", step).output(TensorType::new(DataType::Float32, [n])))
+}
+
+/// `ggml_repeat_4d(ctx, a, ne0..ne3)`: broadcasts `a` up to a target shape
+/// (no `op_params` at all -- the target shape is simply the result
+/// tensor's own `ne`, see `vendor/ggml/src/ggml.c`). MIL's `tile` wants a
+/// per-axis repeat COUNT, not a target size, so this divides the (rank-
+/// padded) target shape by `a`'s own (rank-padded) shape, axis by axis.
+fn lower_repeat(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let x = ctx.src(0)?;
+    let rank = ctx.node.ne.len().max(rank_of(&x));
+    let ty = ty_like(ctx.node, rank);
+    let out_dims = ty.fixed_shape().ok_or_else(|| AotError::UnsupportedOp { index: ctx.index, op: "REPEAT needs a fully-known target shape".to_string() })?;
+    // MIL's `tile` needs `reps` to have exactly `x`'s own declared rank
+    // (unlike an elementwise op, it doesn't auto-broadcast a lower-rank
+    // input against a wider `reps`/output) -- pad `x` itself up to `rank`
+    // first, the same reason `lower_conv_2d_dw` pads its own input.
+    let x = pad_rank(ctx.func, &x, rank)?;
+    let src_dims = x.ty().as_tensor().and_then(TensorType::fixed_shape).ok_or_else(|| AotError::UnsupportedOp {
+        index: ctx.index,
+        op: "REPEAT needs a fully-known source shape".to_string(),
+    })?;
+    let reps: Vec<i32> = out_dims.iter().zip(src_dims.iter()).map(|(&o, &s)| (o / s) as i32).collect();
+    Ok(ctx.func.op(MilOp::Tile).input("x", &x).input("reps", reps).output(ty))
+}
+
+/// `ggml_scale`/`ggml_scale_bias`: both tag `GGML_OP_SCALE`, `op_params =
+/// [scale, bias]` as raw `f32` bit patterns (`ggml_scale` itself always
+/// passes `bias = 0.0`). MIL has no fused scale-and-bias op, so this is
+/// `x * scale + bias` as two real ops -- always both, even when `bias` is
+/// exactly 0 (harmless, and simpler than branching on it).
+fn lower_scale(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let x = ctx.src(0)?;
+    let rank = rank_of(&x);
+    let ty = ty_like(ctx.node, rank);
+    let scale = f32::from_bits(ctx.node.op_params[0] as u32);
+    let bias = f32::from_bits(ctx.node.op_params[1] as u32);
+    let scaled = ctx.func.op(MilOp::Mul).input("x", &x).input("y", scale).output(ty.clone()).build()?;
+    Ok(ctx.func.op(MilOp::Add).input("x", &scaled).input("y", bias).output(ty))
+}
+
+/// ggml_cont just re-lays-out `a`'s own values into a fresh contiguous
+/// buffer, same logical shape -- a ggml-backend memory-layout requirement
+/// with no MIL equivalent (MIL tensors have no "non-contiguous view"
+/// concept for a leaf builder to route around). Lowers to a reshape to its
+/// own (already-known) shape: value-preserving by construction, and reuses
+/// an op every backend already has instead of inventing an identity one.
+fn lower_cont(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let x = ctx.src(0)?;
+    let rank = rank_of(&x);
+    let ty = ty_like(ctx.node, rank);
+    let shape: Vec<i32> = ctx.node.ne.iter().rev().map(|&d| d as i32).collect();
+    Ok(ctx.func.op(MilOp::Reshape).input("x", &x).input("shape", shape).output(ty))
+}
+
+/// ggml_transpose swaps ggml axes 0 and 1 (`ne`/`nb` swapped, everything
+/// else fixed) -- MIL's own last two axes (its axis order is reversed from
+/// ggml's, so ggml's innermost two axes are MIL's last two).
+fn lower_transpose(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let x = ctx.src(0)?;
+    let rank = rank_of(&x);
+    let ty = ty_like(ctx.node, rank);
+    let mut perm: Vec<i32> = (0..rank as i32).collect();
+    if rank >= 2 {
+        perm.swap(rank - 1, rank - 2);
+    }
+    Ok(ctx.func.op(MilOp::Transpose).input("x", &x).input("perm", perm).output(ty))
+}
+
+/// `ggml_permute(a, axis0..axis3)`: op_params are exactly `[axis0, axis1,
+/// axis2, axis3]` (see `ggml_permute`'s own `ggml_set_op_params` call),
+/// where `axisI` is the ggml axis input axis `I` moves *to*. Every call
+/// tensorlisp's own stdlib actually makes (attn.ss's split-heads/
+/// merge-heads: `(0 2 1 3)`, swapping the middle two axes; sdpa's own
+/// value-transpose: `(1 0 2 3)`, swapping the first two) is a single pair
+/// of ggml axes swapping with everything else fixed -- so, like
+/// `lower_permute`'s sibling ops, this only needs to recognize *which*
+/// pair swaps, not implement a fully general permutation (one that moved
+/// data into/out of a padding axis beyond the reported rank would need
+/// more care than a same-rank swap does, and doesn't occur here).
+fn lower_permute(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let x = ctx.src(0)?;
+    let rank = rank_of(&x);
+    let ty = ty_like(ctx.node, rank);
+    let p = ctx.node.op_params;
+    let axis = [p[0], p[1], p[2], p[3]];
+    let mut swapped = None;
+    for (i, &dst) in axis.iter().enumerate() {
+        if dst != i as i32 {
+            match swapped {
+                None => swapped = Some((i as i32, dst)),
+                Some((a, b)) if (a, b) == (dst, i as i32) => {}
+                _ => {
+                    return Err(AotError::UnsupportedOp {
+                        index: ctx.index,
+                        op: format!("PERMUTE {axis:?} (not a single axis swap)"),
+                    });
+                }
+            }
+        }
+    }
+    let perm: Vec<i32> = match swapped {
+        None => (0..rank as i32).collect(),
+        Some((g0, g1)) => {
+            let (g0, g1) = (g0 as usize, g1 as usize);
+            if g0.max(g1) >= rank {
+                return Err(AotError::UnsupportedOp {
+                    index: ctx.index,
+                    op: format!("PERMUTE swaps ggml axis {} or {} beyond rank {rank}", g0.max(g1), g0.min(g1)),
+                });
+            }
+            let (m0, m1) = (rank - 1 - g0, rank - 1 - g1);
+            let mut perm: Vec<i32> = (0..rank as i32).collect();
+            perm.swap(m0, m1);
+            perm
+        }
+    };
+    Ok(ctx.func.op(MilOp::Transpose).input("x", &x).input("perm", perm).output(ty))
+}
+
+/// `ggml_soft_max_ext(a, mask, scale, max_bias)`: op_params are `[scale,
+/// max_bias]` as raw `f32` bit patterns (same convention as `ARANGE`'s,
+/// see `NodeInfo::op_params`'s own doc comment). Only `max_bias == 0.0` is
+/// covered -- the only value tensorlisp's own `attn:sdpa` ever passes
+/// (ALiBi-style linear bias slopes aren't used anywhere in this model).
+/// softmax(a * scale + mask) over ggml's axis 0 (innermost) = MIL's last
+/// axis; MIL has no fused scale/mask/softmax op, so this decomposes into
+/// the same three real ops ggml's own reference computation performs.
+fn lower_soft_max(mut ctx: LowerCtx<'_>) -> Result<OpBuilder<'_>, AotError> {
+    let a = ctx.src(0)?;
+    let scale = f32::from_bits(ctx.node.op_params[0] as u32);
+    let max_bias = f32::from_bits(ctx.node.op_params[1] as u32);
+    if max_bias != 0.0 {
+        return Err(AotError::UnsupportedOp { index: ctx.index, op: format!("SOFT_MAX with max_bias {max_bias} (only 0.0 is covered)") });
+    }
+    let rank = rank_of(&a);
+    let ty = ty_like(ctx.node, rank);
+    let scaled = ctx.func.op(MilOp::Mul).input("x", &a).input("y", scale).output(ty.clone()).build()?;
+    let biased = if ctx.node.srcs.len() > 1 {
+        let mask = ctx.src(1)?;
+        ctx.func.op(MilOp::Add).input("x", &scaled).input("y", &mask).output(ty.clone()).build()?
+    } else {
+        scaled
+    };
+    Ok(ctx.func.op(MilOp::Softmax).input("x", &biased).input("axis", (rank - 1) as i32).output(ty))
 }
 
 /// The CoreML MIL lowering pass: ggml op name -> lowering function. Each
@@ -435,6 +706,13 @@ fn leafnode_pass() -> &'static PassTable<LowerFn> {
             .register("POOL_2D", lower_pool_2d)
             .register("UPSCALE", lower_upscale)
             .register("VIEW", lower_view)
+            .register("CONT", lower_cont)
+            .register("TRANSPOSE", lower_transpose)
+            .register("PERMUTE", lower_permute)
+            .register("SOFT_MAX", lower_soft_max)
+            .register("ARANGE", lower_arange)
+            .register("REPEAT", lower_repeat)
+            .register("SCALE", lower_scale)
     })
 }
 
