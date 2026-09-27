@@ -20,13 +20,22 @@ use crate::error::{Error, Result};
 
 const CORE: &str = include_str!("core.ss");
 
-/// The stdlib libraries, `(tl name)`, in dependency order (see docs/stdlib.md).
+/// The stdlib libraries, `(tl name)` (`name` possibly multi-segment, e.g.
+/// `aot mil shadow` for `(tl aot mil shadow)`), in dependency order (see
+/// docs/stdlib.md).
 const STDLIB: &[(&str, &str)] = &[
     ("tensor", include_str!("stdlib/tensor.ss")),
     ("util", include_str!("stdlib/util.ss")),
     ("nn", include_str!("stdlib/nn.ss")),
     ("attn", include_str!("stdlib/attn.ss")),
     ("vision", include_str!("stdlib/vision.ss")),
+    ("generic", include_str!("stdlib/generic.ss")),
+    ("aot highlevel", include_str!("aot/highlevel.ss")),
+    ("aot reference-compiler", include_str!("aot/reference_compiler.ss")),
+    ("aot mil language", include_str!("aot/mil/language.ss")),
+    ("aot mil trace", include_str!("aot/mil/trace.ss")),
+    ("aot mil shadow", include_str!("aot/mil/shadow.ss")),
+    ("aot mil compile", include_str!("aot/mil/compile.ss")),
 ];
 
 /// Names exported to programs by `(tensorlisp)`, besides generated ops and constants.
@@ -37,9 +46,12 @@ const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? mod
     array-shape array-affine array-reshape \
     postprocess results pipeline run output detokenize token-id define-state state effect device array-length array->list list->array array-slice array-transpose array-take array-argmax \
     image-letterbox boxes-convert nms detect boxes-scale boxes-clip boxes-unletterbox dbscan cluster-centroids \
-    text-boxes text-boxes-order image-crop-text ctc-greedy vocabulary vocabulary-size vocabulary-text";
+    text-boxes text-boxes-order image-crop-text ctc-greedy vocabulary vocabulary-size vocabulary-text \
+    mil-trace:add mil-trace:silu mil-trace:sigmoid mil-trace:reshape-2d mil-trace:reshape-3d mil-trace:reshape-4d \
+    mil-trace:ggml-concat mil-trace:tensor-slice mil-trace:tensor-concat mil-trace:conv2d mil-trace:conv2d-depthwise \
+    mil-trace:max-pool mil-trace:upsample-nearest %mil-trace-reset! %mil-render %mil-render! %mil-declare-input!";
 /// Host entry points, only visible from Rust.
-const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline";
+const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline $tl-compile-generic-to-ggml $tl-compile-generic-to-mil $tl-mil-last-render";
 
 extern "C" fn tl_tensor_ne(t: *const ggml_tensor, i: i32) -> i64 {
     unsafe { (*t).ne[i as usize] }
@@ -323,6 +335,51 @@ fn raw_argument(raw: RawValue) -> Value {
         RawValue::Array(t) => ("tensor", HostValue::Tensor(t)),
     };
     Value::Pair(Box::new(Value::Symbol(kind.into())), Box::new(Value::Int(insert(value))))
+}
+
+/// Compiles `(tl generic)`-vocabulary source into ggml-targeted source (see
+/// `$tl-compile-generic-to-ggml` in core.ss): the simplest possible pass of
+/// tensorlisp's nanopass compiler, a syntax-level rename with no semantic
+/// transformation, so its output can be loaded and run exactly like any
+/// other program -- proving the compile pipeline itself before a harder
+/// target (a real leaf IR) needs actual codegen.
+pub(crate) fn compile_generic_to_ggml(src: &str) -> Result<String> {
+    let src = src.to_owned();
+    let reply = with_scheme(move |s| s.call("$tl-compile-generic-to-ggml", &[Value::String(src)]))??;
+    match reply {
+        Value::String(s) => Ok(s),
+        other => Err(bad_reply("compile", &other)),
+    }
+}
+
+/// Compiles the same source into a CoreML MIL trace target (see
+/// `$tl-compile-generic-to-mil` in core.ss). Unlike the ggml pass this isn't
+/// just a rename -- the output still has to be *run* (real weights, real
+/// input) for its side-effecting `mil-trace:*` shadows to actually populate
+/// the trace, and the compiled model body itself must call `%mil-render!`
+/// somewhere (its tensors are only live while the graph is being built);
+/// [`mil_last_render`] fetches the resulting text back afterwards.
+pub(crate) fn compile_generic_to_mil(src: &str) -> Result<String> {
+    let src = src.to_owned();
+    let reply = with_scheme(move |s| s.call("$tl-compile-generic-to-mil", &[Value::String(src)]))??;
+    match reply {
+        Value::String(s) => Ok(s),
+        other => Err(bad_reply("compile", &other)),
+    }
+}
+
+/// The MIL program text `(%mil-render! ...)` last stored, called from within
+/// a `mil-trace:*`-shadowed program's own model body (its tensors, and
+/// `%weights`/`%ctx`, stop being valid once the graph build returns, so this
+/// can only be read back afterwards, not recomputed by Rust). The Scheme
+/// runtime is one persistent thread (see `with_scheme`), so the value
+/// survives from the `run()` call that set it to this one that reads it.
+pub(crate) fn mil_last_render() -> Result<String> {
+    let reply = with_scheme(move |s| s.call("$tl-mil-last-render", &[]))??;
+    match reply {
+        Value::String(s) => Ok(s),
+        other => Err(bad_reply("compile", &other)),
+    }
 }
 
 impl LoadedProgram {

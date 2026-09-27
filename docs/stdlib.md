@@ -19,6 +19,7 @@ every helper is recognizably from the stdlib and from which part:
 | `(tl attn)` | `attn:` | masks, heads, scaled dot-product attention (GQA, flash), RoPE, fused multi-head blocks |
 | `(tl vision)` | `vision:` | token/image layouts, position-embedding resizing, detection-head decoding |
 | `(tl util)` | `util:` | plain Scheme helpers for pipelines: strings, lists |
+| `(tl generic)` | *(none)* | the AOT-portable op vocabulary: aliases/thin wrappers for exactly the ops `tensorlisp-aot` currently knows how to lower to a backend leaf (CoreML MIL, so far) |
 
 Everything unprefixed is the core (`(tensorlisp)`, always available): `model`,
 `weight`, `shape`, `tap`, the `ggml-*` ops, the host functions (`tokenize`,
@@ -31,6 +32,10 @@ implementation of the PyTorch semantics).
 
 - `(import (tl nn))` binds `nn:linear`, `nn:layer-norm`, ... The prefix is
   always the library's; that's the canonical spelling used in docs and ports.
+- `(import (tl generic))` is the one exception: it binds its names bare
+  (`add`, `conv2d`, `slice`, ...), no `generic:` prefix, since the point is
+  to match ggml's own unprefixed op names as closely as the stdlib's usual
+  per-library prefixing convention allows.
 - Standard R6RS import sets work for other names: `(only (tl tensor) dim)`,
   `(prefix (tl nn) layer/)`, `(rename (tl attn) (sdpa attention))`,
   `(except ...)`. An explicit import set is used as written (no prefix added).
@@ -107,6 +112,17 @@ implementation of the PyTorch semantics).
 | `(vision:anchor-grid w h)` | two values: cell centers x + 0.5 and y + 0.5, each `[w*h]` |
 | `(vision:dfl raw 'bins 16)` | YOLOv8+ distribution focal loss decoding: `[A, 4 * bins]` → expected distances `[A, 4]` (l t r b) |
 | `(vision:decode-ltrb dist w h pixels-per-cell)` | distances from the cell centers of a `w x h` grid → boxes `[A, 4]` cx, cy, w, h in pixels (Ultralytics `dist2bbox`) |
+
+## `(tl generic)` — bare, no prefix
+
+The AOT-portable op vocabulary: `add sub mul relu silu sigmoid mul-mat
+reshape conv2d conv2d-depthwise max-pool upsample-nearest slice concat`,
+each a plain alias or thin wrapper for the matching `ggml-*`/`nn:*`/`tensor:*`
+op -- no new graph-building logic, so a model using these runs exactly as it
+always would. It's the exact, and only, op set `tensorlisp-aot`
+(`crates/tensorlisp-aot`) currently knows how to lower to a backend leaf
+(CoreML MIL); adding an op here and a matching lowering entry there, each
+checked against a real tap, is how AOT coverage grows.
 
 ## `(tl util)` — `util:`
 

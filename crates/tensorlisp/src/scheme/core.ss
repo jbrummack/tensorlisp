@@ -873,9 +873,26 @@
       imports)
     #t))
 
-;; The stdlib: (tl name) binds its exports as name:export unless the import
-;; spec says otherwise (prefix, only, rename, except).
-(define %stdlib '(tensor nn attn vision util))
+;; The stdlib: (tl name...) binds its exports as <last-segment>:export unless
+;; the import spec says otherwise (prefix, only, rename, except). Each entry
+;; is the path after `tl` (so `(tensor)` is `(tl tensor)`, `(aot mil shadow)`
+;; is `(tl aot mil shadow)`), not just a bare symbol, since some stdlib
+;; libraries now nest under a directory of their own (scheme/aot/).
+(define %stdlib '((tensor) (nn) (attn) (vision) (util) (generic)
+                  (aot highlevel) (aot reference-compiler)
+                  (aot mil language) (aot mil trace) (aot mil shadow) (aot mil compile)))
+
+;; (tl generic) is meant to be written bare, with no caller-visible prefix
+;; at all: it's the AOT-portable op vocabulary (see stdlib/generic.ss), and
+;; forcing every model that uses it to write `generic:add` instead of `add`
+;; would defeat the point (matching ggml's own unprefixed op names as
+;; closely as the stdlib's usual per-library prefixing convention allows).
+;; Every `(tl aot ...)` library is bare for the same reason as each other:
+;; their own names already self-distinguish (`add-t`, `mil-shadow:add`,
+;; `hl-op-names`, ...), so a second, path-derived prefix would just be
+;; noise, not disambiguation.
+(define %stdlib-unprefixed '((generic) (aot highlevel) (aot reference-compiler)
+                             (aot mil language) (aot mil trace) (aot mil shadow) (aot mil compile)))
 
 ;; Import specs of the program's leading (import ...) forms, checked and with
 ;; the canonical prefixes applied.
@@ -887,11 +904,12 @@
       [(and (pair? spec) (eq? (car spec) 'library) (pair? (cdr spec))) (cadr spec)]
       [else spec]))
   (define (check spec)
-    (let ([name (library-name spec)])
-      (unless (and (list? name) (= (length name) 2) (eq? (car name) 'tl) (memq (cadr name) %stdlib))
-        (error 'import (format "only the stdlib can be imported: ~a" (map (lambda (n) (list 'tl n)) %stdlib)) name))
-      (if (equal? spec name)
-          `(prefix ,name ,(string->symbol (format "~a:" (cadr name))))
+    (let* ([name (library-name spec)]
+           [path (and (pair? name) (cdr name))])
+      (unless (and (list? name) (pair? name) (eq? (car name) 'tl) (member path %stdlib))
+        (error 'import (format "only the stdlib can be imported: ~a" (map (lambda (n) (cons 'tl n)) %stdlib)) name))
+      (if (and (equal? spec name) (not (member path %stdlib-unprefixed)))
+          `(prefix ,name ,(string->symbol (format "~a:" (car (reverse path)))))
           spec)))
   (apply append
     (map (lambda (form)
@@ -900,6 +918,444 @@
          forms)))
 
 (define (%import-form? form) (and (pair? form) (eq? (car form) 'import)))
+
+;; The simplest possible nanopass compiler: (tl generic) source -> ggml
+;; source, one syntax-to-syntax rewrite pass. Every generic op (see
+;; stdlib/generic.ss) is defined as a plain alias/wrapper for a real
+;; ggml/(tl nn)/(tl tensor) call, so compiling for the "ggml backend" is
+;; exactly renaming each generic call's head to the op it already aliases
+;; -- no semantic transformation, no shape reasoning, the target's own
+;; execution (ggml, run normally) computes shapes exactly as it always has.
+;; This is deliberately the easiest target (a rename, not real codegen), to
+;; get the compile -> emit -> re-load -> compare pipeline itself proven
+;; before a harder target (e.g. a real leaf IR like CoreML MIL) needs a
+;; genuine semantic pass instead of a rename table.
+;;
+;; Renaming only ever touches the head position of a call form -- never an
+;; argument, a quoted datum, or a `let`-bound name -- so it can't misfire on
+;; option keywords (`'stride`) or literal data (`'(2 1)`); it also can't
+;; detect a generic op name locally shadowed by `let`, a known, accepted
+;; simplification for this first pass.
+(define (%generic-rename op form)
+  (case op
+    [(add) 'ggml-add] [(sub) 'ggml-sub] [(mul) 'ggml-mul]
+    [(relu) 'ggml-relu] [(silu) 'ggml-silu] [(sigmoid) 'ggml-sigmoid]
+    [(mul-mat) 'ggml-mul-mat]
+    [(reshape)
+     (case (- (length form) 2)
+       [(1) 'ggml-reshape-1d] [(2) 'ggml-reshape-2d]
+       [(3) 'ggml-reshape-3d] [(4) 'ggml-reshape-4d]
+       [else (error '%compile-generic "reshape takes 1 to 4 target dims" form)])]
+    [(conv2d) 'nn:conv2d] [(conv2d-depthwise) 'nn:conv2d-depthwise]
+    [(max-pool) 'nn:max-pool] [(upsample-nearest) 'nn:upsample-nearest]
+    [(slice) 'tensor:slice] [(concat) 'tensor:concat]
+    [else #f]))
+
+(define (%compile-form form)
+  (cond
+    [(and (pair? form) (symbol? (car form)))
+     (cons (or (%generic-rename (car form) form) (car form))
+           (map %compile-form (cdr form)))]
+    [(pair? form) (cons (%compile-form (car form)) (%compile-form (cdr form)))]
+    [else form]))
+
+;; Reads every top-level form from `src`, drops its leading (import ...)
+;; forms (replaced with a fixed import of every library a rename might
+;; target), and returns ggml-targeted source text.
+(define ($tl-compile-generic-to-ggml src)
+  (let* ([port (open-input-string src)]
+         [forms (let loop ([acc '()])
+                  (let ([form (read port)])
+                    (if (eof-object? form) (reverse acc) (loop (cons form acc)))))]
+         [body (remp %import-form? forms)]
+         [compiled (map %compile-form body)])
+    (with-output-to-string
+      (lambda ()
+        (write '(import (tl nn) (tl tensor)))
+        (newline)
+        (for-each (lambda (f) (write f) (newline)) compiled)))))
+
+;; ---------------------------------------------------------------- MIL trace compiler
+;;
+;; A second nanopass target, CoreML MIL. Unlike $tl-compile-generic-to-ggml's
+;; plain rename, MIL needs a real symbolic SSA graph (op nodes referencing
+;; each other by %name), not a value computed by evaluation -- renaming call
+;; heads alone isn't enough, since the *target* doesn't share ggml's
+;; eager-execution semantics the way the ggml pass's target does.
+;;
+;; Every covered primitive gets a *shadow* instead, doing BOTH: (1) calls the
+;; real op, so the model's own shape-dependent control flow (channel splits,
+;; head counts, weight?-driven block counts) keeps working exactly as it
+;; does for the reference CPU run -- ggml's graph-build-time shape
+;; computation (every op call gets a real ne/nb the instant the node is
+;; created, well before any numeric compute pass) stays the ground truth,
+;; never re-derived in Scheme; and (2) emits the equivalent MIL op node into
+;; a side trace, addressed by looking up each argument tensor's
+;; already-assigned %name. This is "the ggml tensor instructions are the
+;; same as tensor instructions without the ggml prefix (they are a
+;; reference impl for testing the final model)": running the real model
+;; against ggml is simultaneously the numerics reference AND the only
+;; source of ground-truth shapes the MIL side needs.
+;;
+;; Coverage is exactly (tl generic)'s vocabulary, intercepted at the same
+;; call-site boundary (nn:conv2d, tensor:slice, ...), plus the couple of raw
+;; ggml- ops a model may call directly with no generic alias (ggml-add,
+;; ggml-concat, ggml-reshape-*). Anything outside that (ggml-cont/
+;; ggml-transpose/attn:sdpa inside an attention block, vision:dfl's detect
+;; head decode) has no shadow and is simply not traced: the real tensor
+;; still flows through for the reference run (still numerically correct),
+;; but any covered op downstream that tries to use one as a MIL argument
+;; fails loudly via %mil-ref, rather than silently emitting a wrong or
+;; partial graph.
+
+;; real tensor (eq?) -> %name symbol.
+;; tensor.ss's own `dim` isn't visible here (core.ss is what (tl tensor)
+;; imports, not the other way around); this is the same definition, local
+;; to the MIL trace pass.
+(define (%mil-dim t i)
+  (let ([s (shape t)])
+    (if (< i (length s)) (list-ref s i) 1)))
+
+;; tensor.ss's own `stride`, same reason: not visible from core.ss.
+(define (%mil-stride t i)
+  (let ([s (strides t)])
+    (if (< i (length s)) (list-ref s i) (* (%mil-stride t (- i 1)) (%mil-dim t (- i 1))))))
+
+(define %mil-names (make-eq-hashtable))
+;; gguf weight name (string) -> %name symbol, so the same weight referenced
+;; twice (shouldn't normally happen, but cheap to guard) is only declared once.
+(define %mil-weight-names (make-hashtable string-hash string=?))
+(define %mil-stmts '())    ; reversed list of (set %name (op ...)) forms
+(define %mil-weights '())  ; reversed list of (gguf-name %name dtype dims)
+(define %mil-counter 0)
+
+(define (%mil-trace-reset!)
+  (set! %mil-names (make-eq-hashtable))
+  (set! %mil-weight-names (make-hashtable string-hash string=?))
+  (set! %mil-stmts '())
+  (set! %mil-weights '())
+  (set! %mil-counter 0))
+
+(define (%mil-fresh! prefix)
+  (let ([n %mil-counter])
+    (set! %mil-counter (+ n 1))
+    (string->symbol (format "%~a_~a" prefix n))))
+
+;; MIL identifiers can't contain '.'; the gguf name (the real lookup key)
+;; stays untouched, only the %name gets sanitized.
+(define (%mil-sanitize s)
+  (list->string (map (lambda (c) (if (char=? c #\.) #\_ c)) (string->list s))))
+
+;; Records that `t` (a real tensor) was just produced by `node` (an already-
+;; built MIL op-node sexpr, e.g. (relu (x %x_0))); returns `t` unchanged so
+;; the real (reference) computation this shadow wraps is unaffected.
+(define (%mil-emit! t node prefix)
+  (let ([nm (%mil-fresh! prefix)])
+    (set! %mil-stmts (cons (list 'set nm node) %mil-stmts))
+    (hashtable-set! %mil-names t nm)
+    t))
+
+;; The %name a previously-emitted (or declared-weight/input) real tensor was
+;; given.
+(define (%mil-ref t)
+  (or (hashtable-ref %mil-names t #f)
+      (error '%mil-ref "tensor was not produced by a traced (mil-trace:*) op -- likely reached through an untraced primitive (e.g. attention/DFL) upstream" t)))
+
+;; Declares `t` as a MIL graph input named `%name` -- the compile pass
+;; injects one call to this per (model (inputs ...) ...) parameter, so a
+;; model's own declared inputs are %mil-ref-able from its very first op,
+;; the same way a weight becomes ref-able the moment it's first declared.
+(define (%mil-declare-input! t name)
+  (hashtable-set! %mil-names t (string->symbol (format "%~a" name)))
+  t)
+
+;; Declares `t` (a real weight tensor, from `weight`) as a MIL graph input
+;; named after its gguf name (sanitized), unless already declared, and
+;; returns its %name.
+(define (%mil-declare-weight! t gguf-name)
+  (or (hashtable-ref %mil-weight-names gguf-name #f)
+      (let ([nm (string->symbol (format "%~a" (%mil-sanitize gguf-name)))])
+        (hashtable-set! %mil-weight-names gguf-name nm)
+        (set! %mil-weights (cons (list gguf-name nm (dtype t) (shape t)) %mil-weights))
+        (hashtable-set! %mil-names t nm)
+        nm)))
+
+;; Renders the trace accumulated so far as one program sexpr, textually:
+;; (program <name>
+;;   (inputs (%x (tensor f32 (dims ...))) ...)
+;;   (weights (%w (tensor f32 (dims ...)) (source "gguf.name")) ...)
+;;   (block (set %name (op (arg val) ...)) ...)
+;;   (output %name))
+;; `inputs` is `((name dtype dims) ...)`; `output-tensor` is the real tensor
+;; whose %name becomes the program's output.
+(define (%mil-render program-name inputs output-tensor)
+  (define (render-input i)
+    (list (string->symbol (format "%~a" (car i)))
+          (list 'tensor (cadr i) (caddr i))))
+  (define (render-weight w)
+    (list (cadr w) (list 'tensor (caddr w) (cadddr w)) (list 'source (car w))))
+  (with-output-to-string
+    (lambda ()
+      (write (list 'program (string->symbol program-name)
+                    (cons 'inputs (map render-input inputs))
+                    (cons 'weights (map render-weight (reverse %mil-weights)))
+                    (cons 'block (reverse %mil-stmts))
+                    (list 'output (%mil-ref output-tensor)))))))
+
+;; A model builder's own tensors (and `%weights`/`%ctx`) stop being valid the
+;; moment the graph build returns, so `%mil-render` has to be called from
+;; *inside* the model body (where `output-tensor` is still a live tensor),
+;; not from `postprocess` (host-side, after the run, numeric arrays only).
+;; `%mil-render!` is that: same args, stores the text in `%mil-last-render`
+;; (surviving on the Scheme thread after the call returns) instead of
+;; returning it, and returns `output-tensor` unchanged so it can be spliced
+;; in wherever the model would otherwise just use that tensor directly.
+(define %mil-last-render #f)
+(define (%mil-render! program-name inputs output-tensor)
+  (set! %mil-last-render (%mil-render program-name inputs output-tensor))
+  output-tensor)
+
+;; --- shadow ops: same args as the real op they wrap, same return value
+;; (the real tensor), plus one MIL node emitted per call.
+
+(define (mil-trace:add a b)
+  (%mil-emit! (ggml-add a b) (list 'add (list 'x (%mil-ref a)) (list 'y (%mil-ref b))) "add"))
+
+(define (mil-trace:silu x)
+  (%mil-emit! (ggml-silu x) (list 'silu (list 'x (%mil-ref x))) "silu"))
+
+(define (mil-trace:sigmoid x)
+  (%mil-emit! (ggml-sigmoid x) (list 'sigmoid (list 'x (%mil-ref x))) "sigmoid"))
+
+(define (mil-trace:reshape-2d x d0 d1)
+  (%mil-emit! (ggml-reshape-2d x d0 d1) (list 'reshape (list 'x (%mil-ref x)) (list 'shape (list d0 d1))) "reshape"))
+(define (mil-trace:reshape-3d x d0 d1 d2)
+  (%mil-emit! (ggml-reshape-3d x d0 d1 d2) (list 'reshape (list 'x (%mil-ref x)) (list 'shape (list d0 d1 d2))) "reshape"))
+(define (mil-trace:reshape-4d x d0 d1 d2 d3)
+  (%mil-emit! (ggml-reshape-4d x d0 d1 d2 d3) (list 'reshape (list 'x (%mil-ref x)) (list 'shape (list d0 d1 d2 d3))) "reshape"))
+
+;; ggml axis (0 = innermost) -> MIL ndarray axis (0 = outermost) for a rank-4
+;; tensor: mil-axis = 3 - ggml-axis. Same convention tensorlisp-aot's Rust
+;; CONCAT/VIEW lowering already uses.
+(define (%mil-axis4 ax) (- 3 ax))
+
+(define (mil-trace:ggml-concat a b axis)
+  (%mil-emit! (ggml-concat a b axis)
+              (list 'concat (list 'values (list (%mil-ref a) (%mil-ref b)))
+                    (list 'axis (%mil-axis4 axis)) (list 'interleave #f))
+              "concat"))
+
+;; tensor:concat folds ggml-concat pairwise, left to right; mirror that so
+;; the trace gets one MIL concat node per real ggml-concat node, exactly as
+;; many as the real fold performs.
+(define (mil-trace:tensor-concat ts axis)
+  (when (null? ts) (error 'mil-trace:tensor-concat "no tensors"))
+  (fold-left (lambda (acc t) (mil-trace:ggml-concat acc t axis)) (car ts) (cdr ts)))
+
+;; begin/size are known outright from the call site (from, n): unlike
+;; tensorlisp-aot's Rust VIEW lowering, which has to decode a raw
+;; view_offs/nb after the fact, tracing sees the slice's own arguments
+;; directly, before the underlying ggml-view-4d call. Calls ggml-view-4d
+;; directly (`tensor:slice` isn't visible from core.ss -- (tl tensor)
+;; imports core.ss, not the reverse) -- same body as tensor.ss's own `slice`.
+(define (mil-trace:tensor-slice x axis from n)
+  (unless (and (fixnum? axis) (<= 0 axis 3)) (error 'mil-trace:tensor-slice "axis must be 0-3" axis))
+  (let* ([full (list (%mil-dim x 0) (%mil-dim x 1) (%mil-dim x 2) (%mil-dim x 3))]
+         [ne (lambda (i) (if (= i axis) n (%mil-dim x i)))]
+         [y (ggml-view-4d x (ne 0) (ne 1) (ne 2) (ne 3)
+                          (%mil-stride x 1) (%mil-stride x 2) (%mil-stride x 3)
+                          (* from (%mil-stride x axis)))]
+         [begin4 (map (lambda (i) (if (= i axis) from 0)) '(0 1 2 3))]
+         [size4 (map (lambda (i sz) (if (= i axis) n sz)) '(0 1 2 3) full)])
+    (%mil-emit! y
+                (list 'slice_by_size (list 'x (%mil-ref x))
+                      (list 'begin (reverse begin4)) (list 'size (reverse size4)))
+                "slice")))
+
+;; Mirrors nn.ss's own (private) `axes`/`padding` option defaulting, since a
+;; conv/pool shadow has to derive exactly the attributes the real nn:* call
+;; it wraps will use, without being able to call nn.ss's internal helpers.
+(define (%mil-opt opts key default)
+  (let loop ([o opts])
+    (cond [(null? o) default] [(eq? (car o) key) (cadr o)] [else (loop (cddr o))])))
+
+(define (%mil-axes v)
+  (cond
+    [(fixnum? v) (values v v)]
+    [(and (list? v) (= (length v) 2)) (values (cadr v) (car v))]
+    [else (error '%mil-axes "expected an integer or a list (height width)" v)]))
+
+(define (%mil-conv-node kind x wname bname sx sy px py groups)
+  (append
+    (list kind (list 'x (%mil-ref x)) (list 'weight wname)
+          (list 'strides (list sy sx)) (list 'pad_type "custom")
+          (list 'pad (list py py px px)) (list 'dilations (list 1 1)) (list 'groups groups))
+    (if bname (list (list 'bias bname)) '())))
+
+;; `nn:conv2d`/`nn:max-pool`/etc. aren't visible from core.ss either, same
+;; reason as `tensor:slice` above -- (tl nn) imports core.ss, not the
+;; reverse. Each shadow below recomputes the real reference value itself,
+;; from the same raw ggml-* ops nn.ss's own definition uses (mirrored, not
+;; guessed: see nn.ss's `conv2d`/`conv2d-depthwise`/`pool`/`upsample-nearest`
+;; and their private `add-bias`/`conv-bias`/`optional` helpers) -- always the
+;; 'direct conv method (nn.ss's own default on a CPU device, which is what a
+;; compile/trace run uses; the GPU im2col path isn't replicated here).
+
+(define (%mil-optional-weight prefix name)
+  (let ([n (format "~a.~a" prefix name)]) (and (weight? n) (weight n))))
+
+(define (%mil-add-bias y bias) (if bias (ggml-add y bias) y))
+
+(define (%mil-conv-bias-tensor prefix c-out)
+  (let ([b (%mil-optional-weight prefix "bias")]) (and b (ggml-reshape-3d b 1 1 c-out))))
+
+;; Declares prefix.bias as a MIL weight input too, if the model has one.
+(define (%mil-conv-bias-name prefix)
+  (let ([n (format "~a.bias" prefix)])
+    (and (weight? n) (%mil-declare-weight! (weight n) n))))
+
+(define (mil-trace:conv2d x prefix . opts)
+  (let*-values ([(kernel) (weight (format "~a.weight" prefix))]           ; [kw, kh, C_in, C_out]
+                [(kw kh c-out) (values (%mil-dim kernel 0) (%mil-dim kernel 1) (%mil-dim kernel 3))]
+                [(sx sy) (%mil-axes (%mil-opt opts 'stride 1))]
+                [(px py) (let ([p (%mil-opt opts 'padding #f)])
+                           (if p (%mil-axes p) (values (quotient kw 2) (quotient kh 2))))]
+                [(y) (%mil-add-bias (ggml-conv-2d-direct kernel x sx sy px py 1 1) (%mil-conv-bias-tensor prefix c-out))]
+                [(wname) (%mil-declare-weight! kernel (format "~a.weight" prefix))]
+                [(bname) (%mil-conv-bias-name prefix)])
+    (%mil-emit! y (%mil-conv-node 'conv x wname bname sx sy px py 1) "conv")))
+
+(define (mil-trace:conv2d-depthwise x prefix . opts)
+  (let*-values ([(kernel) (weight (format "~a.weight" prefix))]           ; [kw, kh, 1, C]
+                [(kw kh c) (values (%mil-dim kernel 0) (%mil-dim kernel 1) (%mil-dim kernel 3))]
+                [(sx sy) (%mil-axes (%mil-opt opts 'stride 1))]
+                [(px py) (let ([p (%mil-opt opts 'padding #f)])
+                           (if p (%mil-axes p) (values (quotient kw 2) (quotient kh 2))))]
+                [(y) (%mil-add-bias (ggml-conv-2d-dw-direct kernel x sx sy px py 1 1) (%mil-conv-bias-tensor prefix c))]
+                [(wname) (%mil-declare-weight! kernel (format "~a.weight" prefix))]
+                [(bname) (%mil-conv-bias-name prefix)])
+    (%mil-emit! y (%mil-conv-node 'conv x wname bname sx sy px py c) "conv")))
+
+(define (mil-trace:max-pool x k . opts)
+  (let* ([s (let ([s (%mil-opt opts 'stride #f)]) (if s s k))]
+         [p (%mil-opt opts 'padding 0)]
+         [y (ggml-pool-2d x GGML_OP_POOL_MAX k k s s (inexact p) (inexact p))])
+    (%mil-emit! y
+                (list 'max_pool (list 'x (%mil-ref x))
+                      (list 'kernel_sizes (list k k)) (list 'strides (list s s))
+                      (list 'pad_type "custom") (list 'pad (list p p p p)))
+                "pool")))
+
+(define (mil-trace:upsample-nearest x factor)
+  (let ([target-h (* factor (%mil-dim x 1))] [target-w (* factor (%mil-dim x 0))]
+        [y (ggml-upscale x factor GGML_SCALE_MODE_NEAREST)])
+    (%mil-emit! y
+                (list 'resize_nearest_neighbor (list 'x (%mil-ref x))
+                      (list 'target_size_height target-h) (list 'target_size_width target-w))
+                "resize")))
+
+;; Call-head rename table for the MIL trace pass: covers (tl generic)'s own
+;; vocabulary (bare names) and the literal ggml-/nn:-/tensor:-prefixed names
+;; a model may call directly instead -- both are "the same instructions",
+;; per (tl generic)'s own aliasing (see stdlib/generic.ss).
+(define (%mil-rename op)
+  (case op
+    [(add ggml-add) 'mil-trace:add]
+    [(silu ggml-silu) 'mil-trace:silu]
+    [(sigmoid ggml-sigmoid) 'mil-trace:sigmoid]
+    [(ggml-reshape-2d) 'mil-trace:reshape-2d]
+    [(ggml-reshape-3d) 'mil-trace:reshape-3d]
+    [(ggml-reshape-4d) 'mil-trace:reshape-4d]
+    [(ggml-concat) 'mil-trace:ggml-concat]
+    [(slice tensor:slice) 'mil-trace:tensor-slice]
+    [(concat tensor:concat) 'mil-trace:tensor-concat]
+    [(conv2d nn:conv2d) 'mil-trace:conv2d]
+    [(conv2d-depthwise nn:conv2d-depthwise) 'mil-trace:conv2d-depthwise]
+    [(max-pool nn:max-pool) 'mil-trace:max-pool]
+    [(upsample-nearest nn:upsample-nearest) 'mil-trace:upsample-nearest]
+    [else #f]))
+
+;; (model (inputs [name type dims ...] ...) body ...) or
+;; (model entry (inputs [name type dims ...] ...) body ...): after renaming
+;; the body as usual, injects one (%mil-declare-input! name "name") per
+;; declared input, right before the (renamed) body -- a model's own
+;; parameters are otherwise never %mil-ref-able, since nothing else ever
+;; produces them via %mil-emit!/%mil-declare-weight!.
+(define (%mil-inject-model form)
+  (let*-values ([(entry+spec rest) (values (cadr form) (cddr form))]
+                [(entry spec body)
+                 (if (and (pair? entry+spec) (eq? (car entry+spec) 'inputs))
+                     (values #f entry+spec rest)
+                     (values entry+spec (car rest) (cdr rest)))]
+                [(names) (map car (cdr spec))]
+                ;; A `define`, not a bare expression: internal-body syntax
+                ;; requires every define before any expression. Can't reuse
+                ;; `n` as the bound name (internal defines use letrec*
+                ;; semantics -- that would shadow the outer parameter with an
+                ;; as-yet-unassigned binding of the same name, and the RHS's
+                ;; own reference to `n` would then see that empty binding
+                ;; instead of the real parameter), so each gets its own
+                ;; throwaway name.
+                [(decls) (map (lambda (n)
+                                (list 'define (string->symbol (format "%mil-input-decl-~a" n))
+                                      (list '%mil-declare-input! n (symbol->string n))))
+                              names)]
+                ;; Reset here, not once at load time: %mil-* state is global
+                ;; on the one persistent Scheme thread every model load and
+                ;; run shares (see scheme/mod.rs's with_scheme), so a reset
+                ;; at load time can race another model's still-in-progress
+                ;; run. A model's own graph build is otherwise already
+                ;; serialized per run on that thread, so resetting as the
+                ;; first thing *this* build does keeps this run's trace
+                ;; correctly isolated from any other model's.
+                [(reset) (list 'define '%mil-reset-decl (list '%mil-trace-reset!))])
+    (append (list 'model) (if entry (list entry) '()) (list spec) (list reset) decls (map %mil-compile-form body))))
+
+;; Like `map`, but also handles an improper (dotted) list -- needed since
+;; this walks *every* pair in a form, including a `. rest`-style variadic
+;; parameter list (e.g. yolo11.ss's own `(define (conv x prefix stride .
+;; act?) ...)`), not just call expressions.
+(define (%mil-map-form lst)
+  (if (pair? lst)
+      (cons (%mil-compile-form (car lst)) (%mil-map-form (cdr lst)))
+      (%mil-compile-form lst)))
+
+(define (%mil-compile-form form)
+  (cond
+    [(and (pair? form) (eq? (car form) 'model)) (%mil-inject-model form)]
+    [(and (pair? form) (symbol? (car form)))
+     (cons (or (%mil-rename (car form)) (car form))
+           (%mil-map-form (cdr form)))]
+    [(pair? form) (cons (%mil-compile-form (car form)) (%mil-compile-form (cdr form)))]
+    [else form]))
+
+;; Reads every top-level form from `src`, drops its leading (import ...)
+;; forms (replaced with a fixed import of every library a rename might
+;; target), renames every covered primitive call to its mil-trace: shadow,
+;; and resets the trace state once at load time. The result is ordinary
+;; tensorlisp source: load and run it exactly as-is (real weights, real
+;; inputs) to both get the normal numeric output AND, as a side effect,
+;; populate the trace. `%mil-inject-model` already resets the trace and
+;; declares the model's own inputs; call `(%mil-render! ...)` somewhere in
+;; the (renamed) body (its tensors -- and %weights/%ctx -- are only live
+;; while this graph is being built, so it can't be deferred to `postprocess`)
+;; to have the accumulated MIL program text ready via `$tl-mil-last-render`
+;; once the run returns.
+(define ($tl-compile-generic-to-mil src)
+  (let* ([port (open-input-string src)]
+         [forms (let loop ([acc '()])
+                  (let ([form (read port)])
+                    (if (eof-object? form) (reverse acc) (loop (cons form acc)))))]
+         [body (remp %import-form? forms)]
+         [compiled (map %mil-compile-form body)])
+    (with-output-to-string
+      (lambda ()
+        (write '(import (tl nn) (tl tensor)))
+        (newline)
+        (for-each (lambda (f) (write f) (newline)) compiled)))))
+
+;; Fetches the text `%mil-render!` last stored, from Rust, after a run.
+(define ($tl-mil-last-render) (or %mil-last-render ""))
 
 ;; Host entry points, called from Rust.
 

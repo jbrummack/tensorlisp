@@ -210,6 +210,20 @@ pub struct NodeInfo {
     pub dtype: DType,
     /// ggml order (innermost first).
     pub ne: Vec<i64>,
+    /// Byte strides, ggml order (innermost first), matching `ne`. Needed
+    /// (with `view_offs`) to tell a plain reshape/broadcast apart from a
+    /// strided slice when lowering a `VIEW`-family op to another backend.
+    pub nb: Vec<usize>,
+    /// Byte offset from `view_src`'s base, for `VIEW`/`RESHAPE`-family ops
+    /// that alias another tensor's storage instead of computing a new one
+    /// (0 for ops that compute their own contiguous output).
+    pub view_offs: usize,
+    /// Raw `ggml_tensor.op_params`, as the 16 `i32` slots ggml stores them
+    /// in (`GGML_MAX_OP_PARAMS / sizeof(i32)`). Meaning is op-specific and
+    /// matches ggml's own `ggml_set_op_params_i32`/`_f32` call sites for
+    /// that op (e.g. `CONV_2D`: `[s0, s1, p0, p1, d0, d1]`; `ARANGE`: three
+    /// `f32` bit patterns `[start, stop, step]`) -- see `vendor/ggml/src/ggml.c`.
+    pub op_params: [i32; 16],
     /// Sources: "%3" for node 3, otherwise the tensor's name (weights, inputs).
     pub srcs: Vec<String>,
 }
@@ -735,6 +749,9 @@ fn describe(graph: &Graph) -> GraphInfo {
                     .unwrap_or_default(),
                 dtype: DType((*t).type_),
                 ne: { let ne = (*t).ne; ne[..ggml_n_dims(t) as usize].to_vec() },
+                nb: { let nb = (*t).nb; nb[..ggml_n_dims(t) as usize].to_vec() },
+                view_offs: (*t).view_offs,
+                op_params: (*t).op_params,
                 srcs: { (*t).src }
                     .iter()
                     .filter(|s| !s.is_null())

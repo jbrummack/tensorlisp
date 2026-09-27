@@ -77,7 +77,7 @@ fn mlp_matches_reference_on_ane() {
     let tl_model = Model::load(&path, Device::Cpu).unwrap();
     let info = tl_model.graph(&[("x", vec![batch, 4])], &Taps::default()).unwrap();
 
-    let func = tensorlisp_aot::lower_graph(&path, &info, &[("x", vec![batch as u64, 4])], Opset::Ios17)
+    let (func, output_names) = tensorlisp_aot::lower_graph(&path, &info, &[("x", vec![batch as u64, 4])], Opset::Ios17)
         .expect("lower ggml graph to MIL");
 
     let mut program = Program::new();
@@ -97,7 +97,7 @@ fn mlp_matches_reference_on_ane() {
         .unwrap();
 
     let expected = weights.forward(&x);
-    let actual = &outputs["logits"];
+    let actual = &outputs[&output_names["logits"]];
     let actual_f32 = actual.to_f32();
     assert_eq!(actual_f32.len(), expected.len());
     for (a, e) in actual_f32.iter().zip(expected.iter()) {
