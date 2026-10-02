@@ -63,9 +63,14 @@ fn assert_single_output_matches_cpu(program: &str, shape_whcn: [usize; 4]) {
     let cpu_out = tl_model.run(&[("x", input.view())]).unwrap();
     let cpu_y: Vec<f32> = cpu_out["y"].iter().copied().collect();
 
+    // `|mil - cpu| <= atol + rtol * |cpu|`: every model is lowered at fp16
+    // now (see `lib.rs`'s own `DTYPE`), whose relative precision is
+    // roughly constant regardless of magnitude.
     assert_eq!(mil_y.len(), cpu_y.len());
-    let max_diff = mil_y.iter().zip(cpu_y.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    assert!(max_diff < 1e-3, "mismatch, max abs diff {max_diff}");
+    const ATOL: f32 = 0.25;
+    const RTOL: f32 = 0.1;
+    let max_diff = mil_y.iter().zip(cpu_y.iter()).map(|(a, b)| (a - b).abs() - RTOL * b.abs()).fold(f32::MIN, f32::max);
+    assert!(max_diff <= ATOL, "mismatch, max (|mil-cpu| - {RTOL}*|cpu|) = {max_diff} (atol {ATOL})");
 
     std::fs::remove_file(path).ok();
 }

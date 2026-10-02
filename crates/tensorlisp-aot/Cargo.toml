@@ -8,6 +8,7 @@ tensorlisp = { path = "../tensorlisp" }
 coreml-rs = { path = "../../../coreml-rs" }
 cg-leafnode = { path = "../../../cg-leafnode" }
 thiserror = { workspace = true }
+half = "2.7.1"
 
 [dev-dependencies]
 ndarray = "0.17.2"
