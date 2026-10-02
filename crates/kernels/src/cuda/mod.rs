@@ -20,6 +20,8 @@ use sys::{
     CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, CUDA_SUCCESS, NVRTC_SUCCESS,
 };
 
+pub mod exec;
+pub mod lower;
 pub mod paged_attn;
 pub mod shaders;
 pub mod sys;
@@ -75,6 +77,28 @@ impl Buffer {
         let drv = sys::driver().expect("Buffer outlived the driver");
         let ret = unsafe { (drv.cuMemcpyHtoD_v2)(self.ptr, data.as_ptr() as *const c_void, bytes) };
         assert_eq!(ret, CUDA_SUCCESS, "cuMemcpyHtoD: {}", sys::cu_error_string(ret));
+    }
+
+    /// Blocking host -> device copy to `byte_offset` bytes in.
+    pub fn write_at(&self, byte_offset: usize, data: &[u8]) {
+        assert!(byte_offset + data.len() <= self.len, "write past the end of a {}-byte buffer", self.len);
+        if data.is_empty() {
+            return;
+        }
+        self.set_current();
+        let drv = sys::driver().expect("Buffer outlived the driver");
+        let ret = unsafe {
+            (drv.cuMemcpyHtoD_v2)(self.ptr + byte_offset as CUdeviceptr, data.as_ptr() as *const c_void, data.len())
+        };
+        assert_eq!(ret, CUDA_SUCCESS, "cuMemcpyHtoD: {}", sys::cu_error_string(ret));
+    }
+
+    /// Fills the whole buffer with zero bytes.
+    pub fn zero(&self) {
+        self.set_current();
+        let drv = sys::driver().expect("Buffer outlived the driver");
+        let ret = unsafe { (drv.cuMemsetD8_v2)(self.ptr, 0, self.len) };
+        assert_eq!(ret, CUDA_SUCCESS, "cuMemsetD8: {}", sys::cu_error_string(ret));
     }
 
     /// Blocking device -> host copy of `count` elements from the start.
@@ -161,6 +185,14 @@ pub struct Kernel {
     pub library: Arc<str>,
     pub entry: String,
 }
+
+/// A resolved kernel entry point: launching through it skips the by-name lookup.
+#[derive(Clone, Copy)]
+pub struct Func(CUfunction);
+
+// SAFETY: a CUfunction is an immutable handle into a module that lives as long as the Device.
+unsafe impl Send for Func {}
+unsafe impl Sync for Func {}
 
 struct CompiledLibrary {
     module: CUmodule,
@@ -397,67 +429,57 @@ impl Device {
         Ok(func)
     }
 
+    /// Looks `kernel` up once; pair with [`Device::launch_func`] for replay.
+    pub fn resolve(&self, kernel: &Kernel) -> Result<Func> {
+        self.make_current()?;
+        self.function(kernel).map(Func)
+    }
+
     /// Enqueues one dispatch on the device's stream. `args` are positional,
     /// matching the kernel's parameter list exactly (see [`Arg`]).
     pub fn launch(&self, kernel: &Kernel, args: &[Arg], dims: Dims) -> Result<()> {
         self.make_current()?;
-        let func = self.function(kernel)?;
-        let drv = sys::driver().ok_or(Error::NoDevice)?;
+        let func = Func(self.function(kernel)?);
+        self.launch_func(func, args, dims).map_err(|e| match e {
+            Error::Execution(m) => Error::Execution(format!("launching `{}`: {m}", kernel.entry)),
+            e => e,
+        })
+    }
 
-        if dims.shared > 0 {
+    /// [`Device::launch`] for an already resolved kernel; no allocation, no lookup.
+    pub fn launch_func(&self, func: Func, args: &[Arg], dims: Dims) -> Result<()> {
+        const MAX_ARGS: usize = 32;
+        if args.len() > MAX_ARGS {
+            return Err(Error::Invalid(format!("a launch takes at most {MAX_ARGS} arguments, got {}", args.len())));
+        }
+        self.make_current()?;
+        let drv = sys::driver().ok_or(Error::NoDevice)?;
+        let func = func.0;
+
+        if dims.shared > 48 * 1024 {
             unsafe {
                 (drv.cuFuncSetAttribute)(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dims.shared as i32)
             };
         }
 
-        // Stable backing storage for each arg's bytes; `kernel_params[i]` points
-        // into `storage[i]`, so `storage` must not reallocate after this loop
-        // (reserved up front) and must outlive the `cuLaunchKernel` call below.
-        let mut storage: Vec<[u8; 8]> = Vec::with_capacity(args.len());
-        let mut extra_bytes: Vec<&[u8]> = Vec::new();
-        let mut kernel_params: Vec<*mut c_void> = Vec::with_capacity(args.len());
-        for arg in args {
+        // `kernel_params[i]` points into `storage[i]` (or at a `Bytes` argument
+        // itself); both outlive the `cuLaunchKernel` call below.
+        let mut storage = [[0u8; 8]; MAX_ARGS];
+        let mut kernel_params = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
+        for (i, arg) in args.iter().enumerate() {
             match arg {
-                Arg::Buf(b) => {
-                    let addr: CUdeviceptr = b.buf.ptr + b.offset as CUdeviceptr;
-                    let mut slot = [0u8; 8];
-                    slot[..8].copy_from_slice(&addr.to_ne_bytes());
-                    storage.push(slot);
-                    kernel_params.push(storage.last_mut().unwrap().as_mut_ptr() as *mut c_void);
-                }
-                Arg::NullPtr => {
-                    storage.push([0u8; 8]);
-                    kernel_params.push(storage.last_mut().unwrap().as_mut_ptr() as *mut c_void);
-                }
-                Arg::I32(v) => {
-                    let mut slot = [0u8; 8];
-                    slot[..4].copy_from_slice(&v.to_ne_bytes());
-                    storage.push(slot);
-                    kernel_params.push(storage.last_mut().unwrap().as_mut_ptr() as *mut c_void);
-                }
-                Arg::U32(v) => {
-                    let mut slot = [0u8; 8];
-                    slot[..4].copy_from_slice(&v.to_ne_bytes());
-                    storage.push(slot);
-                    kernel_params.push(storage.last_mut().unwrap().as_mut_ptr() as *mut c_void);
-                }
-                Arg::I64(v) => {
-                    let mut slot = [0u8; 8];
-                    slot.copy_from_slice(&v.to_ne_bytes());
-                    storage.push(slot);
-                    kernel_params.push(storage.last_mut().unwrap().as_mut_ptr() as *mut c_void);
-                }
-                Arg::F32(v) => {
-                    let mut slot = [0u8; 8];
-                    slot[..4].copy_from_slice(&v.to_ne_bytes());
-                    storage.push(slot);
-                    kernel_params.push(storage.last_mut().unwrap().as_mut_ptr() as *mut c_void);
-                }
+                Arg::Buf(b) => storage[i] = (b.buf.ptr + b.offset as CUdeviceptr).to_ne_bytes(),
+                Arg::NullPtr => {}
+                Arg::I32(v) => storage[i][..4].copy_from_slice(&v.to_ne_bytes()),
+                Arg::U32(v) => storage[i][..4].copy_from_slice(&v.to_ne_bytes()),
+                Arg::I64(v) => storage[i] = v.to_ne_bytes(),
+                Arg::F32(v) => storage[i][..4].copy_from_slice(&v.to_ne_bytes()),
                 Arg::Bytes(b) => {
-                    extra_bytes.push(b);
-                    kernel_params.push(extra_bytes.last().unwrap().as_ptr() as *mut c_void);
+                    kernel_params[i] = b.as_ptr() as *mut c_void;
+                    continue;
                 }
             }
+            kernel_params[i] = storage[i].as_mut_ptr() as *mut c_void;
         }
 
         let ret = unsafe {
@@ -475,10 +497,23 @@ impl Device {
                 std::ptr::null_mut(),
             )
         };
-        check(ret).map_err(|e| match e {
-            Error::Execution(m) => Error::Execution(format!("launching `{}`: {m}", kernel.entry)),
-            e => e,
-        })
+        check(ret)
+    }
+
+    /// Largest dynamic shared memory a block may request (opt-in limit).
+    pub fn max_shared_memory(&self) -> u32 {
+        let drv = sys::driver().expect("Device outlived the driver");
+        let mut v = 0;
+        let ret = unsafe { (drv.cuDeviceGetAttribute)(&mut v, sys::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, self.dev) };
+        if ret == CUDA_SUCCESS { v as u32 } else { 48 * 1024 }
+    }
+
+    /// Number of streaming multiprocessors.
+    pub fn sm_count(&self) -> u32 {
+        let drv = sys::driver().expect("Device outlived the driver");
+        let mut v = 0;
+        let ret = unsafe { (drv.cuDeviceGetAttribute)(&mut v, sys::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, self.dev) };
+        if ret == CUDA_SUCCESS { v.max(1) as u32 } else { 16 }
     }
 
     /// Waits for everything enqueued on the device's stream.

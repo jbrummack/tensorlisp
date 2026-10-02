@@ -1,7 +1,7 @@
-//! TIPSv2 (the real port in ports/tipsv2) on the native Metal device against
+//! TIPSv2 (the real port in ports/tipsv2) on the native device (Metal or CUDA) against
 //! the ggml CPU backend. Skipped when the converted weights are not under
 //! models/tipsv2-b14 (see ports/tipsv2/README.md for how to produce them).
-#![cfg(target_os = "macos")]
+#![cfg(native_device)]
 
 use std::path::PathBuf;
 
@@ -88,7 +88,8 @@ fn t5gemma2_generates_the_same_text_as_ggml_metal() {
         let (_, v) = out.iter().find(|(n, _)| n == "text").unwrap();
         v.as_text().unwrap().to_string()
     };
-    let (native, ggml) = (text(Device::Native), text(Device::Gpu));
+    let reference = if cfg!(target_os = "macos") { Device::Gpu } else { Device::Cpu };
+    let (native, ggml) = (text(Device::Native), text(reference));
     assert_eq!(native, ggml);
     assert!(native.contains("Paris"), "{native}");
 }

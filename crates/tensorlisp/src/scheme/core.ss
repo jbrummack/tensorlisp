@@ -168,6 +168,64 @@
     (ggml_build_forward_expand g (%tensor-ptr 'effect t))
     t))
 
+;; Paged attention (the native CUDA device only: other backends fail to compile
+;; these nodes). Both are ggml CUSTOM nodes that nothing computes on ggml; the
+;; native executor reads the parameters from `userdata` (see cuda/lower.rs).
+;; The caches are the vLLM layouts in f16 states, any shape with the right
+;; size: keys [blocks, kv-heads, hs/8, block-size, 8] and values [blocks,
+;; kv-heads, hs, block-size] (elements).
+
+(define %custom-4d
+  (foreign-procedure "ggml_custom_4d" (uptr int integer-64 integer-64 integer-64 integer-64 uptr int uptr int uptr) uptr))
+
+(define (%f32-bits x)
+  (let ([bv (make-bytevector 4)])
+    (bytevector-ieee-single-native-set! bv 0 (inexact x))
+    (bytevector-u32-native-ref bv 0)))
+
+(define (%custom-node who type ne userdata srcs)
+  (let ([arr (foreign-alloc (* 8 (length srcs)))]
+        [ctx (%current-ctx who)])
+    (let loop ([i 0] [s srcs])
+      (unless (null? s)
+        (foreign-set! 'uptr arr (* 8 i) (%unwrap who 'src (car s)))
+        (loop (+ i 1) (cdr s))))
+    (let ([p (%custom-4d ctx type (car ne) (cadr ne) (caddr ne) (cadddr ne) arr (length srcs) 0 1 userdata)])
+      (foreign-free arr)
+      (%wrap who p))))
+
+(define (%paged-userdata who kind kv-heads block-size max-context scale)
+  (unless (and (fixnum? kv-heads) (< 0 kv-heads 16)) (error who "kv-heads must be 1..15" kv-heads))
+  (unless (memv block-size '(8 16 32)) (error who "block-size must be 8, 16 or 32" block-size))
+  (unless (and (fixnum? max-context) (< 0 max-context 65536)) (error who "max-context must be 1..65535" max-context))
+  (+ kind (* kv-heads 16) (* block-size 256) (* max-context 65536) (* (%f32-bits scale) 4294967296)))
+
+;; (paged-attention q key-cache value-cache block-tables context-lens block-size max-context scale [kv-heads])
+;; One query per sequence: q f16 [hs, heads, seqs] (contiguous); block-tables
+;; i32 [max-blocks, seqs] (block ids, row-major per sequence), context-lens i32
+;; [seqs] (keys per sequence, at most max-context). -> f16 [hs, heads, seqs].
+(define paged-attention
+  (case-lambda
+    [(q kc vc tables lens block-size max-context scale) (paged-attention q kc vc tables lens block-size max-context scale 1)]
+    [(q kc vc tables lens block-size max-context scale kv-heads)
+     (let ([ne (let pad ([s (shape q)]) (if (< (length s) 3) (pad (append s '(1))) s))])
+       (%custom-node 'paged-attention GGML_TYPE_F16 (list (car ne) (cadr ne) (caddr ne) 1)
+                     (%paged-userdata 'paged-attention 1 kv-heads block-size max-context scale)
+                     (list q kc vc tables lens)))]))
+
+;; (paged-cache-write key value key-cache value-cache slots block-size [kv-heads])
+;; Writes key and value f16 [hs * kv-heads, tokens] into the caches at slot
+;; block * block-size + offset, slots i32 [2 * tokens] holding one little-endian
+;; i64 per token (the value, then 0; a negative value skips the token). Wrap
+;; the result in (effect ...) so it runs before the attention that reads it.
+(define paged-cache-write
+  (case-lambda
+    [(k v kc vc slots block-size) (paged-cache-write k v kc vc slots block-size 1)]
+    [(k v kc vc slots block-size kv-heads)
+     (%custom-node 'paged-cache-write GGML_TYPE_F16 (list 1 1 1 1)
+                   (%paged-userdata 'paged-cache-write 2 kv-heads block-size 1 1.0)
+                   (list k v kc vc slots))]))
+
 ;; Taps: named intermediate tensors that can be read back on request, e.g. to
 ;; compare them with a reference implementation. (tap name t [rank]) returns t.
 

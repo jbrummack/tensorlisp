@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use crate::cuda::shaders::Module;
-use crate::cuda::{Arg, BufRef, Device, Kernel};
+use crate::cuda::{Arg, BufRef, Buffer, Device, Func, Kernel};
 use crate::{DType, Dims, Error, Result};
 
 /// vLLM's CUDA default (`NUM_THREADS = 128` in `paged_attention_v{1,2}_launcher`);
@@ -88,18 +88,27 @@ pub struct ReshapeAndCache<'a> {
     pub kv_scales: Option<(BufRef<'a>, BufRef<'a>)>,
 }
 
+/// Resolves the `reshape_and_cache` kernel for a dtype pair (compiling it on first use).
+pub fn reshape_and_cache_func(dev: &Device, dtype: DType, cache_dtype: DType, scales: bool) -> Result<Func> {
+    check_dtypes(dtype, cache_dtype, scales)?;
+    let (kv, cache) = (ty(dtype), ty(cache_dtype));
+    let kvdt = kv_dt(scales);
+    let expr = format!("vllm::reshape_and_cache_kernel<{kv},{cache},{kvdt}>");
+    let lib = dev.library(&format!("rac:{kv}:{cache}:{kvdt}"), &[&expr], || Module::ReshapeAndCache.source(""))?;
+    dev.resolve(&kernel(lib, expr))
+}
+
 pub fn reshape_and_cache(dev: &Device, p: &ReshapeAndCache) -> Result<()> {
-    check_dtypes(p.dtype, p.cache_dtype, p.kv_scales.is_some())?;
+    let func = reshape_and_cache_func(dev, p.dtype, p.cache_dtype, p.kv_scales.is_some())?;
+    reshape_and_cache_with(dev, p, func)
+}
+
+/// [`reshape_and_cache`] through a kernel from [`reshape_and_cache_func`].
+pub fn reshape_and_cache_with(dev: &Device, p: &ReshapeAndCache, func: Func) -> Result<()> {
     let x = x(p.cache_dtype);
     if p.head_size % x != 0 {
         return invalid(format!("head_size {} must be a multiple of x = {x}", p.head_size));
     }
-    let (kv, cache) = (ty(p.dtype), ty(p.cache_dtype));
-    let kvdt = kv_dt(p.kv_scales.is_some());
-    let expr = format!("vllm::reshape_and_cache_kernel<{kv},{cache},{kvdt}>");
-    let lib = dev.library(&format!("rac:{kv}:{cache}:{kvdt}"), &[&expr], || Module::ReshapeAndCache.source(""))?;
-    let k = kernel(lib, expr);
-
     let (ks, vs): (Arg, Arg) = match p.kv_scales {
         Some((a, b)) => (a.into(), b.into()),
         None => (Arg::NullPtr, Arg::NullPtr),
@@ -120,7 +129,7 @@ pub fn reshape_and_cache(dev: &Device, p: &ReshapeAndCache) -> Result<()> {
         vs,
     ];
     let threads = (p.num_heads * p.head_size).min(512) as u32;
-    dev.launch(&k, &args, Dims::new([p.num_tokens as u32, 1, 1], [threads, 1, 1]))
+    dev.launch_func(func, &args, Dims::new([p.num_tokens as u32, 1, 1], [threads, 1, 1]))
 }
 
 // ---------------------------------------------------------------------------
@@ -168,33 +177,158 @@ impl PagedAttention<'_> {
         (num_kv_heads * head_size * block_size, head_size * block_size)
     }
 
+    pub fn geometry(&self) -> PagedGeometry {
+        PagedGeometry {
+            dtype: self.dtype,
+            cache_dtype: self.cache_dtype,
+            fp8_scales: self.kv_scales.is_some(),
+            num_seqs: self.num_seqs,
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_size: self.head_size,
+            block_size: self.block_size,
+            max_context_len: self.max_context_len,
+        }
+    }
+}
+
+/// What selects and sizes the kernels of a [`PagedAttention`], without its buffers.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedGeometry {
+    pub dtype: DType,
+    pub cache_dtype: DType,
+    pub fp8_scales: bool,
+    pub num_seqs: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_size: usize,
+    pub block_size: usize,
+    pub max_context_len: usize,
+}
+
+impl PagedGeometry {
     fn use_v1(&self) -> bool {
         let partitions = self.max_context_len.div_ceil(PARTITION_SIZE);
         (partitions == 1 || self.num_seqs * self.num_heads > 512) && PARTITION_SIZE % self.block_size == 0
     }
+
+    /// Validates the geometry and resolves the kernels (compiling them on first use).
+    pub fn prepare(&self, dev: &Device) -> Result<PagedPrepared> {
+        PagedAttention::prepare_geometry(self, dev)
+    }
+
+    pub fn scratch(&self, dev: &Device) -> Result<PagedScratch> {
+        PagedScratch::new(dev, self.dtype, self.num_seqs, self.num_heads, self.head_size, self.max_context_len)
+    }
+}
+
+/// The v2 kernel's partial results; allocate once with [`PagedAttention::scratch`]
+/// to launch repeatedly without allocating (and freeing) three buffers per call.
+pub struct PagedScratch {
+    exp_sums: Buffer,
+    max_logits: Buffer,
+    tmp_out: Buffer,
+}
+
+impl PagedScratch {
+    pub fn new(dev: &Device, dtype: DType, num_seqs: usize, num_heads: usize, head_size: usize, max_context_len: usize) -> Result<Self> {
+        let rows = num_seqs * num_heads;
+        let partitions = max_context_len.div_ceil(PARTITION_SIZE);
+        let elem = size_of::<f32>();
+        Ok(PagedScratch {
+            exp_sums: dev.alloc(rows * partitions * elem)?,
+            max_logits: dev.alloc(rows * partitions * elem)?,
+            tmp_out: dev.alloc(rows * partitions * head_size * dtype.size())?,
+        })
+    }
+}
+
+impl PagedAttention<'_> {
+    pub fn scratch(&self, dev: &Device) -> Result<PagedScratch> {
+        PagedScratch::new(dev, self.dtype, self.num_seqs, self.num_heads, self.head_size, self.max_context_len)
+    }
 }
 
 pub fn paged_attention(dev: &Device, p: &PagedAttention) -> Result<()> {
-    check_dtypes(p.dtype, p.cache_dtype, p.kv_scales.is_some())?;
-    if !HEAD_SIZES.contains(&p.head_size) {
-        return invalid(format!("unsupported head_size {} (have {HEAD_SIZES:?})", p.head_size));
-    }
-    if !BLOCK_SIZES.contains(&p.block_size) {
-        return invalid(format!("unsupported block_size {} (have {BLOCK_SIZES:?})", p.block_size));
-    }
-    if p.num_kv_heads == 0 || p.num_heads % p.num_kv_heads != 0 {
-        return invalid("num_heads must be a multiple of num_kv_heads");
-    }
-    let v1 = p.use_v1();
-    let (t, c, hs, bs) = (ty(p.dtype), ty(p.cache_dtype), p.head_size, p.block_size);
-    let kvdt = kv_dt(p.kv_scales.is_some());
+    paged_attention_with(dev, p, None)
+}
 
-    let v1_expr = format!("vllm::paged_attention_v1_kernel<{t},{c},{kvdt},{hs},{bs},{NUM_THREADS}>");
-    let v2_expr = format!("vllm::paged_attention_v2_kernel<{t},{c},{kvdt},{hs},{bs},{NUM_THREADS},{PARTITION_SIZE}>");
-    let reduce_expr = format!("vllm::paged_attention_v2_reduce_kernel<{t},{hs},{NUM_THREADS},{PARTITION_SIZE}>");
-    let exprs: Vec<&str> = if v1 { vec![&v1_expr] } else { vec![&v2_expr, &reduce_expr] };
-    let lib = dev.library(&format!("pa:{t}:{c}:{kvdt}:{hs}:{bs}:{v1}"), &exprs, || Module::PagedAttention.source(""))?;
+/// A paged-attention launch with its kernels resolved, for replaying the same
+/// geometry many times without the by-name lookups.
+pub struct PagedPrepared {
+    v1: bool,
+    main: Func,
+    reduce: Option<Func>,
+    shared: usize,
+    reduce_shared: usize,
+    partitions: usize,
+}
 
+impl PagedAttention<'_> {
+    pub fn prepare(&self, dev: &Device) -> Result<PagedPrepared> {
+        self.geometry().prepare(dev)
+    }
+
+    fn prepare_geometry(p: &PagedGeometry, dev: &Device) -> Result<PagedPrepared> {
+        check_dtypes(p.dtype, p.cache_dtype, p.fp8_scales)?;
+        if !HEAD_SIZES.contains(&p.head_size) {
+            return invalid(format!("unsupported head_size {} (have {HEAD_SIZES:?})", p.head_size));
+        }
+        if !BLOCK_SIZES.contains(&p.block_size) {
+            return invalid(format!("unsupported block_size {} (have {BLOCK_SIZES:?})", p.block_size));
+        }
+        if p.num_kv_heads == 0 || p.num_heads % p.num_kv_heads != 0 {
+            return invalid("num_heads must be a multiple of num_kv_heads");
+        }
+        let v1 = p.use_v1();
+        let (t, c, hs, bs) = (ty(p.dtype), ty(p.cache_dtype), p.head_size, p.block_size);
+        let kvdt = kv_dt(p.fp8_scales);
+
+        let v1_expr = format!("vllm::paged_attention_v1_kernel<{t},{c},{kvdt},{hs},{bs},{NUM_THREADS}>");
+        let v2_expr = format!("vllm::paged_attention_v2_kernel<{t},{c},{kvdt},{hs},{bs},{NUM_THREADS},{PARTITION_SIZE}>");
+        let reduce_expr = format!("vllm::paged_attention_v2_reduce_kernel<{t},{hs},{NUM_THREADS},{PARTITION_SIZE}>");
+        let exprs: Vec<&str> = if v1 { vec![&v1_expr] } else { vec![&v2_expr, &reduce_expr] };
+        let lib = dev.library(&format!("pa:{t}:{c}:{kvdt}:{hs}:{bs}:{v1}"), &exprs, || Module::PagedAttention.source(""))?;
+
+        let elem = size_of::<f32>();
+        let num_warps = (NUM_THREADS / WARP_SIZE) as usize;
+        let outputs_size = (num_warps / 2) * hs * elem;
+        let partitions = p.max_context_len.div_ceil(PARTITION_SIZE);
+        if v1 {
+            let padded = p.max_context_len.div_ceil(bs) * bs;
+            return Ok(PagedPrepared {
+                v1,
+                main: dev.resolve(&kernel(lib, v1_expr))?,
+                reduce: None,
+                shared: (padded * elem).max(outputs_size),
+                reduce_shared: 0,
+                partitions,
+            });
+        }
+        Ok(PagedPrepared {
+            v1,
+            main: dev.resolve(&kernel(lib.clone(), v2_expr))?,
+            reduce: Some(dev.resolve(&kernel(lib, reduce_expr))?),
+            shared: (PARTITION_SIZE * elem).max(outputs_size),
+            reduce_shared: 2 * partitions * elem,
+            partitions,
+        })
+    }
+}
+
+/// [`paged_attention`] with caller-owned v2 scratch (ignored by v1).
+pub fn paged_attention_with(dev: &Device, p: &PagedAttention, scratch: Option<&PagedScratch>) -> Result<()> {
+    let prepared = p.prepare(dev)?;
+    paged_attention_prepared(dev, p, &prepared, scratch)
+}
+
+/// Launches `p` with kernels from `p.prepare`; `p` must have the geometry it was prepared with.
+pub fn paged_attention_prepared(
+    dev: &Device,
+    p: &PagedAttention,
+    prep: &PagedPrepared,
+    scratch: Option<&PagedScratch>,
+) -> Result<()> {
     let (ks, vs): (Arg, Arg) = match p.kv_scales {
         Some((a, b)) => (a.into(), b.into()),
         None => (Arg::NullPtr, Arg::NullPtr),
@@ -202,14 +336,7 @@ pub fn paged_attention(dev: &Device, p: &PagedAttention) -> Result<()> {
     let alibi: Arg = p.alibi_slopes.into();
     let sinks: Arg = p.sinks.into();
 
-    let elem = size_of::<f32>();
-    let num_warps = (NUM_THREADS / WARP_SIZE) as usize;
-    let outputs_size = (num_warps / 2) * hs * elem;
-
-    if v1 {
-        let padded = p.max_context_len.div_ceil(bs) * bs;
-        let shared = (padded * elem).max(outputs_size);
-        let k = kernel(lib, v1_expr);
+    if prep.v1 {
         let args = [
             p.out.into(),
             p.q.into(),
@@ -229,26 +356,26 @@ pub fn paged_attention(dev: &Device, p: &PagedAttention) -> Result<()> {
             vs,
             sinks,
         ];
-        return dev.launch(
-            &k,
+        return dev.launch_func(
+            prep.main,
             &args,
-            Dims::new([p.num_heads as u32, p.num_seqs as u32, 1], [NUM_THREADS, 1, 1]).shared(shared as u32),
+            Dims::new([p.num_heads as u32, p.num_seqs as u32, 1], [NUM_THREADS, 1, 1]).shared(prep.shared as u32),
         );
     }
 
     // v2: per-partition partial results, then a reduction over partitions.
-    let rows = p.num_seqs * p.num_heads;
-    let partitions = p.max_context_len.div_ceil(PARTITION_SIZE);
-    let exp_sums = dev.alloc(rows * partitions * elem)?;
-    let max_logits = dev.alloc(rows * partitions * elem)?;
-    let tmp_out = dev.alloc(rows * partitions * hs * p.dtype.size())?;
-
-    let shared = (PARTITION_SIZE * elem).max(outputs_size);
-    let main = kernel(lib.clone(), v2_expr);
+    let owned;
+    let PagedScratch { exp_sums, max_logits, tmp_out } = match scratch {
+        Some(s) => s,
+        None => {
+            owned = p.scratch(dev)?;
+            &owned
+        }
+    };
     let args = [
-        (&exp_sums).into(),
-        (&max_logits).into(),
-        (&tmp_out).into(),
+        exp_sums.into(),
+        max_logits.into(),
+        tmp_out.into(),
         p.q.into(),
         p.k_cache.into(),
         p.v_cache.into(),
@@ -266,27 +393,26 @@ pub fn paged_attention(dev: &Device, p: &PagedAttention) -> Result<()> {
         vs,
         sinks,
     ];
-    dev.launch(
-        &main,
+    dev.launch_func(
+        prep.main,
         &args,
-        Dims::new([p.num_heads as u32, p.num_seqs as u32, partitions as u32], [NUM_THREADS, 1, 1]).shared(shared as u32),
+        Dims::new([p.num_heads as u32, p.num_seqs as u32, prep.partitions as u32], [NUM_THREADS, 1, 1])
+            .shared(prep.shared as u32),
     )?;
 
-    let reduce = kernel(lib, reduce_expr);
-    let reduce_shared = 2 * partitions * elem;
     let rargs = [
         p.out.into(),
-        (&exp_sums).into(),
-        (&max_logits).into(),
-        (&tmp_out).into(),
+        exp_sums.into(),
+        max_logits.into(),
+        tmp_out.into(),
         p.context_lens.into(),
-        Arg::I32(partitions as i32),
+        Arg::I32(prep.partitions as i32),
         sinks,
     ];
-    dev.launch(
-        &reduce,
+    dev.launch_func(
+        prep.reduce.expect("v2 has a reduce kernel"),
         &rargs,
-        Dims::new([p.num_heads as u32, p.num_seqs as u32, 1], [NUM_THREADS, 1, 1]).shared(reduce_shared as u32),
+        Dims::new([p.num_heads as u32, p.num_seqs as u32, 1], [NUM_THREADS, 1, 1]).shared(prep.reduce_shared as u32),
     )
 }
 

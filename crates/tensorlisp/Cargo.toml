@@ -5,7 +5,10 @@ edition.workspace = true
 description = "Runtime: loads a tensorlisp program + weights from GGUF and runs it on ggml."
 
 [features]
-cuda = ["ggml-sys/cuda"]
+# ggml's CUDA backend (Device::Gpu) plus the native CUDA executor.
+cuda = ["ggml-sys/cuda", "native-cuda"]
+# Only the native CUDA executor (Device::Native), no nvcc build of ggml-cuda.
+native-cuda = ["dep:tensorlisp-kernels"]
 
 [dependencies]
 chez.workspace = true
@@ -18,3 +21,6 @@ image = "0.25.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tensorlisp-kernels = { path = "../kernels" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tensorlisp-kernels = { path = "../kernels", features = ["cuda"], optional = true }

@@ -7,9 +7,8 @@ the upstream host code does.
 
 Status: **Metal launcher, ggml-Metal interop and the native Metal executor
 (`--device native`, below) implemented and tested**; **CUDA launcher and
-paged-attention kernels implemented and tested** (RTX 3080, sm_86, driver
-591.86 / CUDA 12.8); ggml-cuda interop and a native CUDA executor are not
-started.
+paged-attention kernels and the native CUDA executor implemented and tested**
+(RTX 3080, sm_86, driver 591.86 / CUDA 12.8); ggml-cuda interop is not started.
 
 ## Model
 
@@ -161,10 +160,89 @@ deviations from the plan this section used to describe are called out inline.
    exporting `ggml_backend_cuda_context::stream()`, same shape as
    `metal_interop.*`), fp8 KV cache (the fp8 conversion paths are vendored but
    gated behind `ENABLE_FP8`, which nothing defines yet), ALiBi/sinks (wired
-   through but untested — no port needs them yet), and a native CUDA executor
-   (the `--device native` equivalent; CUDA has nothing like `metal/lower.rs`
-   or `scheme/native.ss` yet, so there's no op coverage to speak of beyond
-   paged attention).
+   through but untested — no port needs them yet).
+8. **Native CUDA executor** (`cuda/exec.rs`, `cuda/lower.rs`,
+   `cuda/native/{common.cuh,core.cu,mm.cu,fa.cu}`; `tensorlisp` feature
+   `native-cuda`, or `cuda` which also builds ggml-cuda): the counterpart of
+   the native Metal executor, same IR/planner (`graph.rs`, `plan.rs`), same
+   `--device native`. Unlike Metal there is no ggml kernel library to reuse,
+   so every op is our own NVRTC kernel with one uniform signature
+   `(Op op, src0..src3, dst)`: `Op` is a 456-byte by-value descriptor holding
+   shape/strides/type of up to five tensors plus 12 scalar slots (floats as
+   bit patterns), packed per op in `lower.rs`. One launch per node, no fusion,
+   scratch memory only for split-KV attention (below). Matmul (`mm.cu`, specialized per weight type, f32
+   accumulate, dequantizing on the fly for f16/bf16/Q4_0..Q8_0/K-quants) is
+   chosen in Rust (`mm_vec` warp-per-row for N <= 8, else a 64x64x16
+   shared-memory tile); flash attention (`fa.cu`) is an online-softmax block
+   per (query, head, batch), f32 Q, any plain/quantized K and V, f16 mask,
+   logit softcap, ALiBi, GQA. Not supported (reported by name at compile
+   time like Metal): xielu, mrope/vision rope, circular pad, soft_max/FA
+   sinks, quantized cpy destinations, FA head size above 512.
+   Verified by `crates/tensorlisp/tests/native.rs` (op families) and
+   `native_tips.rs` (TIPSv2 text/vision, YOLO11n, PP-OCRv6, T5Gemma2
+   generation) against the ggml CPU backend, plus
+   `crates/kernels/tests/native_cuda_compile.rs` (every library builds).
+   RTX 3080, release: TIPSv2 vision f16 224px 17.6 ms (ggml CPU 3.8 s),
+   YOLO11n 640px 9.8 ms (CPU 592 ms), T5Gemma2 greedy "Paris" identical to
+   the CPU backend. Matmul is plain fp32 FMA (no tensor cores yet); WMMA
+   tiles and vectorized quantized matvec are the obvious next steps.
+
+   Split-KV decoding: a one-query flash attention over >= 256 keys (the
+   T5Gemma2 decode step, 4 heads x 1088 cache rows) would run on nh * nb
+   blocks, 4 of 68 SMs. It lowers instead to `fa_split` (grid P x nh x nb,
+   each block an online softmax over a slice of >= 64 keys; slices whose mask
+   is all -inf, i.e. unused cache rows, exit at once) plus `fa_reduce`
+   merging the (max, sum, acc) partials, which live in planned arena scratch.
+   This is the structure of the paged-attention v2 kernel, reading ggml's
+   `[hd, rows]` KV state tensors directly instead of vLLM's block-table
+   layouts (those need a layout the ggml graph does not produce, so
+   `cuda::paged_attn` stays a standalone launcher). `TL_NATIVE_FA=plain`
+   disables it; `TL_NATIVE_TIME=1` / `TL_NATIVE_PROFILE=1` print per-run wall
+   time / per-op time (syncing after each launch).
+   T5Gemma2 f16 decode step (median, RTX 3080): one block per head 12.0 ms,
+   split-KV 6.5 ms (83 -> 153 tokens/s, same tokens), unfused
+   matmul + softmax + matmul 7.0 ms. Attention itself went 6.2 -> 1.0 ms of
+   a step.
+   Paged attention (vLLM kernel, f16 cache, 128 threads) on the same geometry,
+   `tests/decode_attn_bench.rs` (`--ignored`, kernel time with launches queued,
+   paged given only the valid keys as a compacted block table): one block per
+   head 230 us, split-KV 28 us, paged 27 us with all 1088 rows valid; with 20
+   valid keys 26 us vs 10 us; 290 valid 25 us vs 16 us; 8192 rows 74 us vs
+   39 us. So paged attention only wins where it can skip keys through the
+   block table, worth about 0.3 ms of a 6.5 ms T5Gemma2 step, and it would
+   need the KV caches in vLLM's layout rather than ggml state tensors.
+
+   Paged attention inside the native executor (CUDA only): Scheme's
+   `(paged-attention q key-cache value-cache tables lens block-size max-context scale [kv-heads])`
+   and `(paged-cache-write key value key-cache value-cache slots block-size [kv-heads])`
+   (core.ss) build ggml `CUSTOM` nodes with no ggml function; the kind, kv heads,
+   block size, max context and scale travel packed in the node's `userdata`
+   (`op_params[4..6]`) and `lower.rs::Ctx::custom` turns them into the vendored
+   vLLM kernels (`Custom::PagedAttention` / `Custom::CacheWrite` dispatches, kernel
+   handles and v2 scratch resolved once at compile time). Pools are f16 states with
+   vLLM's layouts (`[blocks, kv_heads, hs/8, bs, 8]` keys, `[blocks, kv_heads, hs, bs]`
+   values; any state shape of the right size); block tables and context lengths are
+   i32 inputs, slot mappings are one i64 per token written as two i32. Other
+   devices fail to compile these nodes by name. `ports/t5gemma2/concurrency.ss`
+   (appended to t5gemma2.ss by `tests/native_concurrency.rs`) has the batched
+   entries `decode-dense` / `decode-paged`; both give the same tokens as the
+   single-sequence `decode-step` (4 prompts of 6 to 206 tokens).
+   Aggregate throughput, T5Gemma2 f16, RTX 3080, 32 generated tokens per
+   sequence, host loop included, tokens/s:
+
+   | sequences | decode-step per sequence | dense batch | paged batch |
+   |---|---|---|---|
+   | 1 | 83-150 | 168 | 164 (long) / 160 (short) |
+   | 4 | | 488-497 | 497 |
+   | 16 | | 777-781 | 836-862 |
+   | 64 | | 2281-2285 | 3027 (956-token prompts) / 3302 (6-token prompts) |
+
+   The single-sequence number is noisy (6.7-12 ms per step between runs). Batching
+   is the big win (about 15-25x at 64 sequences). Paged beats dense by 1.3x
+   (long prompts) to 1.45x (short prompts) at 64 sequences, mostly by reading only
+   each sequence's own keys, and holds 0.8 MiB per short sequence instead of the
+   dense 19 MiB (17 MiB when prompts fill the cache). Run with
+   `cargo test --release -p tensorlisp --features native-cuda --test native_concurrency -- --ignored --nocapture`.
 
 ## Using it from Scheme (next step)
 

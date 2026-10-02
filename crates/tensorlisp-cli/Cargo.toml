@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [features]
 cuda = ["tensorlisp/cuda"]
+native-cuda = ["tensorlisp/native-cuda"]
 
 [dependencies]
 tensorlisp = { path = "../tensorlisp" }

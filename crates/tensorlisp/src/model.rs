@@ -261,10 +261,10 @@ struct Inner {
     state_buffer: ggml_backend_buffer_t,
     /// Per entry, created on first use.
     graphs: HashMap<String, EntryGraph>,
-    /// The native Metal device and its compiled graphs, per entry (`Device::Native`).
-    #[cfg(target_os = "macos")]
+    /// The native device (Metal or CUDA) and its compiled graphs, per entry (`Device::Native`).
+    #[cfg(native_device)]
     native: Option<crate::native::Native>,
-    #[cfg(target_os = "macos")]
+    #[cfg(native_device)]
     native_graphs: HashMap<String, (GraphKey, crate::native::NativeProgram)>,
     /// Set when an assertion fired during compute.
     poisoned: Option<String>,
@@ -341,19 +341,19 @@ impl Model {
             states: null_mut(),
             state_buffer: null_mut(),
             graphs: HashMap::new(),
-            #[cfg(target_os = "macos")]
+            #[cfg(native_device)]
             native: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(native_device)]
             native_graphs: HashMap::new(),
             poisoned: None,
         };
         if device == Device::Native {
-            #[cfg(target_os = "macos")]
+            #[cfg(native_device)]
             {
                 inner.native = Some(crate::native::Native::load(&inner.file, path)?);
             }
-            #[cfg(not(target_os = "macos"))]
-            return Err(Error::Backend("the native Metal device needs macOS".into()));
+            #[cfg(not(native_device))]
+            return Err(Error::Backend("the native device needs macOS (Metal) or the `cuda` feature".into()));
         } else {
             inner.weights = guard::alloc_ctx_tensors(inner.file.tensors, inner.backends[0])?;
             if inner.weights.is_null() && inner.file.tensor_count() > 0 {
@@ -391,7 +391,7 @@ impl Model {
     /// Zeroes every `(define-state ...)` tensor, as after loading.
     pub fn reset_state(&self) {
         let inner = self.inner.lock().unwrap();
-        #[cfg(target_os = "macos")]
+        #[cfg(native_device)]
         if let Some(native) = &inner.native {
             native.reset_state();
         }
@@ -566,7 +566,7 @@ impl Model {
     /// Name of the primary backend, e.g. "MTL0" or "CPU".
     pub fn device_name(&self) -> String {
         let inner = self.inner.lock().unwrap();
-        #[cfg(target_os = "macos")]
+        #[cfg(native_device)]
         if let Some(native) = &inner.native {
             return native.device_name();
         }
@@ -598,7 +598,7 @@ impl Model {
                 "the model is unusable after an earlier ggml assertion during compute ({reason}); load it again"
             )));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(native_device)]
         if inner.native.is_some() {
             return inner.run_native(name, spec, &ordered, key);
         }
@@ -826,8 +826,8 @@ fn check_shape(spec: &InputSpec, shape: &[usize]) -> Result<()> {
 }
 
 impl Inner {
-    /// Runs entry `name` on the native Metal device: compiles its graph for these shapes if needed, then replays it.
-    #[cfg(target_os = "macos")]
+    /// Runs entry `name` on the native device: compiles its graph for these shapes if needed, then replays it.
+    #[cfg(native_device)]
     fn run_native(&mut self, name: &str, spec: &EntrySpec, ordered: &[&ArrayViewD<f32>], key: GraphKey) -> Result<RunOutput> {
         if self.native_graphs.get(name).is_none_or(|(k, _)| *k != key) {
             let graph = self.build_graph(name, &key.0, &key.1)?;
@@ -874,7 +874,7 @@ impl Inner {
             let name = std::ffi::CString::new(spec.name.as_str()).map_err(|_| Error::Program("bad state name".into()))?;
             unsafe { ggml_set_name(t, name.as_ptr()) };
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(native_device)]
         if let Some(native) = &mut self.native {
             return native.alloc_states(self.states);
         }
@@ -933,9 +933,9 @@ impl Inner {
         if ctx.is_null() {
             return Err(Error::Backend("failed to create the graph context".into()));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(native_device)]
         let native = self.native.is_some();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(native_device))]
         let native = false;
         let device = if !native && unsafe { ggml_backend_is_cpu(self.backends[0]) } { "cpu" } else { "gpu" };
         match self.program.build(entry, ctx, self.file.tensors, self.states, device, &input_dims, GRAPH_SIZE, taps) {

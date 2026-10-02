@@ -1,6 +1,6 @@
 //! The native Metal device (tensorlisp's own executor) against the ggml CPU
 //! backend and straightforward Rust references, op family by op family.
-#![cfg(target_os = "macos")]
+#![cfg(native_device)]
 
 use std::path::PathBuf;
 
@@ -150,8 +150,10 @@ fn elementwise_norms_and_reductions() {
 #[test]
 fn attention_masks_and_flash() {
     // 4 query heads sharing 2 K/V heads; 5 queries (vector flash kernel), then 40 (matrix flash kernel),
-    // K/V lengths that are and are not multiples of the kernels' cache block.
-    for (nq, nk) in [(5usize, 6usize), (40, 70), (40, 64), (3, 100)] {
+    // K/V lengths that are and are not multiples of the kernels' cache block; one
+    // query over 1000 and 777 keys takes the CUDA split-KV decode path (batch 1 has only 5
+    // valid keys, so most of its slices are fully masked).
+    for (nq, nk) in [(5usize, 6usize), (40, 70), (40, 64), (3, 100), (1, 1000), (1, 777)] {
         let program = format!(
             r#"
           (import (tl attn))

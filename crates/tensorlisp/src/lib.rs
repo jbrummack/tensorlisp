@@ -15,7 +15,13 @@ pub mod error;
 pub mod gguf;
 mod guard;
 mod host;
+#[cfg(native_device)]
+mod native_ir;
 #[cfg(target_os = "macos")]
+#[path = "native_metal.rs"]
+mod native;
+#[cfg(all(feature = "native-cuda", not(target_os = "macos")))]
+#[path = "native_cuda.rs"]
 mod native;
 pub mod log;
 pub mod model;

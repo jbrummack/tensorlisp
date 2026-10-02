@@ -52,7 +52,7 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
     /// A graph node with an op (or op configuration) the backend can't lower yet.
-    #[error("native Metal: {op} `{node}`: {why}")]
+    #[error("native backend: {op} `{node}`: {why}")]
     Unsupported { op: String, node: String, why: String },
 }
 

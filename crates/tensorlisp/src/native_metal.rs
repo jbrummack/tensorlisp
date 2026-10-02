@@ -9,7 +9,6 @@
 
 use std::{
     collections::HashMap,
-    ffi::CStr,
     fs::File,
     path::Path,
     sync::{Arc, Mutex},
@@ -19,7 +18,6 @@ use chez::Value;
 use ggml_sys::ffi::*;
 use tensorlisp_kernels::{
     Const,
-    graph::{Graph as IrGraph, Storage, Tensor as IrTensor, TensorId, Ty},
     metal::{
         Buffer, Device as KDevice,
         exec::{Executor, Program, Shared},
@@ -32,12 +30,9 @@ use tensorlisp_kernels::{
 use crate::{
     error::{Error, Result},
     gguf::GgufFile,
+    native_ir::{backend_err, lower_graph, read_results, Lowered, Results},
     scheme,
 };
-
-fn backend_err(e: tensorlisp_kernels::Error) -> Error {
-    Error::Backend(e.to_string())
-}
 
 /// Weights, states and the compiled executor of one model.
 pub(crate) struct Native {
@@ -130,13 +125,8 @@ impl Native {
 /// A compiled graph with what is needed to feed and read it.
 pub(crate) struct NativeProgram {
     program: Program,
-    /// Result name, tensor, ndarray-order shape.
-    outputs: Vec<(String, TensorId, Vec<usize>)>,
-    taps: Vec<(String, TensorId, Vec<usize>)>,
-}
-
-fn name_of(t: *const ggml_tensor) -> String {
-    unsafe { CStr::from_ptr(ggml_get_name(t)) }.to_string_lossy().into_owned()
+    outputs: Results,
+    taps: Results,
 }
 
 impl NativeProgram {
@@ -148,84 +138,11 @@ impl NativeProgram {
         outputs: &[(String, *mut ggml_tensor, usize)],
         taps: &[(String, *mut ggml_tensor, usize)],
     ) -> Result<NativeProgram> {
-        let mut ir = IrGraph::default();
-        let mut ids: HashMap<*mut ggml_tensor, TensorId> = HashMap::new();
-
-        // Every tensor the nodes touch, nodes first and in order.
-        let n = unsafe { ggml_graph_n_nodes(graph) };
-        let mut order: Vec<*mut ggml_tensor> = Vec::new();
-        let mut register = |t: *mut ggml_tensor, order: &mut Vec<*mut ggml_tensor>| {
-            if !t.is_null() && !ids.contains_key(&t) {
-                ids.insert(t, order.len());
-                order.push(t);
-            }
-        };
-        for i in 0..n {
-            register(unsafe { ggml_graph_node(graph, i) }, &mut order);
-        }
-        let mut cursor = 0;
-        while cursor < order.len() {
-            let t = order[cursor];
-            cursor += 1;
-            let (srcs, view_src) = unsafe { ((*t).src, (*t).view_src) };
-            for s in srcs {
-                register(s, &mut order);
-            }
-            register(view_src, &mut order);
-        }
-        for (_, t, _) in outputs.iter().chain(taps) {
-            register(*t, &mut order);
-        }
-
-        let input_index: HashMap<*mut ggml_tensor, usize> = inputs.iter().enumerate().map(|(i, &t)| (t, i)).collect();
-        for &t in &order {
-            let r = unsafe { &*t };
-            let storage = if !r.view_src.is_null() {
-                Storage::Temp
-            } else if let Some(&w) = native.weight_index.get(&(t as usize)) {
-                Storage::Weight(w)
-            } else if let Some(&s) = native.state_index.get(&(t as usize)) {
-                Storage::State(s)
-            } else if let Some(&i) = input_index.get(&t) {
-                Storage::Input(i)
-            } else {
-                Storage::Temp
-            };
-            ir.tensors.push(IrTensor {
-                ty: Ty(r.type_ as u32),
-                ne: r.ne,
-                nb: [r.nb[0] as u64, r.nb[1] as u64, r.nb[2] as u64, r.nb[3] as u64],
-                op: unsafe { CStr::from_ptr(ggml_op_name(r.op)) }.to_string_lossy().into_owned(),
-                op_params: r.op_params,
-                src: r.src.iter().map(|&s| ids.get(&s).copied()).collect(),
-                view_src: ids.get(&r.view_src).copied(),
-                view_offs: r.view_offs as u64,
-                storage,
-                name: name_of(t),
-            });
-        }
-        ir.nodes = (0..n as usize).collect();
-        ir.keep = outputs.iter().chain(taps).map(|(_, t, _)| ids[t]).collect();
-
-        if std::env::var_os("TL_NATIVE_TRACE").is_some() {
-            let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
-            for &id in &ir.nodes {
-                *counts.entry(ir.tensors[id].op.as_str()).or_default() += 1;
-            }
-            eprintln!("native graph: {} nodes: {counts:?}", ir.nodes.len());
-        }
+        let Lowered { ir, outputs, taps } =
+            lower_graph(graph, inputs, outputs, taps, &native.weight_index, &native.state_index);
         let leaves = Leaves { weights: &native.weight_loc, states: &native.state_offsets };
         let program = native.exec.compile(ir, &leaves, &native.matmul).map_err(backend_err)?;
-
-        let shape = |t: *mut ggml_tensor, rank: usize| -> Vec<usize> {
-            let ne = unsafe { (*t).ne };
-            (0..rank).rev().map(|i| ne[i] as usize).collect()
-        };
-        Ok(NativeProgram {
-            program,
-            outputs: outputs.iter().map(|(name, t, rank)| (name.clone(), ids[t], shape(*t, *rank))).collect(),
-            taps: taps.iter().map(|(name, t, rank)| (name.clone(), ids[t], shape(*t, *rank))).collect(),
-        })
+        Ok(NativeProgram { program, outputs, taps })
     }
 
     pub fn set_input(&self, i: usize, data: &[u8]) -> Result<()> {
@@ -236,26 +153,12 @@ impl NativeProgram {
         self.program.run(&Shared { weights: &native.weights, state: &native.state }).map_err(backend_err)
     }
 
-    fn read(&self, results: &[(String, TensorId, Vec<usize>)]) -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
-        results
-            .iter()
-            .map(|(name, id, shape)| {
-                let n: usize = shape.iter().product();
-                let bytes = self.program.read(*id, n * 4).map_err(backend_err)?;
-                let data: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_ne_bytes(c.try_into().unwrap())).collect();
-                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(shape), data)
-                    .map(|a| (name.clone(), a))
-                    .map_err(|e| Error::Backend(format!("{name}: {e}")))
-            })
-            .collect()
-    }
-
     pub fn outputs(&self) -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
-        self.read(&self.outputs)
+        read_results(&self.outputs, |id, n| self.program.read(id, n))
     }
 
     pub fn taps(&self) -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
-        self.read(&self.taps)
+        read_results(&self.taps, |id, n| self.program.read(id, n))
     }
 }
 

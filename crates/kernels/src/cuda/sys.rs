@@ -63,6 +63,7 @@ driver_api! {
     cuCtxSetCurrent: fn(ctx: CUcontext) -> CUresult,
     cuMemAlloc_v2: fn(ptr: *mut CUdeviceptr, bytesize: usize) -> CUresult,
     cuMemFree_v2: fn(ptr: CUdeviceptr) -> CUresult,
+    cuMemsetD8_v2: fn(dst: CUdeviceptr, value: u8, n: usize) -> CUresult,
     cuMemcpyHtoD_v2: fn(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult,
     cuMemcpyDtoH_v2: fn(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult,
     cuModuleLoadDataEx: fn(
@@ -99,6 +100,7 @@ pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 
 macro_rules! nvrtc_api {
     ($( $name:ident : fn($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty ),* $(,)?) => {

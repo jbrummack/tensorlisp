@@ -66,7 +66,7 @@ impl Module {
 const SKIP_SYSTEM_HEADERS: &[&str] =
     &["stdint.h", "cstdint", "stdio.h", "float.h", "assert.h", "cassert", "type_traits", "algorithm", "mutex", "vector", "map"];
 
-const PRELUDE: &str = "\
+pub(crate) const PRELUDE: &str = "\
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
 typedef short int16_t;
