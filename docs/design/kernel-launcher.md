@@ -6,7 +6,10 @@ wrappers on top (`metal::paged_attn`) pick the kernel variant and grid the way
 the upstream host code does.
 
 Status: **Metal launcher, ggml-Metal interop and the native Metal executor
-(`--device native`, below) implemented and tested**, **CUDA planned, untested**.
+(`--device native`, below) implemented and tested**; **CUDA launcher and
+paged-attention kernels implemented and tested** (RTX 3080, sm_86, driver
+591.86 / CUDA 12.8); ggml-cuda interop and a native CUDA executor are not
+started.
 
 ## Model
 
@@ -76,58 +79,92 @@ f32/f16/bf16, GQA, softcap, odd head size, block 32).
 
 Enable with feature `ggml` (off by default; the crate builds standalone).
 
-## CUDA backend plan
+## CUDA backend (`crates/kernels/src/cuda`, feature `cuda`)
 
-Goal: same `Device`/`Buffer`/`Kernel`/`Arg`/`Dims` surface, so the typed
-wrappers and tests carry over (extract a `Backend` trait from `metal::Device`
-when the second implementation lands; don't abstract before).
+Same `Device`/`Buffer`/`Kernel`/`Arg`/`Dims` *shape* as Metal (a `Backend`
+trait hasn't been extracted yet — the two modules don't share code, by
+design, until a third backend would actually need it), implemented as follows;
+deviations from the plan this section used to describe are called out inline.
 
-1. **Driver API via `libloading`** (`libcuda`: `cuInit`, `cuDevicePrimaryCtxRetain`,
-   `cuMemAlloc`, `cuMemcpy{H2D,D2H}`, `cuModuleLoadData`, `cuModuleGetFunction`,
-   `cuLaunchKernel`, `cuFuncSetAttribute`, `cuStreamSynchronize`). Nothing to
-   link at build time, so the crate still builds on machines without a
-   toolkit; `Device::system_default()` just returns `NoDevice`. (This is what
-   `cudarc` does; writing the ~15 calls ourselves avoids its build/feature
-   matrix.)
-2. **Two source paths behind one `Library`:**
-   * *NVRTC* (`libnvrtc`, dynamic): text in, cubin out for the device's
-     `sm_XX`. Template instantiation on demand maps to
-     `nvrtcAddNameExpression("paged_attention<half,half,128,16,...>")` +
-     `nvrtcGetLoweredName`, mirroring what the Metal side does by appending
-     instantiations. Fits vLLM's `pagedattention*.cu`, `reshape_and_cache`,
-     `copy_blocks`, `gather_kv_cache` (small headers, embedded and flattened
-     like the Metal includes; `cuda_fp16.h`/`cuda_bf16.h` come from the
-     toolkit's include dir, found via `CUDA_PATH`/`CUDA_HOME` like ggml-sys).
-   * *AOT cubin/fatbin* via nvcc and the `cc` crate (`.cuda(true)`; ggml-sys
-     already drives nvcc this way, same arch detection): for CUTLASS-heavy
-     sources (FlashAttention-3, FlashInfer, Marlin) that NVRTC can't handle
-     comfortably. Embedded with `include_bytes!` and loaded with
-     `cuModuleLoadData`. Phase 2, per kernel family, behind a cargo feature.
-3. **Launch details:** args are packed into the `void*[]` parameter array in
-   slot order (slots are positional on CUDA, so gaps for optional buffers must
-   be filled with null pointers where the kernel signature has them; the typed
-   wrappers own this). Pointer args pass `base + offset`. Dynamic shared memory
-   above 48 KiB (paged attention v1 with long contexts) needs
-   `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` once per function.
-   Function constants become template arguments, so they are part of the
-   NVRTC name expression and the cache key, as they already are in `Kernel`.
-4. **ggml-cuda interop**, same shape as the Metal shim: `tensor->data` is a
-   device pointer in ggml's context, which is the device's *primary* context
-   (we retain the same one, so pointers are valid). The stream is the
-   difference: ggml-cuda computes asynchronously on its own non-blocking
-   stream, so `csrc/cuda_interop.cpp` should export that backend's stream
-   (`ggml_backend_cuda_context::stream()`) and our `Device` launches on it.
-   Until then, `ggml_backend_synchronize` + `cuStreamSynchronize` around each
-   hop is correct, just slow.
-5. **Reuse upstream's CUDA host code where it is simpler.** mistral.rs ships
-   `.cu` files with `extern "C"` host launchers (`paged_attention_v1_f16(...)`,
-   called through its `ffi.rs`). The fastest first milestone is compiling those
-   with nvcc/`cc` and calling the launchers directly, then moving to the
-   NVRTC path only if build time or flexibility matters.
-6. **Testing:** the Rust reference in `tests/paged_attn.rs` is
-   backend-neutral; parameterize the harness over `Device` so the identical
-   cases run on CUDA. Gate on `HAS_CUDA` like ggml-sys. No NVIDIA hardware was
-   available here, so none of the CUDA plan has been run.
+1. **Driver API via `libloading`** (`crates/kernels/src/cuda/sys.rs`):
+   `cuInit`, `cuDevicePrimaryCtxRetain`, `cuMemAlloc_v2`, `cuMemcpy{H,D}toD_v2`,
+   `cuModuleLoadDataEx`, `cuModuleGetFunction`, `cuLaunchKernel`,
+   `cuFuncSetAttribute`, `cuStreamCreate`/`Synchronize`, plus the matching
+   NVRTC entry points, all `dlopen`'d (`nvcuda.dll`/`libcuda.so.1`,
+   `nvrtc64_120_0.dll`/`libnvrtc.so`) rather than linked, so the crate builds
+   with `--features cuda` on a machine with no NVIDIA driver at all;
+   `Device::system_default()` returns `NoDevice`. The *driver* calls use the
+   `_v2`-suffixed symbol names explicitly: `nvcuda.dll` still exports the
+   unversioned ones too, but only as a compatibility alias of uncertain ABI,
+   so don't rely on `GetProcAddress("cuMemAlloc")` resolving to the right thing.
+2. **NVRTC only** (no AOT/cubin path yet — not needed: the vLLM paged-attention
+   kernels aren't CUTLASS-heavy). `Device::library` registers one name
+   expression per template instantiation (`nvrtcAddNameExpression` before
+   `nvrtcCompileProgram`, `nvrtcGetLoweredName` after) and compiles to PTX
+   (`--gpu-architecture=compute_XY`, arch read once via
+   `cuDeviceGetAttribute(COMPUTE_CAPABILITY_{MAJOR,MINOR})` — more reliable
+   than ggml-sys's `nvidia-smi` shell-out, since we already have a `CUdevice`);
+   `cuModuleLoadDataEx` JIT-compiles the PTX to SASS at load time. An
+   `extern "C" __global__` kernel (`copy_blocks_kernel_*`) needs no name
+   expression: its symbol is already unmangled.
+3. **NVRTC's header situation needed more than `-I`.** Its built-in headers
+   cover CUDA's own `cuda_fp16.h`/`cuda_bf16.h`/`cuda_fp8.h` (confirmed:
+   `cuda_bf16.h` resolves once `-I<CUDA_PATH>/include` is passed — the
+   *toolkit's* headers, not libc's), but not `<stdint.h>`, `<cstdint>`,
+   `<float.h>`, `<assert.h>`, `<type_traits>`, `<algorithm>`, `<mutex>`,
+   `<vector>`, `<map>`: those are the *host* C/C++ runtime's, which NVRTC has
+   no path to (no `cl.exe`/`gcc` invocation backs it). `cuda/shaders.rs`
+   strips these `#include`s and prepends a ~10-line prelude defining the
+   fixed-width int typedefs, `FLT_MAX` and a no-op `assert` by hand — simpler
+   and more portable than hunting down the host toolchain's include dir (MSVC's
+   on Windows, glibc's on Linux) just for a handful of typedefs. See that
+   file's doc comment for the one sharp edge this flattener has: it does not
+   evaluate `#ifdef`/`#else`, so a vendored file with two same-basename
+   `#include "..."`s behind a `USE_ROCM` branch (there's exactly one such
+   case, `quantization/fp8/{amd,nvidia}/quant_utils.cuh`) needs the dead
+   branch's include excluded explicitly rather than just deduplicated.
+4. **Launch details**, as planned: args are positional in the `void*[]`
+   kernel-params array (`Device::launch` takes `&[Arg]`, not Metal's
+   `&[(slot, Arg)]`; an absent optional buffer is `Arg::NullPtr`, matching the
+   kernel signature's own null-checked pointer params). Dynamic shared memory
+   is a `cuLaunchKernel` argument, not a bound slot; `Device::launch` always
+   calls `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` first when it's
+   nonzero (vLLM's host code caches this per-function behind a mutex; calling
+   it unconditionally is simpler and cheap enough not to bother). Function
+   constants have no CUDA equivalent — they're folded into the template args,
+   hence the name expression, hence `Kernel`'s cache key; CUDA's `Kernel` has
+   no `consts` field.
+5. **`crates/kernels/src/cuda/paged_attn.rs`** reimplements vLLM's host
+   launcher math in Rust (grid/block/shared-memory sizing, the v1-vs-v2
+   selection heuristic) exactly like `metal::paged_attn` does for the Metal
+   port — the CUDA `.cu` host launchers (`paged_attention_v1_f16`, ...) are
+   *not* compiled or linked; only the `__global__` kernels they'd call are,
+   via NVRTC. One correction to this doc's earlier assumption: vLLM's CUDA
+   default is `NUM_THREADS = 128` (`WARP_SIZE = 32`), not the Metal port's
+   256 — the two backends use different thread-block sizes for the same op,
+   each matching its own upstream default. `copy_blocks` is hand-written
+   (`cuda/shaders/copy_blocks.cu`), not vendored: upstream's CUDA version
+   copies one block pair across *every model layer* in one launch
+   (`int64_t *key_cache_ptrs[layer]`), which the Metal port had already
+   simplified to one `key_cache`/`value_cache` pair per launch; the CUDA side
+   now matches that simplification so `CopyBlocks` is one struct, not two.
+6. **Tested**: `cargo test -p tensorlisp-kernels --features cuda` runs
+   `tests/paged_attn_cuda.rs`, line-for-line the same cases as
+   `tests/paged_attn.rs` (Metal) — `reshape_and_cache` + `gather_kv_cache`
+   round-trip, `paged_attention` v1 and v2 against an f32 reference, f32/f16/
+   bf16, GQA, softcap, odd head size, block 32, `copy_blocks`. All pass on an
+   RTX 3080 (sm_86). Gated the same way as the Metal tests
+   (`TL_ALLOW_NO_GPU=1` to skip without one).
+7. **Not done**: ggml-cuda interop (the `metal::ggml` feature's equivalent —
+   sharing ggml-cuda's primary context/stream so a kernel launch and a ggml
+   graph can interleave without an extra sync; needs `csrc/cuda_interop.cpp`
+   exporting `ggml_backend_cuda_context::stream()`, same shape as
+   `metal_interop.*`), fp8 KV cache (the fp8 conversion paths are vendored but
+   gated behind `ENABLE_FP8`, which nothing defines yet), ALiBi/sinks (wired
+   through but untested — no port needs them yet), and a native CUDA executor
+   (the `--device native` equivalent; CUDA has nothing like `metal/lower.rs`
+   or `scheme/native.ss` yet, so there's no op coverage to speak of beyond
+   paged attention).
 
 ## Using it from Scheme (next step)
 

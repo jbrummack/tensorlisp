@@ -6,12 +6,16 @@
 //! Scheme (`(launch kernel grid threads args..)`) as well as from typed Rust
 //! wrappers like [`metal::paged_attn`].
 //!
-//! Backends mirror each other: `metal` today, `cuda` per docs/design/kernel-launcher.md.
+//! Backends mirror each other in shape (`Device`/`Buffer`/`Kernel`/`Arg`/`Dims`)
+//! without sharing a trait yet: `metal` (macOS, `objc2`) and `cuda` (feature
+//! `cuda`, dlopen'd Driver API + NVRTC, any OS). See docs/design/kernel-launcher.md.
 
 pub mod graph;
 pub mod plan;
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 
 /// Element types the vendored kernels are instantiated for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

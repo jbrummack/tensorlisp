@@ -2072,6 +2072,7 @@ dependencies = [
  "bindgen",
  "ggml-sys",
  "half",
+ "libloading",
  "objc2",
  "objc2-foundation",
  "objc2-metal",

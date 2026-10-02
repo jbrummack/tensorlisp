@@ -2,16 +2,21 @@
 name = "tensorlisp-kernels"
 version.workspace = true
 edition.workspace = true
-description = "Backend-native kernel launcher (Metal now, CUDA planned) plus vendored paged-attention kernels. No ggml, no torch/candle."
+description = "Backend-native kernel launcher (Metal, CUDA) plus vendored paged-attention kernels. No ggml, no torch/candle."
 license = "MIT"
 
 [features]
 # Share the MTLDevice/queue/buffers of ggml's Metal backend (see src/metal/ggml.rs).
 ggml = ["dep:ggml-sys"]
+# CUDA Driver API + NVRTC, both dlopen'd at runtime (see src/cuda/sys.rs): the
+# crate still builds and links without a CUDA install; Device::system_default()
+# returns NoDevice if nvcuda/nvrtc aren't found on the target machine.
+cuda = ["dep:libloading"]
 
 [dependencies]
 thiserror.workspace = true
 ggml-sys = { workspace = true, optional = true }
+libloading = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
