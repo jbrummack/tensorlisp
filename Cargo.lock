@@ -2033,6 +2033,7 @@ dependencies = [
  "ggml-sys",
  "image",
  "ndarray",
+ "tensorlisp-kernels",
  "thiserror",
 ]
 
@@ -2068,6 +2069,7 @@ dependencies = [
 name = "tensorlisp-kernels"
 version = "0.1.0"
 dependencies = [
+ "bindgen",
  "ggml-sys",
  "half",
  "objc2",

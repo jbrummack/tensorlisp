@@ -70,7 +70,10 @@ let logits = &out["logits"];                            // named ndarray out
 ```
 
 `Device::Auto` uses the first GPU if there is one; ops it can't run fall back
-to the CPU. The graph for the current input shapes stays allocated; a shape
+to the CPU. `Device::Native` (macOS, `--device native` in `tl`) runs on tensorlisp's
+own Metal executor instead of a ggml backend (ggml's kernels, our planner and
+dispatch lowering, matmul policy in Scheme; see `docs/design/kernel-launcher.md`);
+ops it doesn't implement yet fail with their name instead of falling back. The graph for the current input shapes stays allocated; a shape
 change rebuilds it.
 
 ### File format

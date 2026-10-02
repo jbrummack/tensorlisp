@@ -16,7 +16,8 @@ impl FromStr for DeviceArg {
             "auto" => Device::Auto,
             "cpu" => Device::Cpu,
             "gpu" => Device::Gpu,
-            other => return Err(format!("unknown device {other:?} (expected auto, cpu or gpu)")),
+            "native" => Device::Native,
+            other => return Err(format!("unknown device {other:?} (expected auto, cpu, gpu or native)")),
         }))
     }
 }

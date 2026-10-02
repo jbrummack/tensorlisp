@@ -8,6 +8,8 @@
 //!
 //! Backends mirror each other: `metal` today, `cuda` per docs/design/kernel-launcher.md.
 
+pub mod graph;
+pub mod plan;
 #[cfg(target_os = "macos")]
 pub mod metal;
 
@@ -45,6 +47,9 @@ pub enum Error {
     Execution(String),
     #[error("{0}")]
     Invalid(String),
+    /// A graph node with an op (or op configuration) the backend can't lower yet.
+    #[error("native Metal: {op} `{node}`: {why}")]
+    Unsupported { op: String, node: String, why: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -73,5 +78,6 @@ impl Dims {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Const {
     Bool(bool),
+    I16(i16),
     I32(i32),
 }

@@ -15,6 +15,8 @@ pub mod error;
 pub mod gguf;
 mod guard;
 mod host;
+#[cfg(target_os = "macos")]
+mod native;
 pub mod log;
 pub mod model;
 pub mod program;

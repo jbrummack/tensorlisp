@@ -60,6 +60,9 @@ pub enum Device {
     Auto,
     Cpu,
     Gpu,
+    /// The GPU through tensorlisp's own Metal executor (macOS): graphs are
+    /// lowered to a recorded dispatch list instead of running on a ggml backend.
+    Native,
 }
 
 /// A tensorlisp model: weights on the device plus the program that builds its graphs.
@@ -230,7 +233,7 @@ pub struct NodeInfo {
 
 type GraphKey = (Vec<Vec<usize>>, Taps);
 
-struct Graph {
+pub(crate) struct Graph {
     ctx: *mut ggml_context,
     graph: *mut ggml_cgraph,
     inputs: Vec<*mut ggml_tensor>,
@@ -258,6 +261,11 @@ struct Inner {
     state_buffer: ggml_backend_buffer_t,
     /// Per entry, created on first use.
     graphs: HashMap<String, EntryGraph>,
+    /// The native Metal device and its compiled graphs, per entry (`Device::Native`).
+    #[cfg(target_os = "macos")]
+    native: Option<crate::native::Native>,
+    #[cfg(target_os = "macos")]
+    native_graphs: HashMap<String, (GraphKey, crate::native::NativeProgram)>,
     /// Set when an assertion fired during compute.
     poisoned: Option<String>,
 }
@@ -276,7 +284,7 @@ fn init_gpu() -> Option<ggml_backend_t> {
 
 fn init_backends(device: Device) -> Result<Vec<ggml_backend_t>> {
     let gpu = match device {
-        Device::Cpu => None,
+        Device::Cpu | Device::Native => None,
         Device::Auto => init_gpu(),
         Device::Gpu => Some(init_gpu().ok_or_else(|| Error::Backend("no GPU device available".into()))?),
     };
@@ -333,13 +341,26 @@ impl Model {
             states: null_mut(),
             state_buffer: null_mut(),
             graphs: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            native: None,
+            #[cfg(target_os = "macos")]
+            native_graphs: HashMap::new(),
             poisoned: None,
         };
-        inner.weights = guard::alloc_ctx_tensors(inner.file.tensors, inner.backends[0])?;
-        if inner.weights.is_null() && inner.file.tensor_count() > 0 {
-            return Err(Error::Backend("failed to allocate the weight buffer".into()));
+        if device == Device::Native {
+            #[cfg(target_os = "macos")]
+            {
+                inner.native = Some(crate::native::Native::load(&inner.file, path)?);
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(Error::Backend("the native Metal device needs macOS".into()));
+        } else {
+            inner.weights = guard::alloc_ctx_tensors(inner.file.tensors, inner.backends[0])?;
+            if inner.weights.is_null() && inner.file.tensor_count() > 0 {
+                return Err(Error::Backend("failed to allocate the weight buffer".into()));
+            }
+            load_weights(&inner.file, path)?;
         }
-        load_weights(&inner.file, path)?;
         inner.alloc_states()?;
 
         let shared = Arc::new(Shared {
@@ -370,6 +391,10 @@ impl Model {
     /// Zeroes every `(define-state ...)` tensor, as after loading.
     pub fn reset_state(&self) {
         let inner = self.inner.lock().unwrap();
+        #[cfg(target_os = "macos")]
+        if let Some(native) = &inner.native {
+            native.reset_state();
+        }
         if !inner.state_buffer.is_null() {
             unsafe { ggml_backend_buffer_clear(inner.state_buffer, 0) };
         }
@@ -541,6 +566,10 @@ impl Model {
     /// Name of the primary backend, e.g. "MTL0" or "CPU".
     pub fn device_name(&self) -> String {
         let inner = self.inner.lock().unwrap();
+        #[cfg(target_os = "macos")]
+        if let Some(native) = &inner.native {
+            return native.device_name();
+        }
         unsafe { CStr::from_ptr(ggml_backend_name(inner.backends[0])) }.to_string_lossy().into_owned()
     }
 
@@ -568,6 +597,10 @@ impl Model {
             return Err(Error::Backend(format!(
                 "the model is unusable after an earlier ggml assertion during compute ({reason}); load it again"
             )));
+        }
+        #[cfg(target_os = "macos")]
+        if inner.native.is_some() {
+            return inner.run_native(name, spec, &ordered, key);
         }
         if inner.graphs.get(name).and_then(|g| g.graph.as_ref()).is_none_or(|(k, _)| *k != key) {
             inner.rebuild_graph(name, key)?;
@@ -793,6 +826,37 @@ fn check_shape(spec: &InputSpec, shape: &[usize]) -> Result<()> {
 }
 
 impl Inner {
+    /// Runs entry `name` on the native Metal device: compiles its graph for these shapes if needed, then replays it.
+    #[cfg(target_os = "macos")]
+    fn run_native(&mut self, name: &str, spec: &EntrySpec, ordered: &[&ArrayViewD<f32>], key: GraphKey) -> Result<RunOutput> {
+        if self.native_graphs.get(name).is_none_or(|(k, _)| *k != key) {
+            let graph = self.build_graph(name, &key.0, &key.1)?;
+            let compiled = crate::native::NativeProgram::compile(
+                self.native.as_ref().unwrap(),
+                graph.graph,
+                &graph.inputs,
+                &graph.outputs,
+                &graph.taps,
+            );
+            unsafe { ggml_free(graph.ctx) };
+            self.native_graphs.insert(name.to_string(), (key, compiled?));
+        }
+        let native = self.native.as_ref().unwrap();
+        let (_, program) = &self.native_graphs[name];
+        for (i, (array, spec)) in ordered.iter().zip(&spec.inputs).enumerate() {
+            let data = array.as_standard_layout();
+            if spec.dtype == "i32" {
+                program.set_input(i, &to_i32_bytes(&spec.name, data.as_slice().unwrap())?)?;
+            } else {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * size_of::<f32>()) };
+                program.set_input(i, bytes)?;
+            }
+        }
+        program.run(native)?;
+        Ok(RunOutput { outputs: program.outputs()?, taps: program.taps()? })
+    }
+
     /// Creates the program's state tensors on the primary device, zeroed.
     fn alloc_states(&mut self) -> Result<()> {
         let specs: Vec<StateSpec> = self.program.states.clone();
@@ -809,6 +873,10 @@ impl Inner {
             let t = unsafe { ggml_new_tensor(self.states, ty, spec.dims.len() as i32, spec.dims.as_ptr()) };
             let name = std::ffi::CString::new(spec.name.as_str()).map_err(|_| Error::Program("bad state name".into()))?;
             unsafe { ggml_set_name(t, name.as_ptr()) };
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(native) = &mut self.native {
+            return native.alloc_states(self.states);
         }
         self.state_buffer = guard::alloc_ctx_tensors(self.states, self.backends[0])?;
         if self.state_buffer.is_null() {
@@ -865,7 +933,11 @@ impl Inner {
         if ctx.is_null() {
             return Err(Error::Backend("failed to create the graph context".into()));
         }
-        let device = if unsafe { ggml_backend_is_cpu(self.backends[0]) } { "cpu" } else { "gpu" };
+        #[cfg(target_os = "macos")]
+        let native = self.native.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let native = false;
+        let device = if !native && unsafe { ggml_backend_is_cpu(self.backends[0]) } { "cpu" } else { "gpu" };
         match self.program.build(entry, ctx, self.file.tensors, self.states, device, &input_dims, GRAPH_SIZE, taps) {
             Ok(built) => Ok(Graph {
                 ctx,

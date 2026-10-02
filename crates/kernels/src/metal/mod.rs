@@ -11,15 +11,18 @@ use std::sync::{Arc, Mutex};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSDictionary, NSObject, NSString};
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType,
-    MTLDevice, MTLFunctionConstantValues, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType,
+    MTLDevice, MTLFunctionConstantValues, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::{Const, Dims, Error, Result};
 
+pub mod exec;
+pub mod kargs;
+pub mod lower;
 pub mod paged_attn;
 pub mod shaders;
 #[cfg(feature = "ggml")]
@@ -75,6 +78,17 @@ impl Buffer {
         out
     }
 
+    /// `count` elements starting `byte_offset` bytes in.
+    pub fn read_range<T: Copy>(&self, byte_offset: usize, count: usize) -> Vec<T> {
+        assert!(byte_offset + count * size_of::<T>() <= self.len());
+        let mut out = Vec::<T>::with_capacity(count);
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.contents().add(byte_offset) as *const T, out.as_mut_ptr(), count);
+            out.set_len(count);
+        }
+        out
+    }
+
     pub fn write<T: Copy>(&self, data: &[T]) {
         assert!(std::mem::size_of_val(data) <= self.len());
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.contents() as *mut T, data.len()) }
@@ -107,6 +121,8 @@ pub enum Arg<'a> {
     U32(u32),
     I64(i64),
     F32(f32),
+    /// Arbitrary bytes (a kernel-argument struct), copied at encode time.
+    Bytes(&'a [u8]),
 }
 
 impl<'a> From<&'a Buffer> for Arg<'a> {
@@ -119,6 +135,18 @@ impl<'a> From<BufRef<'a>> for Arg<'a> {
         Arg::Buf(b)
     }
 }
+
+/// A compiled compute pipeline.
+#[derive(Clone)]
+pub struct Pipeline {
+    pso: RawPipeline,
+    /// `maxTotalThreadsPerThreadgroup`: kernels with many registers get fewer than the device's 1024.
+    pub max_threads: usize,
+}
+
+// SAFETY: MTLComputePipelineState is immutable and thread-safe.
+unsafe impl Send for Pipeline {}
+unsafe impl Sync for Pipeline {}
 
 /// Which pipeline to run: an entry point of a registered library, specialized
 /// by function constants.
@@ -146,7 +174,7 @@ pub struct Device {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     libraries: Mutex<HashMap<Arc<str>, RawLibrary>>,
-    pipelines: Mutex<HashMap<Kernel, RawPipeline>>,
+    pipelines: Mutex<HashMap<Kernel, Pipeline>>,
     stream: Mutex<Stream>,
 }
 
@@ -184,6 +212,24 @@ impl Device {
         }
     }
 
+    /// Capabilities the ggml kernels branch on.
+    pub fn props(&self) -> lower::DeviceProps {
+        lower::DeviceProps {
+            simdgroup_mm: self.dev.supportsFamily(MTLGPUFamily::Apple7),
+            max_threadgroup_memory: self.dev.maxThreadgroupMemoryLength() as u32,
+        }
+    }
+
+    /// Largest single buffer the device can allocate.
+    pub fn max_buffer_len(&self) -> usize {
+        self.dev.maxBufferLength()
+    }
+
+    /// Whether the GPU does bfloat natively (ggml's `GGML_METAL_HAS_BF16`).
+    pub fn has_bfloat(&self) -> bool {
+        self.dev.supportsFamily(MTLGPUFamily::Apple6)
+    }
+
     pub fn name(&self) -> String {
         self.dev.name().to_string()
     }
@@ -206,21 +252,36 @@ impl Device {
     /// Registers (and later compiles, once) a library under `key`. `source`
     /// only runs if the key is new, so callers can build text lazily.
     pub fn library(&self, key: &str, source: impl FnOnce() -> String) -> Result<Arc<str>> {
+        self.library_with(key, &[], source)
+    }
+
+    /// Like [`Device::library`], with preprocessor macros (`-DNAME=VALUE`).
+    pub fn library_with(&self, key: &str, macros: &[(&str, &str)], source: impl FnOnce() -> String) -> Result<Arc<str>> {
         let mut libs = self.libraries.lock().unwrap();
         if let Some((k, _)) = libs.get_key_value(key) {
             return Ok(k.clone());
         }
         let text = source();
+        let options = (!macros.is_empty()).then(|| {
+            let options = MTLCompileOptions::new();
+            let keys: Vec<Retained<NSString>> = macros.iter().map(|(k, _)| NSString::from_str(k)).collect();
+            let vals: Vec<Retained<NSObject>> = macros.iter().map(|(_, v)| NSString::from_str(v).into_super()).collect();
+            let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+            let dict: Retained<NSDictionary<NSString, NSObject>> = NSDictionary::from_retained_objects(&key_refs, &vals);
+            unsafe { options.setPreprocessorMacros(Some(&dict)) };
+            options
+        });
         let lib = self
             .dev
-            .newLibraryWithSource_options_error(&NSString::from_str(&text), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(&text), options.as_deref())
             .map_err(|e| Error::Compile { lib: key.to_string(), msg: e.localizedDescription().to_string() })?;
         let key: Arc<str> = Arc::from(key);
         libs.insert(key.clone(), lib);
         Ok(key)
     }
 
-    fn pipeline(&self, k: &Kernel) -> Result<RawPipeline> {
+    /// Compiles (or fetches) the pipeline for `k`.
+    pub fn pipeline(&self, k: &Kernel) -> Result<Pipeline> {
         if let Some(p) = self.pipelines.lock().unwrap().get(k) {
             return Ok(p.clone());
         }
@@ -250,6 +311,13 @@ impl Device {
                                 *idx as usize,
                             );
                         }
+                        Const::I16(i) => {
+                            cv.setConstantValue_type_atIndex(
+                                NonNull::from(i).cast(),
+                                MTLDataType::Short,
+                                *idx as usize,
+                            );
+                        }
                         Const::I32(i) => {
                             cv.setConstantValue_type_atIndex(
                                 NonNull::from(i).cast(),
@@ -266,14 +334,21 @@ impl Device {
             .dev
             .newComputePipelineStateWithFunction_error(&func)
             .map_err(|e| err(e.localizedDescription().to_string()))?;
-        self.pipelines.lock().unwrap().insert(k.clone(), pso.clone());
-        Ok(pso)
+        let pipeline = Pipeline { max_threads: pso.maxTotalThreadsPerThreadgroup(), pso };
+        self.pipelines.lock().unwrap().insert(k.clone(), pipeline.clone());
+        Ok(pipeline)
     }
 
     /// Encodes one dispatch. `args` are `(slot, value)`. Nothing runs until
     /// [`Device::sync`] (or [`Device::flush`]).
     pub fn launch(&self, kernel: &Kernel, args: &[(u32, Arg)], dims: Dims) -> Result<()> {
-        let pso = self.pipeline(kernel)?;
+        let pipeline = self.pipeline(kernel)?;
+        self.launch_pipeline(&pipeline, args, dims)
+    }
+
+    /// [`Device::launch`] with an already compiled pipeline (no lookup).
+    pub fn launch_pipeline(&self, pipeline: &Pipeline, args: &[(u32, Arg)], dims: Dims) -> Result<()> {
+        let pso = &pipeline.pso;
         let mut stream = self.stream.lock().unwrap();
         if stream.open.is_none() {
             let cmd = self.queue.commandBuffer().ok_or_else(|| Error::Execution("no command buffer".into()))?;
@@ -281,7 +356,7 @@ impl Device {
             stream.open = Some(Encoding { cmd, enc });
         }
         let enc = &stream.open.as_ref().unwrap().enc;
-        enc.setComputePipelineState(&pso);
+        enc.setComputePipelineState(pso);
         // SAFETY: slots/lengths come from the typed args below; Metal copies bytes.
         unsafe {
             for (slot, arg) in args {
@@ -292,6 +367,9 @@ impl Device {
                     Arg::U32(v) => enc.setBytes_length_atIndex(NonNull::from(v).cast(), 4, slot),
                     Arg::I64(v) => enc.setBytes_length_atIndex(NonNull::from(v).cast(), 8, slot),
                     Arg::F32(v) => enc.setBytes_length_atIndex(NonNull::from(v).cast(), 4, slot),
+                    Arg::Bytes(b) => {
+                        enc.setBytes_length_atIndex(NonNull::new(b.as_ptr() as *mut c_void).unwrap(), b.len(), slot)
+                    }
                 }
             }
             if dims.shared > 0 {

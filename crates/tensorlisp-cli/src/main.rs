@@ -53,7 +53,7 @@ pub struct ModelArgs {
     /// Run this program file instead of the one stored in the model.
     #[arg(long)]
     pub program: Option<PathBuf>,
-    /// Where to run: auto (GPU if available), cpu or gpu.
+    /// Where to run: auto (GPU if available), cpu, gpu (ggml's GPU backend) or native (tensorlisp's own Metal executor, macOS).
     #[arg(long, default_value = "auto")]
     pub device: common::DeviceArg,
     /// Add or replace an asset the program reads with (asset NAME), NAME=PATH (repeatable).

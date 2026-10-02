@@ -5,8 +5,8 @@ scalars, dispatch. No tensors, no shapes, no ggml, no torch/candle. Typed
 wrappers on top (`metal::paged_attn`) pick the kernel variant and grid the way
 the upstream host code does.
 
-Status: **Metal implemented and tested**, ggml-Metal interop implemented and
-tested, **CUDA planned (below), untested**, Scheme binding not started.
+Status: **Metal launcher, ggml-Metal interop and the native Metal executor
+(`--device native`, below) implemented and tested**, **CUDA planned, untested**.
 
 ## Model
 
@@ -148,3 +148,107 @@ Paged attention only touches the KV cache (f16/bf16/f32/fp8), so weight quants
 don't affect it. For GEMM kernels brought in later (e.g. Marlin), keep ggml
 block quants as the on-disk canonical form (`tl quantize` already writes them)
 and repack at load per backend, as llama.cpp does for CPU.
+
+## Native Metal executor (`Device::Native`, `tl ... --device native`)
+
+ggml's *backend* is replaced by this crate's; ggml's *graph* is not. A Scheme
+program still builds a ggml cgraph (shape inference, the op vocabulary every
+port already uses), but nothing is allocated or computed by ggml. Pipeline:
+
+```
+Scheme program --> ggml cgraph (metadata only, no_alloc)
+   --> tensorlisp_kernels::graph::Graph          IR: ops by ggml name, ne/nb, op_params, views
+   --> plan::plan                                 liveness + first-fit arena, input/weight/state placement
+   --> metal::lower (Rust) + scheme/native.ss     one or more Dispatch per node, pipelines created
+   --> Program::run                               encode the recorded list, commit, wait
+```
+
+Everything shape-dependent happens once per `(entry, input shapes, taps)` when
+the graph is compiled; `run` only uploads inputs, encodes the dispatch list into
+one command buffer and reads the results back from the arena (shared storage).
+Weights are read from the GGUF straight into `MTLBuffer`s (split across buffers
+past the device's maximum buffer length); `(define-state ...)` tensors get their
+own zeroed buffer.
+
+The kernels are ggml's, unchanged: `build.rs` flattens `vendor/ggml/.../ggml-metal.metal`
+and bindgens `ggml_metal_kargs_*`, `FC_*`, `OP_*` from `ggml-metal-impl.h`, so
+there is one source of truth and a ggml bump flows through. `metal/lower.rs` is
+a port of the host half of ggml-metal (`ggml_metal_op_*` plus the pipeline
+getters): kernel variant, function constants, threadgroup shapes, argument
+structs. Not ported: op fusion (norm+mul+add, add chains) and concurrent
+dispatch; every node is its own serial dispatch.
+
+**Ops** (what the TIPS ports need and their natural neighbours): ADD SUB MUL DIV,
+SCALE SQR SQRT SIN COS LOG CLAMP FILL LEAKY_RELU and all UNARY ops, SUM_ROWS MEAN,
+CONCAT REPEAT, GET_ROWS, SOFT_MAX (mask, no sinks), CPY CONT DUP, NORM RMS_NORM,
+IM2COL, ARANGE, UPSCALE, ROPE (norm, neox, multi, vision), POOL_2D, CONV_2D_DW, SET_ROWS, ARGMAX, PAD, PAD_REFLECT_1D, MUL_MAT (f32/f16/bf16 and the common quantized types),
+FLASH_ATTN_EXT (matrix and vector kernels, mask, sinks, softcap, f16/f32 K/V);
+RESHAPE VIEW PERMUTE TRANSPOSE are free. Anything else fails at compile time with the op
+and node name (`native Metal: ROPE ...: op not implemented`). Missing for the
+other ports: CONV_2D, CONV_TRANSPOSE_*, MUL_MAT_ID, GLU, PAD, ...
+(each is a function in `lower.rs` modelled on its `ggml_metal_op_*`).
+
+**Ports on `--device native`:** TIPSv2 text and vision, YOLO11n (same detections as
+the README: bus 0.94, person 0.90/0.85/0.83/0.38; head cosine 0.999999 vs the
+Ultralytics reference taps; 47.9 ms vs 48.2 ms on ggml Metal) and T5Gemma 2
+(`caption` gives " a bumble bee in a flower bed.", `generate` the same tokens as
+ggml Metal; KV cache in state tensors via SET_ROWS/CPY, flash attention with an
+f16 cache, argmax in the graph) and PP-OCRv6 (detector taps and probability map match the
+reference at f16 level, the full `ocr` pipeline returns the same boxes, scores and text as
+ggml Metal). `tests/native_tips.rs` covers all four.
+
+PP-OCRv6 found the one real gap: `nn:conv2d` pads with leading amounts (`ggml_pad_ext`),
+which ggml-metal's pad kernel does not support (ggml silently runs it on the CPU).
+Such ops get our own kernel: `metal/shaders/extra.metal`, a second library compiled next
+to ggml's, with the same calling convention (argument struct at buffer 0). It is where
+anything ggml-metal lacks goes. Missing ops are now all collected and reported in one error
+(`not implemented: PAD x11 (e.g. ...); ...`) instead of one per run; `TL_NATIVE_TRACE=1`
+prints each compiled graph's op histogram.
+
+### Matrix multiplication lives in Scheme
+
+`scheme/native.ss` (`$tl-native-lower-mul-mat`) decides, from the operand types,
+shapes and strides, between the small-batch `mul_mv_ext`, the simdgroup-matrix
+`mul_mm` and `mul_mv` kernels, and returns plain data: kernel name, function
+constants, argument slots (tensors by role, kernel-argument structs as typed
+fields), grid, threads, threadgroup memory. Rust packs the structs like C
+(`kargs::pack`, size-checked against the bindgen'd `sizeof`), creates the
+pipeline and records the dispatch. Replies are cached per operand signature.
+This is the seam for the next steps: a variant search or a generated kernel
+changes `native.ss`, not the Rust executor.
+
+### Verification
+
+* `crates/tensorlisp/tests/native.rs`: native vs the ggml CPU backend (and exact
+  dequantized references for matmul) per op family: every matmul kernel x
+  {f32, f16, bf16, q4_0, q8_0, q4_K, q6_K} x batch {1,3,5,8,9,40}; norms,
+  activations, reductions, embedding, positions; attention with/without mask,
+  GQA, flash vector and matrix kernels with and without KV padding; im2col patch
+  embedding; unsupported ops are reported by name.
+* `crates/tensorlisp/tests/native_tips.rs`: the real TIPSv2 text (f32) and vision
+  (f16, flash attention, antialiased position resize at 224 px) towers, every tap
+  and output, vs the CPU backend (skipped without `models/tipsv2-b14`).
+* `crates/kernels/src/plan.rs`: arena planner invariants on random graphs.
+* `tl compare --device native` against the PyTorch references of
+  `ports/tipsv2` gives the same errors as ggml's Metal backend (text f32:
+  embedding max abs 5.9e-4 vs 6.5e-4; vision f16 448 px: patches max abs 1.5e-2,
+  cosine 0.999999; quantized variants match the accuracy in the port README).
+
+### Numbers (M1 Pro)
+
+| | native | ggml Metal |
+|---|---|---|
+| text f32, 3 texts | 16.1 ms | 16.4 ms |
+| vision f16, 2 images 448 px | 168 ms | 164 ms |
+| load (incl. compiling ggml's Metal library) | 0.9 s | 0.9 s |
+
+The ~3% on vision is the missing fusion/concurrency; parity first, speed later.
+The Metal library is compiled from source on every load (about 0.8 s); caching
+the metallib/binary archive on disk is straightforward and not done.
+
+### Not done / next
+
+* Fusion and concurrent dispatch (needs memory-range tracking like ggml's
+  `ggml_mem_ranges`, or a barrier-minimizing pass over the IR).
+* The remaining ops above; then the t5gemma2 and yolo11 ports on `--device native`.
+* Autotuning: only after op coverage. `native.ss` is where variants get enumerated.

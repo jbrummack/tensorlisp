@@ -19,6 +19,7 @@ use ggml_sys::ffi::{ggml_tensor, scheme as generated};
 use crate::error::{Error, Result};
 
 const CORE: &str = include_str!("core.ss");
+const NATIVE: &str = include_str!("native.ss");
 
 /// The stdlib libraries, `(tl name)` (`name` possibly multi-segment, e.g.
 /// `aot mil shadow` for `(tl aot mil shadow)`), in dependency order (see
@@ -51,7 +52,7 @@ const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? mod
     mil-trace:ggml-concat mil-trace:tensor-slice mil-trace:tensor-concat mil-trace:conv2d mil-trace:conv2d-depthwise \
     mil-trace:max-pool mil-trace:upsample-nearest %mil-trace-reset! %mil-render %mil-render! %mil-declare-input!";
 /// Host entry points, only visible from Rust.
-const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline $tl-compile-generic-to-ggml $tl-compile-generic-to-mil $tl-mil-last-render";
+const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline $tl-compile-generic-to-ggml $tl-compile-generic-to-mil $tl-mil-last-render $tl-native-lower-mul-mat";
 
 extern "C" fn tl_tensor_ne(t: *const ggml_tensor, i: i32) -> i64 {
     unsafe { (*t).ne[i as usize] }
@@ -71,7 +72,7 @@ fn library_source() -> String {
         "(library (tensorlisp runtime)\n\
            (export {public} {HOST})\n\
            (import (chezscheme))\n\
-           {raw}\n{constants}\n{CORE}\n{ops})\n\
+           {raw}\n{constants}\n{CORE}\n{NATIVE}\n{ops})\n\
          (library (tensorlisp)\n\
            (export {public})\n\
            (import (tensorlisp runtime)))\n\
@@ -366,6 +367,12 @@ pub(crate) fn compile_generic_to_mil(src: &str) -> Result<String> {
         Value::String(s) => Ok(s),
         other => Err(bad_reply("compile", &other)),
     }
+}
+
+/// Asks the Scheme matmul policy (native.ss) how to run one MUL_MAT; `args`
+/// are the two sources' and the result's descriptors and the device props.
+pub(crate) fn native_lower_mul_mat(args: Vec<Value>) -> Result<Value> {
+    Ok(with_scheme(move |s| s.call("$tl-native-lower-mul-mat", &args))??)
 }
 
 /// The MIL program text `(%mil-render! ...)` last stored, called from within
