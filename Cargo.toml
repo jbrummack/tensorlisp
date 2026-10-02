@@ -8,6 +8,7 @@ members = [
     "crates/tensorlisp-cli",
     "crates/tensorlisp-aot",
     "crates/importers",
+    "crates/kernels",
     "experiments/handrolled-lisp",
     "experiments/gguf-loader",
 ]

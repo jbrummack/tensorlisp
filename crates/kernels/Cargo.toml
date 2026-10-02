@@ -1,0 +1,22 @@
+[package]
+name = "tensorlisp-kernels"
+version.workspace = true
+edition.workspace = true
+description = "Backend-native kernel launcher (Metal now, CUDA planned) plus vendored paged-attention kernels. No ggml, no torch/candle."
+license = "MIT"
+
+[features]
+# Share the MTLDevice/queue/buffers of ggml's Metal backend (see src/metal/ggml.rs).
+ggml = ["dep:ggml-sys"]
+
+[dependencies]
+thiserror.workspace = true
+ggml-sys = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+
+[dev-dependencies]
+half = "2"

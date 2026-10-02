@@ -191,7 +191,8 @@ fn generate_bindings(include: &Path, backends: &Backends) {
     let headers = headers
         .iter()
         .map(|name| include.join(format!("{name}.h")).to_str().unwrap().to_string())
-        .chain(["csrc/guard.h".to_string()]);
+        .chain(["csrc/guard.h".to_string()])
+        .chain(backends.metal.then(|| "csrc/metal_interop.h".to_string()));
 
     let bindings = bindgen::Builder::default()
         .clang_arg(format!("-I{}", include.display()))
@@ -342,6 +343,7 @@ fn build_ggml(target: &Target, backends: &Backends) {
                 metal.join("ggml-metal-common.cpp"),
                 metal.join("ggml-metal-device.cpp"),
                 metal.join("ggml-metal-ops.cpp"),
+                PathBuf::from("csrc/metal_interop.cpp"),
             ])
             .cpp(true)
             .compile("ggml_metal_cpp");
