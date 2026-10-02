@@ -98,28 +98,44 @@
 
 ;; --- decoder
 
-(define (layer x i pos masks ple)
+(define (project-q h i pos)
+  (let ([p (prefix-fn i)] [n (dim h 1)])
+    (rope (rms-norm (ggml-reshape-3d (nn:linear h (p "self_attn.q_proj")) (head-dim i) heads n) (p "self_attn.q_norm")) pos i)))
+
+;; This layer's own key (normed, rotated) and value (scale-free norm), each [hd, 1, n].
+(define (project-kv h i pos)
+  (let ([p (prefix-fn i)] [n (dim h 1)] [hd (head-dim i)])
+    (values (rope (rms-norm (ggml-reshape-3d (nn:linear h (p "self_attn.k_proj")) hd 1 n) (p "self_attn.k_norm")) pos i)
+            (ggml-rms-norm (ggml-reshape-3d (nn:linear h (p "self_attn.v_proj")) hd 1 n) eps))))
+
+;; Everything after attention: o_proj, MLP, the per-layer embedding and the layer scalar.
+;; attended [heads * hd, n], ple [256, n, 35].
+(define (finish-layer x attended i ple)
   (let* ([p (prefix-fn i)]
-         [hd (head-dim i)]
          [n (dim x 1)]
-         [h (rms-norm x (p "input_layernorm"))]
-         [q (rope (rms-norm (ggml-reshape-3d (nn:linear h (p "self_attn.q_proj")) hd heads n) (p "self_attn.q_norm")) pos i)])
+         [x (ggml-add x (rms-norm (nn:linear attended (p "self_attn.o_proj")) (p "post_attention_layernorm")))]
+         [x (ggml-add x (rms-norm (mlp (rms-norm x (p "pre_feedforward_layernorm")) p) (p "post_feedforward_layernorm")))]
+         [gate (ggml-mul (gelu (nn:linear x (p "per_layer_input_gate")))
+                         (ggml-reshape-2d (tensor:slice ple 2 i 1) ple-dim n))]
+         [x (ggml-add x (rms-norm (nn:linear gate (p "per_layer_projection")) (p "post_per_layer_input_norm")))])
+    (ggml-mul x (weight (p "layer_scalar")))))
+
+(define (layer x i pos masks ple)
+  (let* ([hd (head-dim i)]
+         [n (dim x 1)]
+         [h (rms-norm x ((prefix-fn i) "input_layernorm"))]
+         [q (project-q h i pos)])
     (when (< i first-shared)
-      (let ([k (rope (rms-norm (ggml-reshape-3d (nn:linear h (p "self_attn.k_proj")) hd 1 n) (p "self_attn.k_norm")) pos i)]
-            [v (ggml-rms-norm (ggml-reshape-3d (nn:linear h (p "self_attn.v_proj")) hd 1 n) eps)])
+      (let-values ([(k v) (project-kv h i pos)])
         (effect (ggml-set-rows (cache "k" i) (ggml-reshape-2d k hd n) pos))
         (effect (ggml-set-rows (cache "v" i) (ggml-reshape-2d v hd n) pos))))
-    (let* ([src (kv-source i)]
-           [attended (attn:sdpa (ggml-permute q 0 2 1 3)
-                                (ggml-reshape-4d (cache "k" src) hd capacity 1 1)
-                                (ggml-reshape-4d (cache "v" src) hd capacity 1 1)
-                                'mask (if (full? i) (car masks) (cdr masks)) 'scale 1.0 'flash #t)]
-           [x (ggml-add x (rms-norm (nn:linear attended (p "self_attn.o_proj")) (p "post_attention_layernorm")))]
-           [x (ggml-add x (rms-norm (mlp (rms-norm x (p "pre_feedforward_layernorm")) p) (p "post_feedforward_layernorm")))]
-           [gate (ggml-mul (gelu (nn:linear x (p "per_layer_input_gate")))
-                           (ggml-reshape-2d (tensor:slice ple 2 i 1) ple-dim n))]
-           [x (ggml-add x (rms-norm (nn:linear gate (p "per_layer_projection")) (p "post_per_layer_input_norm")))])
-      (ggml-mul x (weight (p "layer_scalar"))))))
+    (let ([src (kv-source i)])
+      (finish-layer x
+                    (attn:sdpa (ggml-permute q 0 2 1 3)
+                               (ggml-reshape-4d (cache "k" src) hd capacity 1 1)
+                               (ggml-reshape-4d (cache "v" src) hd capacity 1 1)
+                               'mask (if (full? i) (car masks) (cdr masks)) 'scale 1.0 'flash #t)
+                    i ple))))
 
 (define (softcapped logits)
   (ggml-scale (ggml-tanh (ggml-scale logits (/ 1.0 softcap))) softcap))
