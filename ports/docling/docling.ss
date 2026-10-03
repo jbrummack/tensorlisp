@@ -227,16 +227,15 @@
 ;; --- pipelines: chat template, tile-prompt expansion, tokenization, greedy decode ---
 
 (define tok (tokenizer (asset "tokenizer.json")))
-(define bos (token-id tok "<|start_of_role|>"))
 (define eos (token-id tok "<|end_of_text|>"))
 (define image-token (token-id tok "<image>"))
 (define fake-token (token-id tok "<fake_token_around_image>"))
 (define global-img (token-id tok "<global-img>"))
 
 ;; The single-turn chat template: <|start_of_role|>user<|end_of_role|><image>
-;; PROMPT<|end_of_text|><|start_of_role|>assistant<|end_of_role|>.
+;; PROMPT<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>.
 (define (apply-chat-template prompt)
-  (string-append "<|start_of_role|>user<|end_of_role|><image>" prompt "<|end_of_text|><|start_of_role|>assistant<|end_of_role|>"))
+  (string-append "<|start_of_role|>user<|end_of_role|><image>" prompt "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"))
 
 ;; One tile's block: <fake_token_around_image><row_R_col_C> + 64x<image>, or,
 ;; for the trailing global view, <fake_token_around_image><global-img> +
@@ -267,13 +266,13 @@
 
 (define (done? tokens limit) (or (= (length tokens) limit) (and (pair? tokens) (= (util:last tokens) eos))))
 
-(define (greedy first-pos max-new)
-  (let ([limit (min decode-length (+ first-pos max-new))])
-    (let loop ([tokens '()] [pos first-pos])
-      (if (done? tokens (- limit first-pos))
+(define (greedy first first-pos max-new)
+  (let ([limit (min max-new (- decode-length first-pos))])
+    (let loop ([tokens (list first)] [pos first-pos])
+      (if (done? tokens limit)
           tokens
           (let* ([self-mask (list->array (util:pad-list (util:make-list (+ pos 1) 1) decode-length 0))]
-                 [r (run decode-step [token (list->array (list (if (null? tokens) bos (util:last tokens))))]
+                 [r (run decode-step [token (list->array (list (util:last tokens)))]
                                      [pos (list->array (list pos))] [mask self-mask])])
             (loop (append tokens (util:->integers (array->list (output r 'next)))) (+ pos 1)))))))
 
@@ -290,11 +289,11 @@
         (let* ([at (list->array (list (- n 1)))]
                [r (run prefill-image [pixels tiles] [ids ids] [gather gather] [pos pos] [at at])]
                [first (car (array->list (array-argmax (output r 'logits))))])
-          (generation-results (cons first (greedy n 512))))))))
+          (generation-results (greedy first n 512)))))))
 
 (pipeline generate ([prompt string])
   (let-values ([(ids gather pos n) (prompt-inputs (apply-chat-template prompt) 0)])
     (let* ([at (list->array (list (- n 1)))]
            [r (run prefill-text [ids ids] [pos pos] [at at])]
            [first (car (array->list (array-argmax (output r 'logits))))])
-      (generation-results (cons first (greedy n 256))))))
+      (generation-results (greedy first n 256)))))
