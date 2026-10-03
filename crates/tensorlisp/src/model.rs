@@ -79,6 +79,7 @@ pub enum Device {
 /// state, so the model then refuses to run and leaks its ggml objects instead
 /// of freeing memory those threads may still use. Load it again to recover.
 /// Assertions on backend worker threads still abort the process.
+#[derive(Clone)]
 pub struct Model {
     shared: Arc<Shared>,
 }
@@ -232,6 +233,11 @@ pub struct NodeInfo {
 }
 
 type GraphKey = (Vec<Vec<usize>>, Taps);
+
+mod adapter;
+mod train;
+pub use adapter::AdapterFormat;
+pub use train::{StepStats, TrainOptions, Trainer};
 
 pub(crate) struct Graph {
     ctx: *mut ggml_context,
@@ -883,7 +889,7 @@ impl Inner {
             return Err(Error::Backend("failed to allocate the state buffer".into()));
         }
         unsafe { ggml_backend_buffer_clear(self.state_buffer, 0) };
-        Ok(())
+        self.init_params(0)
     }
 
     /// Replaces entry's current graph with a newly built and allocated one.
@@ -924,11 +930,30 @@ impl Inner {
     }
 
     fn build_graph(&mut self, entry: &str, shapes: &[Vec<usize>], taps: &Taps) -> Result<Graph> {
+        self.build_graph_with(entry, shapes, taps, false, GRAPH_SIZE)
+    }
+
+    /// Builds entry `entry`'s graph; with `grads` the graph has gradient slots and its context room
+    /// for the backward and optimizer nodes added by training.
+    fn build_graph_with(
+        &mut self,
+        entry: &str,
+        shapes: &[Vec<usize>],
+        taps: &Taps,
+        grads: bool,
+        graph_size: usize,
+    ) -> Result<Graph> {
         let input_dims = shapes
             .iter()
             .map(|shape| Ok(ne_from_shape(shape)?[..shape.len()].to_vec()))
             .collect::<Result<Vec<_>>>()?;
-        let mem_size = unsafe { ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false) };
+        let mem_size = unsafe {
+            if grads {
+                ggml_tensor_overhead() * graph_size * 2 + 3 * ggml_graph_overhead_custom(graph_size, true)
+            } else {
+                ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false)
+            }
+        };
         let ctx = unsafe { ggml_init(ggml_init_params { mem_size, mem_buffer: null_mut(), no_alloc: true }) };
         if ctx.is_null() {
             return Err(Error::Backend("failed to create the graph context".into()));
@@ -938,7 +963,7 @@ impl Inner {
         #[cfg(not(native_device))]
         let native = false;
         let device = if !native && unsafe { ggml_backend_is_cpu(self.backends[0]) } { "cpu" } else { "gpu" };
-        match self.program.build(entry, ctx, self.file.tensors, self.states, device, &input_dims, GRAPH_SIZE, taps) {
+        match self.program.build(entry, ctx, self.file.tensors, self.states, device, &input_dims, graph_size, taps, grads) {
             Ok(built) => Ok(Graph {
                 ctx,
                 graph: built.graph,

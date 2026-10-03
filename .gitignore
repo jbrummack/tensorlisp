@@ -30,3 +30,4 @@ ports/*/rec/
 ports/*/*.png
 ports/*/*.jpg
 ports/*/*.jpeg
+/target-cuda

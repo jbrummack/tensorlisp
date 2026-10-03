@@ -30,7 +30,9 @@ mod scheme;
 
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use model::{Device, GraphInfo, Inference, LoadOptions, Model, NodeInfo, RawInput, RunOptions, RunOutput, Value};
+pub use model::{
+    AdapterFormat, Device, GraphInfo, Inference, LoadOptions, Model, NodeInfo, RawInput, RunOptions, RunOutput, StepStats, TrainOptions, Trainer, Value,
+};
 pub use program::Program;
 pub use scheme::{EntrySpec, InputSpec, PipelineSpec, RawKind, RawSpec, StateSpec, Taps};
 

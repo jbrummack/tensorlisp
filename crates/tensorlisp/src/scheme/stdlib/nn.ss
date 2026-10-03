@@ -19,8 +19,11 @@
   (define (add-bias y bias) (if bias (ggml-add y bias) y))
 
   ;; torch.nn.Linear: x [in, ...] -> [out, ...]; weight [out, in] in torch.
+  ;; With a LoRA adapter attached to `prefix` (lora-attach!), its delta is added.
   (define (linear x prefix)
-    (add-bias (ggml-mul-mat (weight (param prefix "weight")) x) (optional prefix "bias")))
+    (let* ([y (ggml-mul-mat (weight (param prefix "weight")) x)]
+           [delta (lora-delta x prefix)])
+      (add-bias (if delta (ggml-add y delta) y) (optional prefix "bias"))))
 
   ;; torch.nn.LayerNorm over axis 0. 'eps (default 1e-5, torch's; many ViTs use 1e-6).
   (define (layer-norm x prefix . opts)

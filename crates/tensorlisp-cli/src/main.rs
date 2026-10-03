@@ -6,6 +6,7 @@ mod inspect;
 mod npy;
 mod quantize;
 mod run;
+mod train;
 
 use std::path::PathBuf;
 
@@ -43,6 +44,8 @@ enum Command {
     Compare(run::CompareArgs),
     /// Quantize the weights of a GGUF file.
     Quantize(quantize::QuantizeArgs),
+    /// Fine-tune LoRA adapters of a program on JSON lines and save them in PEFT's format.
+    Train(train::TrainArgs),
 }
 
 /// Options shared by commands that load a model.
@@ -59,6 +62,16 @@ pub struct ModelArgs {
     /// Add or replace an asset the program reads with (asset NAME), NAME=PATH (repeatable).
     #[arg(long = "asset")]
     pub assets: Vec<String>,
+    /// Append these program files to --program (repeatable), e.g. a LoRA add-on like ports/t5gemma2/train.ss.
+    #[arg(long = "append")]
+    pub append: Vec<PathBuf>,
+    /// Apply this LoRA adapter (a directory written by `tl train`). The program must define its parameters
+    /// (append train.ss); the adapter's rank and alpha are set in the program from its adapter_config.json.
+    #[arg(long)]
+    pub adapter: Option<PathBuf>,
+    /// Tensor name prefix in the adapter file (PEFT's `base_model.model.` + the checkpoint's own prefix).
+    #[arg(long, default_value = "base_model.model.model.")]
+    pub adapter_key_prefix: String,
 }
 
 fn main() {
@@ -82,6 +95,7 @@ fn main() {
         Command::Process(args) => run::process(args, cli.json),
         Command::Compare(args) => run::compare(args, cli.json),
         Command::Quantize(args) => quantize::run(args, cli.json),
+        Command::Train(args) => train::run(args, cli.json),
     };
     match result {
         Ok(code) => std::process::exit(code),

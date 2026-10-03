@@ -2033,6 +2033,8 @@ dependencies = [
  "ggml-sys",
  "image",
  "ndarray",
+ "safetensors",
+ "serde_json",
  "tensorlisp-kernels",
  "thiserror",
 ]

@@ -6801,7 +6801,13 @@ static void ggml_compute_backward(
                 }
                 ggml_add_or_set(ctx, cgraph, isrc0, tmp);
             }
-            if (src1_needs_grads) {
+            if (src1_needs_grads && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) && src0->ne[2] == 1 && src0->ne[3] == 1) {
+                // tensorlisp: a frozen half-precision weight. ggml_out_prod needs an F32 src0 on the GPU
+                // backends (the weight would be copied to the CPU at every step); a mul_mat with the
+                // transposed copy of the weight runs wherever the weight is.
+                ggml_add_or_set(ctx, cgraph, isrc1,
+                        ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, src0)), grad));
+            } else if (src1_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc1,
                         // ggml_mul_mat(ctx,                   // [n,p,qq,rr]
                         //     ggml_cont(ctx,                  // [m,n,q1,r1]
@@ -6815,6 +6821,20 @@ static void ggml_compute_backward(
                             src0,               // [n,m,q1,r1]
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case GGML_OP_CONCAT: {
+            // tensorlisp: backward of concat, the slices of grad (not in upstream ggml).
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            if (src0_needs_grads) {
+                struct ggml_tensor * g0 = ggml_view_4d(ctx, grad, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, g0));
+            }
+            if (src1_needs_grads) {
+                struct ggml_tensor * g1 = ggml_view_4d(ctx, grad, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                    grad->nb[1], grad->nb[2], grad->nb[3], (size_t) src0->ne[dim] * grad->nb[dim]);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, g1));
             }
         } break;
         case GGML_OP_SCALE: {
@@ -7036,6 +7056,13 @@ static void ggml_compute_backward(
                 case GGML_UNARY_OP_RELU: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_step(ctx, src0), grad));
+                    }
+                } break;
+                case GGML_UNARY_OP_TANH: {
+                    // tensorlisp: d tanh(x) = 1 - tanh(x)^2 (not in upstream ggml).
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0,
+                            ggml_mul(ctx, grad, ggml_scale_bias(ctx, ggml_sqr(ctx, tensor), -1.0f, 1.0f)));
                     }
                 } break;
                 case GGML_UNARY_OP_SILU: {

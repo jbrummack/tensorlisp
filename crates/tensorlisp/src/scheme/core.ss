@@ -161,6 +161,50 @@
       (when (eqv? p 0) (error 'state "no state with this name; declare it with define-state" name))
       (make-tensor p ctx))))
 
+;; Trainable parameters (training only; see docs/design/training.md): a state that
+;; the trainer fills at load and updates with the optimizer. f32, ggml dims.
+;; init: 'zeros, or a number b > 0 for uniform values in [-b, b].
+;;
+;; (define-param "lora.q.A" 0.04 640 8)
+(define-syntax define-param
+  (syntax-rules ()
+    [(_ name init dim ...) (%define-param! name init (list dim ...))]))
+
+(define (%define-param! name init dims)
+  (unless (or (eq? init 'zeros) (and (real? init) (> init 0)))
+    (error 'define-param "init must be 'zeros or a positive number (uniform bound)" init))
+  (%define-state! name 'f32 dims)
+  (let ([slot (%loading)])
+    (set-car! (vector-ref slot 4) (list name 'f32 dims (if (eq? init 'zeros) 0.0 (inexact init))))))
+
+;; LoRA: y = W x + (alpha / r) B (A x) on a linear layer (PEFT semantics: A is
+;; kaiming-uniform (a = sqrt 5), B zeros). (lora-attach! prefix in out) declares the
+;; adapter of module `prefix` (after (lora-config! rank alpha)); nn:linear then adds its
+;; delta. A is [in, r] and B [r, out] in ggml order, which is torch's lora_A / lora_B
+;; weights [r, in] and [out, r] in memory.
+(define %lora-rank 0)
+(define %lora-alpha 0.0)
+(define %lora-modules (make-hashtable string-hash string=?))
+
+(define (lora-config! rank alpha)
+  (unless (and (fixnum? rank) (> rank 0)) (error 'lora-config! "rank must be a positive integer" rank))
+  (set! %lora-rank rank)
+  (set! %lora-alpha (inexact alpha)))
+
+(define (lora-attach! prefix in out)
+  (when (= %lora-rank 0) (error 'lora-attach! "call lora-config! first"))
+  (%define-param! (string-append "lora." prefix ".A") (/ 1.0 (sqrt (inexact in))) (list in %lora-rank))
+  (%define-param! (string-append "lora." prefix ".B") 'zeros (list %lora-rank out))
+  (hashtable-set! %lora-modules prefix (/ %lora-alpha %lora-rank)))
+
+;; The adapter's contribution to module `prefix` for input x [in, ...], or #f without one.
+(define (lora-delta x prefix)
+  (let ([scale (hashtable-ref %lora-modules prefix #f)])
+    (and scale
+         (ggml-scale (ggml-mul-mat (state (string-append "lora." prefix ".B"))
+                                   (ggml-mul-mat (state (string-append "lora." prefix ".A")) x))
+                     scale))))
+
 ;; Adds t (e.g. a write into state) to the graph now; returns t.
 (define (effect t)
   (let ([g (%graph)])
@@ -1478,7 +1522,9 @@
         (and post (map symbol->string (car post)))
         (map (lambda (p) (list (symbol->string (car p)) (%raw-spec->strings (cadr p))))
              (%model-pipelines m))
-        (map (lambda (st) (list (car st) (symbol->string (cadr st)) (caddr st)))
+        (map (lambda (st) (if (pair? (cdddr st))
+                              (list (car st) (symbol->string (cadr st)) (caddr st) (cadddr st))
+                              (list (car st) (symbol->string (cadr st)) (caddr st))))
              (reverse (vector-ref slot 4)))))))
 
 (define (%host-arg a)
@@ -1574,7 +1620,7 @@
 ;; names to read back. Returns
 ;; (graph (input-address ...) (output ...) (tap ...) (tap-name ...)), where
 ;; outputs and taps are (name-string address rank).
-(define ($tl-build id entry ctx weights states device input-dims graph-size taps)
+(define ($tl-build id entry ctx weights states device input-dims graph-size taps grads)
   (let ([m (hashtable-ref %models id #f)]
         [tap-slot (box '())])
     (unless m (error 'build "unknown model" id))
@@ -1584,7 +1630,7 @@
     (set! %op 'inputs)
     (set! %pending '())
     (parameterize ([%ctx ctx] [%weights weights] [%states states] [%taps tap-slot] [%device (string->symbol device)]
-                   [%graph (ggml_new_graph_custom ctx graph-size #f)])
+                   [%graph (ggml_new_graph_custom ctx graph-size grads)])
       (let* ([inputs (map (lambda (spec ne) (%new-input ctx spec ne))
                           (car m) input-dims)]
              [outs (apply (cdr m) (map (lambda (p) (make-tensor p ctx)) inputs))])

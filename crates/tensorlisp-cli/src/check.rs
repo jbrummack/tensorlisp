@@ -39,6 +39,9 @@ pub fn run(args: &CheckArgs, json: bool) -> Result<i32> {
         program: args.program.clone(),
         device: DeviceArg(Device::Cpu),
         assets: args.assets.clone(),
+        append: Vec::new(),
+        adapter: None,
+        adapter_key_prefix: String::new(),
     })?;
 
     let entry = model.entry(args.entry.as_deref())?.name.clone();

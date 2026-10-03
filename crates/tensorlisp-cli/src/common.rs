@@ -38,12 +38,55 @@ pub fn read_assets(args: &[String]) -> Result<Vec<(String, Vec<u8>)>> {
         .collect()
 }
 
-pub fn load_model(args: &ModelArgs) -> Result<Model> {
-    let options = LoadOptions {
-        program: args.program.as_ref().map(read_program).transpose()?,
-        assets: read_assets(&args.assets)?,
+/// `(define NAME VALUE)` in a program's text, with VALUE replaced.
+pub fn set_define(text: &str, name: &str, value: &str) -> Result<String> {
+    let head = format!("(define {name} ");
+    let start = text.find(&head).with_context(|| format!("the program has no (define {name} ...) to set"))?;
+    let end = start + text[start..].find(')').context("unbalanced define")?;
+    Ok(format!("{}{head}{value}{}", &text[..start], &text[end..]))
+}
+
+/// The program text of `--program` plus `--append`s, or `None` to use the model file's own program.
+pub fn program_text(args: &ModelArgs) -> Result<Option<String>> {
+    let Some(program) = &args.program else {
+        if !args.append.is_empty() {
+            bail!("--append needs --program: the program stored in the model file can't be extended");
+        }
+        return Ok(None);
     };
-    Model::load_with(&args.model, args.device.0, options).with_context(|| format!("loading {}", args.model.display()))
+    let Program::Text(mut text) = read_program(program)?;
+    for extra in &args.append {
+        let Program::Text(t) = read_program(extra)?;
+        text.push('\n');
+        text.push_str(&t);
+    }
+    Ok(Some(text))
+}
+
+pub fn adapter_format(args: &ModelArgs, alpha: f32) -> tensorlisp::AdapterFormat {
+    tensorlisp::AdapterFormat { key_prefix: args.adapter_key_prefix.clone(), alpha, base_model: args.model.display().to_string() }
+}
+
+pub fn load_model(args: &ModelArgs) -> Result<Model> {
+    let mut text = program_text(args)?;
+    let mut alpha = 16.0;
+    if let Some(dir) = &args.adapter {
+        // The adapter's rank and alpha decide the shapes of the parameters the program defines.
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join("adapter_config.json")).with_context(|| format!("reading {}/adapter_config.json", dir.display()))?,
+        )?;
+        let rank = config["r"].as_u64().context("adapter_config.json has no r")?;
+        alpha = config["lora_alpha"].as_f64().context("adapter_config.json has no lora_alpha")? as f32;
+        let t = text.take().context("--adapter needs --program and --append with the program's LoRA add-on")?;
+        text = Some(set_define(&set_define(&t, "lora-rank", &rank.to_string())?, "lora-alpha", &format!("{alpha:?}"))?);
+    }
+    let options = LoadOptions { program: text.map(Program::Text), assets: read_assets(&args.assets)? };
+    let model = Model::load_with(&args.model, args.device.0, options).with_context(|| format!("loading {}", args.model.display()))?;
+    if let Some(dir) = &args.adapter {
+        let n = model.load_adapter(dir, &adapter_format(args, alpha))?;
+        eprintln!("applied the adapter {} ({n} tensors)", dir.display());
+    }
+    Ok(model)
 }
 
 /// Raw examples from `NAME=VALUE` arguments: `@path` reads a file (decoded
