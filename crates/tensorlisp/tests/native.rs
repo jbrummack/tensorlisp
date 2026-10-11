@@ -302,6 +302,69 @@ fn attention_with_large_head_sizes() {
     }
 }
 
+/// Paged attention (vLLM pool layouts, Tree kernels on Vulkan and PTX) against the dense flash attention
+/// on the same K/V: one pool filled through the cache write with shuffled blocks, sequences of unequal
+/// length, grouped K/V heads, the head sizes of real decoders.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn paged_attention_matches_dense() {
+    for (hs, kvh, bs) in [(64usize, 1usize, 16usize), (128, 2, 8), (256, 1, 16), (512, 1, 32)] {
+        let (seqs, heads, n_max) = (3usize, 4usize, 70usize);
+        let max_blocks = n_max.div_ceil(bs);
+        let blocks = seqs * max_blocks;
+        let lens = [n_max, 33, 5];
+        let program = format!(
+            r#"
+          (import (tl attn))
+          (define hs {hs}) (define bs {bs}) (define kvh {kvh}) (define heads {heads}) (define seqs {seqs}) (define n-max {n_max})
+          (define-state "pk" f16 hs bs kvh {blocks})
+          (define-state "pv" f16 hs bs kvh {blocks})
+          (define (to-f16 t) (ggml-cast t GGML_TYPE_F16))
+          (define (to-f32 t) (ggml-cast t GGML_TYPE_F32))
+          (model fill (inputs [k f32 ({hd} _)] [v f32 ({hd} _)] [slots i32 (_)])
+            (effect (paged-cache-write (to-f16 k) (to-f16 v) (state "pk") (state "pv") slots bs kvh))
+            (outputs))
+          (model attend (inputs [q f32 (hs heads seqs)] [tables i32 ({max_blocks} seqs)] [lens i32 (seqs)]
+                                [kd f32 (hs n-max kvh seqs)] [vd f32 (hs n-max kvh seqs)] [valid f32 (n-max seqs)])
+            (define scale (/ 1.0 (sqrt (inexact hs))))
+            (define paged (to-f32 (paged-attention (to-f16 q) (state "pk") (state "pv") tables lens bs n-max scale kvh)))
+            (define dense (attn:sdpa (ggml-reshape-4d q hs 1 heads seqs) kd vd 'mask (attn:padding-mask valid 1) 'flash #t))
+            (outputs [paged (ggml-reshape-2d paged (* hs heads) seqs) 2]
+                     [dense (ggml-reshape-2d dense (* hs heads) seqs) 2]))
+        "#,
+            hd = hs * kvh
+        );
+        let path = write(&format!("paged-{hs}-{kvh}-{bs}"), &program, &[]);
+        let model = Model::load(&path, Device::Native).unwrap();
+        let tokens = seqs * n_max;
+        let (k, v, q) = (noise(&[tokens, kvh * hs], 11), noise(&[tokens, kvh * hs], 12), noise(&[seqs, heads, hs], 13));
+        // Sequence s owns blocks s * max_blocks.. but in reverse, so the table is not the identity.
+        let block = |s: usize, b: usize| s * max_blocks + (max_blocks - 1 - b);
+        let mut slots = Array::zeros(IxDyn(&[2 * tokens]));
+        let mut tables = Array::zeros(IxDyn(&[seqs, max_blocks]));
+        for s in 0..seqs {
+            for b in 0..max_blocks {
+                tables[[s, b]] = block(s, b) as f32;
+            }
+            for j in 0..n_max {
+                // positions past a sequence's length are not written (negative slot)
+                slots[[2 * (s * n_max + j)]] = if j < lens[s] { (block(s, j / bs) * bs + j % bs) as f32 } else { -1.0 };
+            }
+        }
+        run(&model, "fill", &[("k", &k), ("v", &v), ("slots", &slots)]);
+        let dense_of = |x: &ArrayD<f32>| -> ArrayD<f32> {
+            x.view().into_shape_with_order(IxDyn(&[seqs, n_max, kvh, hs])).unwrap().permuted_axes(IxDyn(&[0, 2, 1, 3])).as_standard_layout().into_owned()
+        };
+        let (kd, vd) = (dense_of(&k), dense_of(&v));
+        let lens_a = Array::from_shape_fn(IxDyn(&[seqs]), |i| lens[i[0]] as f32);
+        let valid = Array::from_shape_fn(IxDyn(&[seqs, n_max]), |i| if i[1] < lens[i[0]] { 1.0f32 } else { 0.0 });
+        let out = run(&model, "attend", &[("q", &q), ("tables", &tables), ("lens", &lens_a), ("kd", &kd), ("vd", &vd), ("valid", &valid)]);
+        let (paged, dense) = (&out.iter().find(|(n, _)| n == "paged").unwrap().1, &out.iter().find(|(n, _)| n == "dense").unwrap().1);
+        close(&format!("paged vs dense hs={hs} kv_heads={kvh} block={bs}"), paged, dense, 4e-3);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 #[test]
 fn state_and_set_rows_persist_between_runs() {
     let program = r#"

@@ -53,7 +53,10 @@ pub(super) fn q8_dot_plan(graph: &Graph, caps: &Caps, id: TensorId) -> Option<Do
     let dense = |x: &crate::graph::Tensor| x.nb[2] == x.nb[1] * x.ne[1] as u64 && x.nb[3] == x.nb[2] * x.ne[2] as u64;
     let batch = tb.ne[2] * tb.ne[3];
     let n = if batch == 1 { tb.ne[1] } else if dense(tb) && dense(t) { tb.ne[1] * batch } else { return None };
-    if !(1..=8).contains(&n) {
+    // TL_TREE_DOT_MAXN: the most columns the dp4a mat-vec takes (default 64; it holds a
+    // sum per column per lane and beats dequantizing q8_0 inside the tensor-core matmul up to there).
+    let maxn: i64 = std::env::var("TL_TREE_DOT_MAXN").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    if !(1..=maxn).contains(&n) {
         return None;
     }
     let words = n as u64 * k as u64 / 4;

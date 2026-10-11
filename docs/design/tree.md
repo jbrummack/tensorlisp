@@ -280,8 +280,13 @@ POOL_2D, CONV_2D_DW, some UNARY, UPSCALE, odd MUL_MAT types). Checked on the RTX
 text generation (same text as the CPU backend), Gemma 4 E2B q8_0 (32 greedy tokens equal to transformers), batched dense and
 paged decoding of T5Gemma2; Gemma 4 paged differs from dense/sequential at one near-tie token in one of four sequences.
 Gemma 4 E2B q8_0 aggregate tokens/s, 6-token prompts (the NVRTC executor / Tree on PTX): 1 sequence 36 / 131 (sequential
-decode-step), batched dense 1: 37 / 140, 4: 90 / 517, 8: 110 / 737; from 16 sequences on the q8_0 matrix path is slow
-(16: 186 / 67, 64: 635 / 689): the next thing to tune.
+decode-step), batched dense 1: 37 / 140, 4: 90 / 517, 8: 110 / 737, 16: 186 / 937, 32: 347 / 1118, 64: 635 / 945.
+The last three used to be 67, 350 and 689 on Tree: with more than 8 columns a q8_0 product went to the tensor-core matmul, which
+dequantizes the weights inside the tile and sat at ~85 ms a step whatever the batch (the weights are read at a fraction of the
+bandwidth). The dp4a mat-vec is generic in the column count and now takes up to 64 columns (`TL_TREE_DOT_MAXN`, default 64):
+16 sequences 17 ms a step, 32 28 ms, 64 68 ms (against 93 ms for the tensor-core path). Beyond 64 columns (prefill) the matmul
+is compute-bound and the tensor cores stay. `native.rs::paged_attention_matches_dense` checks the paged kernels against dense
+attention on the same K/V (hs 64..512, grouped heads, shuffled blocks, unequal lengths): 2.5e-4 on PTX, 7e-4 on Vulkan.
 
 Bug found on the way: the PTX `exp` returned NaN for -inf (its error-correction term is inf - inf), which only shows with masked
 keys *inside* a valid range (masked suffixes are never evaluated); fixed, regression test `attention_with_large_head_sizes`.
