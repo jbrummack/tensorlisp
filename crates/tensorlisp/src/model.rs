@@ -271,7 +271,8 @@ struct Inner {
     #[cfg(native_device)]
     native: Option<crate::native::Native>,
     #[cfg(native_device)]
-    native_graphs: HashMap<String, (GraphKey, crate::native::NativeProgram)>,
+    /// Per entry, one compiled program per distinct input shape (prefill and decode alternate).
+    native_graphs: HashMap<String, Vec<(GraphKey, crate::native::NativeProgram)>>,
     /// Set when an assertion fired during compute.
     poisoned: Option<String>,
 }
@@ -835,20 +836,31 @@ impl Inner {
     /// Runs entry `name` on the native device: compiles its graph for these shapes if needed, then replays it.
     #[cfg(native_device)]
     fn run_native(&mut self, name: &str, spec: &EntrySpec, ordered: &[&ArrayViewD<f32>], key: GraphKey) -> Result<RunOutput> {
-        if self.native_graphs.get(name).is_none_or(|(k, _)| *k != key) {
-            let graph = self.build_graph(name, &key.0, &key.1)?;
-            let compiled = crate::native::NativeProgram::compile(
-                self.native.as_ref().unwrap(),
-                graph.graph,
-                &graph.inputs,
-                &graph.outputs,
-                &graph.taps,
-            );
-            unsafe { ggml_free(graph.ctx) };
-            self.native_graphs.insert(name.to_string(), (key, compiled?));
-        }
+        let cached = self.native_graphs.get(name).and_then(|v| v.iter().position(|(k, _)| *k == key));
+        let slot = match cached {
+            Some(slot) => slot,
+            None => {
+                let graph = self.build_graph(name, &key.0, &key.1)?;
+                let compiled = crate::native::NativeProgram::compile(
+                    self.native.as_ref().unwrap(),
+                    graph.graph,
+                    &graph.inputs,
+                    &graph.outputs,
+                    &graph.taps,
+                );
+                unsafe { ggml_free(graph.ctx) };
+                let list = self.native_graphs.entry(name.to_string()).or_default();
+                // A handful of shapes is normal (prefill, decode); keep memory bounded for models
+                // fed many different shapes by dropping the oldest.
+                if list.len() >= 8 {
+                    list.remove(0);
+                }
+                list.push((key, compiled?));
+                list.len() - 1
+            }
+        };
         let native = self.native.as_ref().unwrap();
-        let (_, program) = &self.native_graphs[name];
+        let (_, program) = &self.native_graphs[name][slot];
         for (i, (array, spec)) in ordered.iter().zip(&spec.inputs).enumerate() {
             let data = array.as_standard_layout();
             if spec.dtype == "i32" {

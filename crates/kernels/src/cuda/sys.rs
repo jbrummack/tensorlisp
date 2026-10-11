@@ -27,6 +27,7 @@ pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
+pub type CUevent = *mut c_void;
 /// Always 64-bit: the driver API's pointer type regardless of host pointer width.
 pub type CUdeviceptr = c_ulonglong;
 
@@ -66,6 +67,14 @@ driver_api! {
     cuMemsetD8_v2: fn(dst: CUdeviceptr, value: u8, n: usize) -> CUresult,
     cuMemcpyHtoD_v2: fn(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult,
     cuMemcpyDtoH_v2: fn(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult,
+    cuMemcpyHtoDAsync_v2: fn(dst: CUdeviceptr, src: *const c_void, bytes: usize, stream: CUstream) -> CUresult,
+    cuMemcpyDtoHAsync_v2: fn(dst: *mut c_void, src: CUdeviceptr, bytes: usize, stream: CUstream) -> CUresult,
+    cuMemsetD8Async: fn(dst: CUdeviceptr, value: u8, n: usize, stream: CUstream) -> CUresult,
+    cuEventCreate: fn(event: *mut CUevent, flags: c_uint) -> CUresult,
+    cuEventRecord: fn(event: CUevent, stream: CUstream) -> CUresult,
+    cuEventQuery: fn(event: CUevent) -> CUresult,
+    cuEventSynchronize: fn(event: CUevent) -> CUresult,
+    cuEventDestroy_v2: fn(event: CUevent) -> CUresult,
     cuModuleLoadDataEx: fn(
         module: *mut CUmodule,
         image: *const c_void,
@@ -101,6 +110,14 @@ pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 1;
+pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X: c_int = 5;
+pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y: c_int = 6;
+pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z: c_int = 7;
+/// `CU_EVENT_DISABLE_TIMING`.
+pub const CU_EVENT_DISABLE_TIMING: c_uint = 0x2;
+/// `CUDA_ERROR_NOT_READY`: an event or stream has work pending.
+pub const CUDA_ERROR_NOT_READY: CUresult = 600;
 
 macro_rules! nvrtc_api {
     ($( $name:ident : fn($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty ),* $(,)?) => {

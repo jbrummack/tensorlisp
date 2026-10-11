@@ -185,6 +185,21 @@ impl Tensor {
     }
 }
 
+/// A node several others were fused into (op `"FUSED_*"`): the arguments of the Tree generator
+/// (a Scheme expression's tail, e.g. `'((f32 full)) 'f32 '(...) 't0 0` for `(k:ew ...)`) and the
+/// push words.
+#[derive(Clone, Debug)]
+pub struct Fused {
+    pub args: String,
+    pub push: Vec<u32>,
+    /// `FUSED_ROW`: the first `n_inputs` sources are inputs, the rest tensors the chain also writes
+    /// (`taps`, as the stage whose value each one is).
+    pub n_inputs: usize,
+    pub taps: Vec<usize>,
+    /// `FUSED_ROW`: the stage whose value is the node's own result.
+    pub last_stage: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     pub tensors: Vec<Tensor>,
@@ -192,6 +207,14 @@ pub struct Graph {
     pub nodes: Vec<TensorId>,
     /// Tensors that must stay valid after the last node (outputs, taps).
     pub keep: Vec<TensorId>,
+    /// Details of the fused nodes (see `vulkan/fuse_tree.rs`), by node.
+    pub fused: std::collections::HashMap<TensorId, Fused>,
+    /// Tensors whose producer writes int8 blocks (k:quantize-q8's `xq`, then `xd`, in the tensor's
+    /// own bytes) instead of f32, because every reader is a dp4a mat-vec.
+    pub q8_out: std::collections::HashSet<TensorId>,
+    /// Activation tensor -> a tensor holding its int8 blocks next to it: the producer writes both
+    /// (the f32 values are read by other nodes), and the dp4a mat-vecs read the blocks.
+    pub q8_side: std::collections::HashMap<TensorId, TensorId>,
 }
 
 impl Graph {

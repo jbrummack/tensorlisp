@@ -31,3 +31,6 @@ ports/*/*.png
 ports/*/*.jpg
 ports/*/*.jpeg
 /target-cuda
+
+# glslang release used to compile GLSL when the Vulkan SDK (glslc) is not installed
+/vendor/glslang

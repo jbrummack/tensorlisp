@@ -22,6 +22,7 @@ impl Target {
 struct Backends {
     metal: bool,
     cuda: bool,
+    vulkan: bool,
 }
 
 impl Backends {
@@ -36,7 +37,11 @@ impl Backends {
         if cuda && target.os == "macos" {
             panic!("the cuda backend is not supported on macOS; use metal instead");
         }
-        Backends { metal, cuda }
+        let vulkan = feature("VULKAN");
+        if vulkan && target.os == "macos" {
+            panic!("the vulkan backend is not supported on macOS; use metal instead");
+        }
+        Backends { metal, cuda, vulkan }
     }
 }
 
@@ -78,6 +83,79 @@ impl Cuda {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "86".to_string())
     }
+}
+
+/// A detected Vulkan SDK plus the generated shader sources, used to compile
+/// `ggml-vulkan`. The backend loads the Vulkan loader at run time through
+/// vulkan.hpp's dynamic dispatcher, so only headers are needed to build.
+struct Vulkan {
+    include: PathBuf,
+    lib_dir: Option<PathBuf>,
+    /// `ggml-vulkan-shaders.hpp` and one `<shader>.comp.cpp` per shader, as
+    /// written by scripts/build-ggml-vulkan-shaders.sh.
+    gen_dir: PathBuf,
+    /// `GGML_VULKAN_*_GLSLC_SUPPORT` macros the shaders were generated with.
+    defines: Vec<String>,
+}
+
+impl Vulkan {
+    fn detect(target: &Target) -> Vulkan {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
+            roots.push(PathBuf::from(sdk));
+        }
+        if target.os == "windows" {
+            if let Ok(rd) = std::fs::read_dir(r"C:\VulkanSDK") {
+                let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+                dirs.sort();
+                roots.extend(dirs.into_iter().rev());
+            }
+        }
+        let include = roots
+            .iter()
+            .flat_map(|r| [r.join("Include"), r.join("include")])
+            .chain([PathBuf::from("/usr/include"), PathBuf::from("/usr/local/include")])
+            .find(|d| d.join("vulkan").join("vulkan.hpp").is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the vulkan feature needs the Vulkan SDK headers (vulkan/vulkan.hpp): install the Vulkan SDK \
+                     and set VULKAN_SDK, or install libvulkan-dev"
+                )
+            });
+        let lib_dir = roots.iter().flat_map(|r| [r.join("Lib"), r.join("lib")]).find(|d| d.is_dir());
+        let gen_dir = std::env::var_os("GGML_VULKAN_SHADERS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repo_root().join("target").join("ggml-vulkan").join("gen"));
+        if !gen_dir.join("ggml-vulkan-shaders.hpp").is_file() {
+            panic!(
+                "the vulkan feature needs the generated shader sources in {}: run scripts/build-ggml-vulkan-shaders.sh \
+                 (needs glslc from the Vulkan SDK), or set GGML_VULKAN_SHADERS",
+                gen_dir.display()
+            );
+        }
+        let defines = std::fs::read_to_string(gen_dir.join("feature-defines.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        Vulkan { include, lib_dir, gen_dir, defines }
+    }
+}
+
+/// Sources for the `ggml-vulkan` backend: the host file plus every generated shader unit.
+fn vulkan_sources(src: &Path, vk: &Vulkan) -> Vec<PathBuf> {
+    let mut files = vec![src.join("ggml-vulkan").join("ggml-vulkan.cpp")];
+    let mut shaders: Vec<PathBuf> = std::fs::read_dir(&vk.gen_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", vk.gen_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "cpp"))
+        .collect();
+    shaders.sort();
+    files.extend(shaders);
+    files
 }
 
 /// Sources for the `ggml-cuda` backend, matching
@@ -188,6 +266,9 @@ fn generate_bindings(include: &Path, backends: &Backends) {
     if backends.cuda {
         headers.push("ggml-cuda");
     }
+    if backends.vulkan {
+        headers.push("ggml-vulkan");
+    }
     let headers = headers
         .iter()
         .map(|name| include.join(format!("{name}.h")).to_str().unwrap().to_string())
@@ -290,6 +371,9 @@ fn build_ggml(target: &Target, backends: &Backends) {
     }
     if backends.cuda {
         base.define("GGML_USE_CUDA", None);
+    }
+    if backends.vulkan {
+        base.define("GGML_USE_VULKAN", None);
     }
 
     let (arch_c, arch_cpp) = cpu_arch_sources(target, &ggml_cpu);
@@ -404,6 +488,38 @@ fn build_ggml(target: &Target, backends: &Backends) {
         println!("cargo:rustc-link-lib=cudadevrt");
     }
 
+    if backends.vulkan {
+        let vk = Vulkan::detect(target);
+        let mut build = cc::Build::new();
+        build
+            .cpp(true)
+            .std("c++17")
+            .includes([&include, &src, &src.join("ggml-vulkan"), &vk.include, &vk.gen_dir])
+            .define("GGML_USE_VULKAN", None)
+            .define("GGML_VERSION", "\"unknown\"")
+            .define("GGML_COMMIT", "\"unknown\"")
+            .define("NOMINMAX", None)
+            .define("WIN32_LEAN_AND_MEAN", None)
+            .flag_if_supported("-O3")
+            .flag_if_supported("/bigobj")
+            .warnings(false);
+        for d in &vk.defines {
+            build.define(d, None);
+        }
+        build.files(vulkan_sources(&src, &vk)).compile("ggml_vulkan_impl");
+        println!("cargo:rerun-if-changed={}", vk.gen_dir.display());
+        if let Some(lib_dir) = &vk.lib_dir {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+        // The loader itself: vulkan.hpp resolves entry points dynamically, but a few
+        // raw vk* prototypes are referenced too.
+        if target.os == "windows" {
+            println!("cargo:rustc-link-lib=vulkan-1");
+        } else {
+            println!("cargo:rustc-link-lib=vulkan");
+        }
+    }
+
     if target.os == "windows" {
         // ggml-cpu.c reads CPU info via the Windows Registry API.
         println!("cargo:rustc-link-lib=dylib=advapi32");
@@ -438,6 +554,11 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(ggml_cuda)");
     if backends.cuda {
         println!("cargo:rustc-cfg=ggml_cuda");
+    }
+
+    println!("cargo:rustc-check-cfg=cfg(ggml_vulkan)");
+    if backends.vulkan {
+        println!("cargo:rustc-cfg=ggml_vulkan");
     }
 
     generate_bindings(&ggml_root().join("include"), &backends);

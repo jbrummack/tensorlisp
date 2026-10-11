@@ -23,6 +23,9 @@ mod native;
 #[cfg(all(feature = "native-cuda", not(target_os = "macos")))]
 #[path = "native_cuda.rs"]
 mod native;
+#[cfg(all(feature = "native-vulkan", not(feature = "native-cuda"), not(target_os = "macos")))]
+#[path = "native_vulkan.rs"]
+mod native;
 pub mod log;
 pub mod model;
 pub mod program;

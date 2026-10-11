@@ -20,6 +20,7 @@ use sys::{
     CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, CUDA_SUCCESS, NVRTC_SUCCESS,
 };
 
+pub mod backend;
 pub mod exec;
 pub mod lower;
 pub mod paged_attn;
@@ -378,6 +379,26 @@ impl Device {
         unsafe { (nv.nvrtcGetPTX)(prog, ptx.as_mut_ptr() as *mut i8) };
         unsafe { (nv.nvrtcDestroyProgram)(&mut prog) };
 
+        self.load_ptx(key, &ptx, lowered)
+    }
+
+    /// Loads PTX text (`Code::Ptx` blobs, e.g. from the Tree compiler) through the driver's JIT:
+    /// no NVRTC, no toolkit. `entry` names are plain symbols.
+    pub fn library_ptx(&self, key: &str, ptx: &str) -> Result<Arc<str>> {
+        {
+            let libs = self.libraries.lock().unwrap();
+            if let Some((k, _)) = libs.get_key_value(key) {
+                return Ok(k.clone());
+            }
+        }
+        self.make_current()?;
+        let mut bytes = ptx.as_bytes().to_vec();
+        bytes.push(0);
+        self.load_ptx(key, &bytes, HashMap::new())
+    }
+
+    /// `cuModuleLoadDataEx` of NUL-terminated PTX; registers the module under `key`.
+    fn load_ptx(&self, key: &str, ptx: &[u8], lowered: HashMap<String, CString>) -> Result<Arc<str>> {
         let drv = sys::driver().ok_or(Error::NoDevice)?;
         let mut module: CUmodule = std::ptr::null_mut();
         let mut log_buf = vec![0u8; 8192];

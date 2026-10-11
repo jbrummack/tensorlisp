@@ -12,6 +12,9 @@
 
 pub mod graph;
 pub mod plan;
+pub mod sched;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 #[cfg(target_os = "macos")]
 pub mod metal;
 #[cfg(feature = "cuda")]

@@ -69,7 +69,7 @@ fn decode_attention_paged_vs_flash() {
             tensor(Ty::F16, [rows as i64, 1, 1, 1], "NONE", Storage::Input(1), vec![]),
             tensor(Ty::F32, [HS as i64, HEADS as i64, 1, 1], "FLASH_ATTN_EXT", Storage::Temp, vec![Some(0), Some(1), Some(2), Some(3)]),
         ];
-        let graph = Graph { tensors, nodes: vec![4], keep: vec![4] };
+        let graph = Graph { tensors, nodes: vec![4], keep: vec![4], fused: Default::default(), q8_out: Default::default(), q8_side: Default::default() };
         let cache_bytes = (rows * HS * 2) as u64;
         let states = [0, align(cache_bytes)];
         let state = dev.alloc((align(cache_bytes) * 2) as usize).unwrap();

@@ -79,7 +79,9 @@ fn matmul_kernels_by_type_and_batch() {
         .iter()
         .map(|n| format!("(model n{n} (inputs [x f32 ({k} {n})]) (outputs [y (ggml-mul-mat (weight \"w\") x) 2]))\n"))
         .collect();
-    for dtype in ["f32", "f16", "bf16", "q4_0", "q8_0", "q4_K", "q6_K"].map(|n| DType::parse(n).unwrap()) {
+    // ggml's Vulkan shaders have no f32-activation matrix-matrix kernel for bf16 weights.
+    let skip_bf16 = cfg!(all(feature = "native-vulkan", not(feature = "native-cuda"), not(target_os = "macos")));
+    for dtype in ["f32", "f16", "bf16", "q4_0", "q8_0", "q4_K", "q6_K"].into_iter().filter(|n| !(skip_bf16 && *n == "bf16")).map(|n| DType::parse(n).unwrap()) {
         let path = write(&format!("mm-{dtype}"), &entries, &[Weight { name: "w", dtype, data: &w }]);
         let model = Model::load(&path, Device::Native).unwrap();
         // The dequantized weights are the exact reference for this type.
@@ -93,8 +95,11 @@ fn matmul_kernels_by_type_and_batch() {
             let x = noise(&[n, k], 10 + n as u64);
             let got = run(&model, &format!("n{n}"), &[("x", &x)]).remove(0).1;
             let want = x.clone().into_dimensionality::<ndarray::Ix2>().unwrap().dot(&stored.t());
-            // Matrix-matrix kernels round operands to half.
-            close(&format!("{dtype} n={n}"), &got, &want.into_dyn(), 4e-3);
+            // Matrix-matrix kernels round operands to half. Tree's q8_0 mat-vec (TL_NATIVE_TREE, the
+            // default unless TL_TREE_DOT=0) quantizes the activations to int8 first, as ggml's CPU and
+            // CUDA backends do: ~0.5% of the scale.
+            let quantized_acts = format!("{dtype}") == "q8_0" && n <= 8 && std::env::var("TL_NATIVE_TREE").is_ok_and(|v| v != "0") && std::env::var("TL_TREE_DOT").map_or(true, |v| v != "0");
+            close(&format!("{dtype} n={n}"), &got, &want.into_dyn(), if quantized_acts { 1e-2 } else { 4e-3 });
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -175,6 +180,34 @@ fn attention_masks_and_flash() {
             valid[[1, j]] = 0.0;
         }
         // Flash attention keeps K/V in half precision.
+        same_as_cpu(&path, "sdpa", &[("q", &q), ("k", &k), ("v", &v), ("valid", &valid)], 8e-3);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// One query over a long cache: Tree kernels split the keys into chunks (flash_attn_part +
+/// flash_attn_combine); masks that leave whole chunks empty, a chunk edge inside the valid part, and
+/// grouped K/V heads.
+#[test]
+fn split_kv_decode_attention() {
+    for (nk, valid0, valid1) in [(300usize, 300usize, 300usize), (1000, 750, 5), (512, 129, 128), (777, 1, 777)] {
+        let program = format!(
+            r#"
+          (import (tl attn))
+          (model sdpa (inputs [q f32 (64 1 4 2)] [k f32 (64 {nk} 2 2)] [v f32 (64 {nk} 2 2)] [valid f32 ({nk} 2)])
+            (define mask (attn:padding-mask valid 1))
+            (outputs [flash (attn:sdpa q k v 'mask mask 'flash #t) 3]))
+        "#
+        );
+        let path = write(&format!("split-{nk}"), &program, &[]);
+        let (q, k, v) = (noise(&[2, 4, 1, 64], 1), noise(&[2, 2, nk, 64], 2), noise(&[2, 2, nk, 64], 3));
+        let mut valid = ArrayD::<f32>::zeros(IxDyn(&[2, nk]));
+        for j in 0..valid0 {
+            valid[[0, j]] = 1.0;
+        }
+        for j in 0..valid1 {
+            valid[[1, j]] = 1.0;
+        }
         same_as_cpu(&path, "sdpa", &[("q", &q), ("k", &k), ("v", &v), ("valid", &valid)], 8e-3);
         std::fs::remove_file(path).unwrap();
     }
@@ -275,6 +308,35 @@ fn state_and_set_rows_persist_between_runs() {
     let x = noise(&[1, 4], 30);
     let sum = run(&native, "add", &[("x", &x), ("at", &at)]).remove(0).1;
     close("after reset", &sum, &x.clone().into_shape_with_order(IxDyn(&[4])).unwrap(), 1e-6);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn norm_weight_rope_chains_match_unfused() {
+    // rms_norm * weight (* rope) is fused on devices that have the fused shaders; the result
+    // must not change, including when the norm output has a second reader (then it cannot fuse).
+    let program = r#"
+      (import (tl nn) (tl attn))
+      (model chain (inputs [x f32 (64 2 5)] [pos i32 (5)])
+        (define n (nn:rms-norm x "nw"))
+        (outputs [norm n 3]
+                 [neox (attn:rope (nn:rms-norm x "nw") pos 'base 1000.0) 3]
+                 [plain (ggml-rope-ext (nn:rms-norm x "nw") pos #f 64 0 0 1000.0 1.0 0.0 1.0 0.0 0.0) 3]
+                 [shared (ggml-add (attn:rope n pos 'base 1000.0) n) 3]))
+      (model wide (inputs [x f32 (96 4 3)])
+        (outputs [y (nn:rms-norm x "ww") 3] [half (nn:rms-norm x "wh") 3]))
+    "#;
+    let nw = noise(&[64], 11);
+    let ww = noise(&[96], 12);
+    let wh = noise(&[48], 15);
+    let path = write(
+        "norm-rope",
+        program,
+        &[Weight { name: "nw.weight", dtype: DType::F32, data: &nw }, Weight { name: "ww.weight", dtype: DType::F32, data: &ww }, Weight { name: "wh.weight", dtype: DType::F32, data: &wh }],
+    );
+    let pos = ndarray::arr1(&[0.0f32, 1.0, 5.0, 6.0, 31.0]).into_dyn();
+    same_as_cpu(&path, "chain", &[("x", &noise(&[5, 2, 64], 13)), ("pos", &pos)], 1e-4);
+    same_as_cpu(&path, "wide", &[("x", &noise(&[3, 4, 96], 14))], 1e-4);
     std::fs::remove_file(path).unwrap();
 }
 

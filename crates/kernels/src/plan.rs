@@ -54,6 +54,13 @@ struct Block {
 }
 
 pub fn plan(graph: &Graph, leaves: &Leaves, scratch_bytes: &dyn Fn(TensorId) -> u64) -> Layout {
+    plan_spread(graph, leaves, scratch_bytes, 0)
+}
+
+/// [`plan`], except that when everything fits in `spread_limit` bytes nothing shares memory: a dead
+/// tensor's bytes handed to a new one make the new writer wait for the old readers, which an executor
+/// that overlaps independent launches (the Vulkan one) pays for in barriers.
+pub fn plan_spread(graph: &Graph, leaves: &Leaves, scratch_bytes: &dyn Fn(TensorId) -> u64, spread_limit: u64) -> Layout {
     let n = graph.nodes.len();
     let nt = graph.tensors.len();
 
@@ -109,6 +116,8 @@ pub fn plan(graph: &Graph, leaves: &Leaves, scratch_bytes: &dyn Fn(TensorId) -> 
     order.extend(scratch_blocks.iter().enumerate().map(|(i, (_, b))| (b.first, true, i)));
     order.sort();
 
+    let total: u64 = blocks.iter().map(|b| b.size).sum::<u64>() + scratch_blocks.iter().map(|(_, b)| b.size).sum::<u64>();
+    let no_reuse = std::env::var_os("TL_PLAN_REUSE").is_none() && total <= spread_limit;
     for (_, is_scratch, i) in order {
         let (first_pos, last_pos, size) = if is_scratch {
             let b = &scratch_blocks[i].1;
@@ -117,6 +126,19 @@ pub fn plan(graph: &Graph, leaves: &Leaves, scratch_bytes: &dyn Fn(TensorId) -> 
             let b = &blocks[i];
             (b.first, b.last, b.size)
         };
+        // A small arena is not worth reusing: memory handed from a dead tensor to a new one makes the
+        // new writer wait for the old readers (a barrier between launches that need none).
+        if no_reuse {
+            live.retain(|_| false);
+            let off = arena;
+            arena += size;
+            if is_scratch {
+                scratch[scratch_blocks[i].0] = Some(off);
+            } else {
+                offsets[blocks[i].id] = off;
+            }
+            continue;
+        }
         live.retain(|l| l.last >= first_pos);
         live.sort_by_key(|l| l.off);
         let mut off = 0u64;

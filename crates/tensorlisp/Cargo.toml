@@ -7,8 +7,13 @@ description = "Runtime: loads a tensorlisp program + weights from GGUF and runs 
 [features]
 # ggml's CUDA backend (Device::Gpu) plus the native CUDA executor.
 cuda = ["ggml-sys/cuda", "native-cuda"]
+# ggml's own Vulkan backend (--device gpu); see crates/ggml-sys.
+vulkan = ["ggml-sys/vulkan"]
 # Only the native CUDA executor (Device::Native), no nvcc build of ggml-cuda.
-native-cuda = ["dep:tensorlisp-kernels"]
+native-cuda = ["dep:tensorlisp-kernels", "tensorlisp-kernels/cuda"]
+# Only the native Vulkan executor (Device::Native) over ggml's precompiled shaders; no ggml-vulkan.
+# Needs scripts/build-ggml-vulkan-shaders.sh run once. Ignored when native-cuda is also on.
+native-vulkan = ["dep:tensorlisp-kernels", "tensorlisp-kernels/vulkan"]
 
 [dependencies]
 chez.workspace = true
@@ -25,4 +30,4 @@ serde_json = "1.0.151"
 tensorlisp-kernels = { path = "../kernels" }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-tensorlisp-kernels = { path = "../kernels", features = ["cuda"], optional = true }
+tensorlisp-kernels = { path = "../kernels", optional = true }

@@ -31,6 +31,11 @@ const STDLIB: &[(&str, &str)] = &[
     ("attn", include_str!("stdlib/attn.ss")),
     ("vision", include_str!("stdlib/vision.ss")),
     ("generic", include_str!("stdlib/generic.ss")),
+    ("tree spirv", include_str!("stdlib/tree_spirv.ss")),
+    ("tree", include_str!("stdlib/tree.ss")),
+    ("tree opt", include_str!("stdlib/tree_opt.ss")),
+    ("tree kernels", include_str!("stdlib/tree_kernels.ss")),
+    ("tree ptx", include_str!("stdlib/tree_ptx.ss")),
     ("aot highlevel", include_str!("aot/highlevel.ss")),
     ("aot reference-compiler", include_str!("aot/reference_compiler.ss")),
     ("aot mil language", include_str!("aot/mil/language.ss")),
@@ -103,6 +108,9 @@ fn boot() -> Result<Scheme> {
             .map_err(|e| Error::Program(format!("stdlib (tl {name}) failed to load: {e}")))?;
     }
 
+    // The environment Tree kernel expressions are compiled in (see `tree_compile`).
+    scheme.eval("(define-top-level-value '$tl-tree-env (environment '(rnrs) '(tl tree) '(tl tree opt) '(tl tree kernels)))")?;
+
     // ggml assertions on this thread raise Scheme errors (see core.ss).
     crate::guard::install();
     let Value::Int(handler) = scheme.call("$tl-abort-handler", &[])? else {
@@ -170,6 +178,25 @@ fn with_scheme<R: Send + 'static>(f: impl FnOnce(&Scheme) -> R + Send + 'static)
         }))
         .map_err(|_| Error::Backend("the Scheme thread has stopped".into()))?;
     rx.recv().map_err(|_| Error::Backend("the Scheme thread has stopped".into()))
+}
+
+/// Compiles a Tree kernel expression, e.g. `(k:binary 'add)`, to SPIR-V bytes (little-endian
+/// words) on the Scheme thread. The generators are in `stdlib/tree_kernels.ss`.
+#[cfg(feature = "native-vulkan")]
+pub(crate) fn tree_compile(expr: &str) -> Result<Vec<u8>> {
+    // TL_TREE_PASSES: the optimization passes run on the kernel first (default fold,licm,cse,dce;
+    // "none" skips them), see stdlib/tree_opt.ss.
+    let passes = std::env::var("TL_TREE_PASSES").unwrap_or_else(|_| "fold,licm,cse,dce".into());
+    let list: Vec<&str> = passes.split(',').filter(|p| !p.is_empty() && *p != "none").collect();
+    let src = if list.is_empty() {
+        format!("(eval '(compile-kernel {expr}) $tl-tree-env)")
+    } else {
+        format!("(eval '(compile-kernel (optimize {expr} '({}))) $tl-tree-env)", list.join(" "))
+    };
+    match with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))? {
+        Value::Bytevector(b) => Ok(b),
+        other => Err(Error::Program(format!("tree kernel compiler returned {other:?}"))),
+    }
 }
 
 /// An input as declared by `(model (inputs ...))`.

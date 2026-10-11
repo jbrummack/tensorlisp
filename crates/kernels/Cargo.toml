@@ -12,11 +12,18 @@ ggml = ["dep:ggml-sys"]
 # crate still builds and links without a CUDA install; Device::system_default()
 # returns NoDevice if nvcuda/nvrtc aren't found on the target machine.
 cuda = ["dep:libloading"]
+# Vulkan compute backend; ash dlopen's the loader at runtime, so the crate
+# builds without the SDK (see src/vulkan and docs/design/scheduler.md).
+vulkan = ["dep:ash"]
+# WGSL -> SPIR-V through naga, to write small kernels without glslc.
+wgsl = ["dep:naga"]
 
 [dependencies]
 thiserror.workspace = true
 ggml-sys = { workspace = true, optional = true }
 libloading = { version = "0.8", optional = true }
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"], optional = true }
+naga = { version = "30", features = ["wgsl-in", "spv-out"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

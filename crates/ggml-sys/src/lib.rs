@@ -9,6 +9,9 @@ pub const HAS_METAL: bool = cfg!(ggml_metal);
 /// Whether the CUDA backend was compiled in.
 pub const HAS_CUDA: bool = cfg!(ggml_cuda);
 
+/// Whether ggml's Vulkan backend was compiled in.
+pub const HAS_VULKAN: bool = cfg!(ggml_vulkan);
+
 pub struct Tensor(*mut ggml_tensor);
 impl Tensor {
     fn get(&self) -> &ggml_tensor {

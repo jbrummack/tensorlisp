@@ -3,7 +3,8 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     let mac = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
     let cuda_native = std::env::var_os("CARGO_FEATURE_NATIVE_CUDA").is_some();
-    if mac || cuda_native {
+    let vulkan_native = std::env::var_os("CARGO_FEATURE_NATIVE_VULKAN").is_some();
+    if mac || cuda_native || vulkan_native {
         println!("cargo::rustc-cfg=native_device");
     }
 }
