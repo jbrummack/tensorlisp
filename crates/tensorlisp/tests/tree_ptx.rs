@@ -746,12 +746,18 @@ fn q8_matmul_on_int8_tensor_cores() {
     };
     let e = Engine::new(Arc::new(cuda));
     let bench = std::env::var_os("TL_BENCH").is_some();
+    // TL_Q8MMA_KERNEL=w: the wide-staging variant (k % 256 == 0)
+    let kernel = if std::env::var("TL_Q8MMA_KERNEL").is_ok_and(|v| v == "w") { "k:matmul-q8mma-w" } else { "k:matmul-q8mma" };
+    let wide = kernel.ends_with("-w");
     let cfgs: Vec<String> = match std::env::var("TL_Q8MMA_CFGS") {
         Ok(v) => v.split(';').map(str::to_string).collect(),
+        Err(_) if wide => ["64 64 2 2", "32 128 1 4", "64 32 2 1"].map(str::to_string).to_vec(),
         Err(_) => ["64 64 2 2", "128 64 4 2", "64 128 2 2", "128 128 4 2"].map(str::to_string).to_vec(),
     };
     let shapes: &[(usize, usize, usize)] = if bench {
         &[(12288, 406, 1536), (6144, 406, 1536), (1536, 406, 6144), (2048, 406, 1536)]
+    } else if wide {
+        &[(256, 100, 256), (130, 37, 512), (70, 5, 256), (33, 130, 768)]
     } else {
         &[(70, 37, 96), (256, 100, 256), (130, 5, 64)]
     };
@@ -785,7 +791,7 @@ fn q8_matmul_on_int8_tensor_cores() {
         }
         for cfg in &cfgs {
             let p: Vec<usize> = cfg.split(' ').map(|x| x.parse().unwrap()).collect();
-            let expr = format!("(k:matmul-q8mma {cfg})");
+            let expr = format!("({kernel} {cfg})");
             let reply = scheme.eval(&format!("(eval '(compile-kernel-ptx {expr}) $env)")).unwrap_or_else(|err| panic!("{expr}: {err}"));
             let blob = blob_from_reply(&expr, reply);
             let (la, lq, ld, lc) = (wbytes.len(), 4 * xq.len(), 4 * xd.len(), 4 * m * n);
