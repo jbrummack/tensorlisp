@@ -24,6 +24,9 @@ pub struct Executor {
     shaders: Shaders,
     pub caps: Caps,
     tree: Option<TreeKernels>,
+    /// The Tree compiler for the paged-attention nodes, which have no ggml shader (kept apart from
+    /// `tree`, whose presence switches fusion and lowering of every other node).
+    paged: Option<TreeKernels>,
 }
 
 impl Executor {
@@ -35,13 +38,18 @@ impl Executor {
             .filter(|l| l.contains("add_f32_f32_f32"))
             .ok_or_else(|| Error::Invalid(format!("no precompiled ggml Vulkan shaders in {}: run scripts/build-ggml-vulkan-shaders.sh", dir.display())))?;
         let caps = vk.caps();
-        Ok(Executor { engine: Arc::new(Engine::new(Arc::new(vk))), shaders: Shaders::new(lib), caps, tree: None })
+        Ok(Executor { engine: Arc::new(Engine::new(Arc::new(vk))), shaders: Shaders::new(lib), caps, tree: None, paged: None })
     }
 
     /// Lowers nodes with a Tree generator to generated kernels (ggml's shaders stay the fallback
     /// unless `tree.only`). Fusion is off then: its pseudo-ops are ggml shaders.
     pub fn set_tree(&mut self, tree: TreeKernels) {
         self.tree = Some(tree);
+    }
+
+    /// Lets `CUSTOM` nodes (paged attention, cache write) compile their Tree kernels.
+    pub fn set_paged_kernels(&mut self, tree: TreeKernels) {
+        self.paged = Some(tree);
     }
 
     pub fn backend(&self) -> &Arc<Vulkan> {
@@ -113,7 +121,7 @@ impl Executor {
         let step_bytes = (arena_base + layout.arena_size).max(4);
         let pos: HashMap<TensorId, usize> = graph.nodes.iter().enumerate().map(|(p, &id)| (id, p)).collect();
         let stats = TreeStats::default();
-        let ctx = Ctx { shaders: &self.shaders, caps, graph: &graph, layout: &layout, arena_base, pos: &pos, tree: self.tree.as_ref(), stats: &stats };
+        let ctx = Ctx { shaders: &self.shaders, caps, graph: &graph, layout: &layout, arena_base, pos: &pos, tree: self.tree.as_ref(), paged: self.paged.as_ref(), stats: &stats };
 
         let mut launches = Vec::new();
         let mut missing: Vec<(String, String)> = Vec::new();

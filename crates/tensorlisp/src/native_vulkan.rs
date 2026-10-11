@@ -64,6 +64,10 @@ impl Native {
                 }));
             }
         }
+        // Paged attention has no ggml shader: its nodes always compile Tree kernels.
+        exec.set_paged_kernels(TreeKernels::new(false, |expr| {
+            crate::scheme::tree_compile(expr).map_err(|e| tensorlisp_kernels::Error::Invalid(e.to_string()))
+        }));
         let backend = exec.backend().clone();
 
         // Lay the tensors out in chunks.

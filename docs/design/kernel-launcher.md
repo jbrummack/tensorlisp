@@ -212,7 +212,7 @@ deviations from the plan this section used to describe are called out inline.
    block table, worth about 0.3 ms of a 6.5 ms T5Gemma2 step, and it would
    need the KV caches in vLLM's layout rather than ggml state tensors.
 
-   Paged attention inside the native executor (CUDA only): Scheme's
+   Paged attention inside the native executor (CUDA, and Vulkan, see below): Scheme's
    `(paged-attention q key-cache value-cache tables lens block-size max-context scale [kv-heads])`
    and `(paged-cache-write key value key-cache value-cache slots block-size [kv-heads])`
    (core.ss) build ggml `CUSTOM` nodes with no ggml function; the kind, kv heads,
@@ -242,7 +242,30 @@ deviations from the plan this section used to describe are called out inline.
    (long prompts) to 1.45x (short prompts) at 64 sequences, mostly by reading only
    each sequence's own keys, and holds 0.8 MiB per short sequence instead of the
    dense 19 MiB (17 MiB when prompts fill the cache). Run with
-   `cargo test --release -p tensorlisp --features native-cuda --test native_concurrency -- --ignored --nocapture`.
+   `cargo test --release -p tensorlisp --features native-cuda --test native_concurrency -- --ignored --nocapture`.
+
+   On the native Vulkan executor the same `CUSTOM` nodes lower to Tree kernels
+   (`vulkan/lower/tree_ops.rs::paged_custom`, generators `k:paged-attn-part` /
+   `k:paged-cache-write` in `stdlib/tree_kernels.ss`), whatever `TL_NATIVE_TREE` says: the
+   executor always carries a Tree compiler for them. Attention is split over chunks of 128
+   keys (a workgroup per chunk, head and sequence; chunks past the context length write l = 0)
+   and merged by `k:flash-attn-combine` with an f16 output; scratch for the partials is
+   planned like flash attention's. The pools keep vLLM's layouts. Head size must be a
+   multiple of 32. `native_concurrency` (T5Gemma2) and `native_gemma4`
+   `batched_decoding_matches_sequential` give identical tokens for sequential, dense and paged
+   decoding with `--features native-vulkan`; not tuned yet (value reads stride by the block size).
+   T5Gemma2 f16, RTX 3080 (300 W cap), tokens/s, dense / paged, 32 generated tokens per sequence
+   (sequential decode-step: 270/s):
+
+   | sequences | 956-token prompts | 6-token prompts |
+|---|---|---|
+   | 1 | 317 / 302 | 319 / 329 |
+| 4 | 1184 / 1105 | 1184 / 1271 |
+| 16 | 1963 / 1976 | 2184 / 2320 |
+   | 64 | 4831 / 4791 | 6542 / 7226 |
+
+   Paged ties dense on long prompts and wins 10% on short ones (64 sequences), with 0.8 MiB of cache
+   per short sequence against 19.1 MiB; the single runs at 2 and 8 sequences swing between runs.
 
 ## Using it from Scheme (next step)
 

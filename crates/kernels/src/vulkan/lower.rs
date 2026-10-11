@@ -144,6 +144,8 @@ pub struct Ctx<'a> {
     pub pos: &'a HashMap<TensorId, usize>,
     /// Generated kernels for the nodes that have a Tree generator (see `tree_ops.rs`).
     pub tree: Option<&'a TreeKernels>,
+    /// Compiler for the `CUSTOM` nodes when `tree` is off.
+    pub paged: Option<&'a TreeKernels>,
     pub stats: &'a TreeStats,
 }
 
@@ -455,6 +457,7 @@ pub fn scratch_bytes(graph: &Graph, id: TensorId, caps: &Caps, tree: bool) -> u6
     }
     match graph.tensors[id].op.as_str() {
         "FLASH_ATTN_EXT" => fa_plan(graph, caps, id).map_or(0, |p| p.scratch),
+        "CUSTOM" => tree_ops::paged_scratch(graph, id),
         "MUL_MAT" => mm_plan(graph, caps, id).map_or(0, |p| if mm_uses_matrix_kernel(graph, id) { p.scratch } else { 0 }),
         _ => 0,
     }
@@ -616,6 +619,10 @@ impl<'a> Ctx<'a> {
             "REPEAT" => self.repeat(id),
             "ARANGE" => self.arange(id),
             "ARGMAX" => self.argmax(id),
+            "CUSTOM" => match self.paged {
+                Some(tree) => self.paged_custom(tree, id),
+                None => unsupported(t, "paged attention needs the Tree compiler"),
+            },
             _ => unsupported(t, "op not implemented on Vulkan"),
         }
     }

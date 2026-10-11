@@ -7,7 +7,7 @@
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
   (export k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
-          k:matmul k:matmul-cm k:matvec k:rope k:set-rows k:argmax k:flash-attn k:flash-attn-part k:flash-attn-combine k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
+          k:matmul k:matmul-cm k:matvec k:rope k:set-rows k:argmax k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
   (define wg 256)
@@ -947,15 +947,90 @@
                                      (store part (+ pb 2 dd) acc))))
                               dds)))))))))))
 
+  ;; ---- paged attention (vLLM pool layouts, see docs/design/kernel-launcher.md) ---------------------
+  ;; Key pool f16 [blocks, kv_heads, hs/8, bs, 8], value pool f16 [blocks, kv_heads, hs, bs]; kvb and
+  ;; kvh are the strides (elements) of a block and of a kv head inside it. One workgroup per (chunk of
+  ;; `chunk` keys, head, sequence); chunks past the sequence's context length write l = 0 and the merge
+  ;; (k:flash-attn-combine, one query per sequence) skips them. hs % 32 == 0.
+  ;; grid: nchunks x heads x seqs.   push: heads nchunks gqa maxblocks kvb kvh scale:f32
+  ;; q f16 [hs, heads, seqs], tb i32 [maxblocks, seqs], ln i32 [seqs]; part as in k:flash-attn-part.
+  (define (k:paged-attn-part hs bs chunk)
+    (let* ([rs (range 0 (div hs 32))] [dds (range 0 (div (+ hs (- wg 1)) wg))])
+      `(kernel paged_attn_part
+         (offsets prefix) (workgroup ,wg)
+         (buffers (q ro u16) (k ro u16) (v ro u16) (tb ro i32) (ln ro i32) (part wo f32))
+         (push ,@(u32s 'heads 'nchunks 'gqa 'maxblocks 'kvb 'kvh) (scale f32))
+         (shared (s f32 ,chunk) (red f32 32))
+         (let ([tid (local-id 0)] [ch (group-id 0)] [h (group-id 1)] [si (group-id 2)])
+           (let ([kvi (/ h gqa)] [c0 (* ch ,chunk)] [ctx (u32 (load ln si))]
+                 [pb (* (+ (* (+ (* si heads) h) nchunks) ch) ,(+ hs 2))]
+                 [tbase (* si maxblocks)])
+             (var n u32 0)
+             (when (< c0 ctx) (set! n (min (- ctx c0) ,chunk)))
+             (when (= n 0)
+               (when (= tid 0) (store part pb -inf.0) (store part (+ pb 1) 0.0)))
+             (when (> n 0)
+               (begin
+                 ,@(map (lambda (j) `(var ,(name 'qr j) f32 (half->f32 (load q (+ (* (+ (* si heads) h) ,hs) (lane) ,(* 32 j)))))) rs)
+                 ;; scores: a subgroup takes the keys sg, sg + S, ...
+                 (let ([lo (+ (* (/ (lane) 8) ,(* bs 8)) (rem (lane) 8))] [hb (* kvi kvh)])
+                   (for (jj (subgroup-id) n (num-subgroups))
+                     (let ([j (+ c0 jj)])
+                       (let ([kb (+ (* (u32 (load tb (+ tbase (/ j ,bs)))) kvb) hb (* (rem j ,bs) 8) lo)])
+                         (var dot f32 0.0)
+                         ,@(map (lambda (j) `(set! dot (fma ,(name 'qr j) (half->f32 (load k (+ kb ,(* 4 j bs 8)))) dot))) rs)
+                         (let ([t (subgroup-add dot)])
+                           (when (= (lane) 0) (store s jj (* t scale))))))))
+                 (barrier)
+                 (var mx f32 -inf.0)
+                 (for (jj tid n ,wg) (set! mx (max mx (load s jj))))
+                 ,@(reduce 'max 'mx 'gmax)
+                 (var sum f32 0.0)
+                 (for (jj tid n ,wg)
+                   (let ([p (exp (- (load s jj) gmax))]) (store s jj p) (set! sum (+ sum p))))
+                 ,@(reduce 'add 'sum 'gsum)
+                 (when (= tid 0) (store part pb gmax) (store part (+ pb 1) gsum))
+                 ,@(map (lambda (i)
+                          `(let ([dd (+ tid ,(* i wg))])
+                             (when (< dd ,hs)
+                               (var acc f32 0.0)
+                               (let ([vb (+ (* kvi kvh) (* dd ,bs))])
+                                 (for (jj 0 n)
+                                   (let ([j (+ c0 jj)])
+                                     (set! acc (fma (load s jj)
+                                                    (half->f32 (load v (+ vb (* (u32 (load tb (+ tbase (/ j ,bs)))) kvb) (rem j ,bs))))
+                                                    acc)))))
+                               (store part (+ pb 2 dd) acc))))
+                        dds))))))))
+
+  ;; Writes key and value f16 [hs * kv_heads, tokens] (dense) into the pools at slot = block * bs + offset,
+  ;; slots i32 [2 * tokens] (one little-endian i64 per token; a negative slot skips the token).
+  ;; One thread per element.   push: n hs kvheads kvb kvh
+  (define (k:paged-cache-write bs)
+    `(kernel paged_cache_write
+       (offsets prefix) (workgroup ,wg)
+       (buffers (key ro u16) (value ro u16) (kc rw u16) (vc rw u16) (slots ro i32))
+       (push ,@(u32s 'n 'hs 'kvheads 'kvb 'kvh))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ([tok (/ idx (* hs kvheads))] [r (rem idx (* hs kvheads))])
+             (let ([sl (load slots (* tok 2))] [hd (/ r hs)] [d (rem r hs)])
+               (when (>= sl 0)
+                 (let ([slot (u32 sl)])
+                   (let ([base (+ (* (/ slot ,bs) kvb) (* hd kvh))] [off (rem slot ,bs)])
+                     (store kc (+ base (* (/ d 8) ,(* bs 8)) (* off 8) (rem d 8)) (load key idx))
+                     (store vc (+ base (* d ,bs) off) (load value idx)))))))))))
+
   ;; Merges the chunks of one (head, query, batch): d = sum_c exp(m_c - M) o_c / sum_c exp(m_c - M) l_c.
   ;; grid: x = head, y = batch * nq + query.   push: nq nh hsv nchunks d1 d2 d3
   (define k:flash-attn-combine
     (case-lambda
-      [() (k:flash-attn-combine #f)]
-      [(q8?)
-       `(kernel ,(if q8? 'flash_attn_combine_q8 'flash_attn_combine)
+      [() (k:flash-attn-combine #f 'f32)]
+      [(q8?) (k:flash-attn-combine q8? 'f32)]
+      [(q8? dty)
+       `(kernel ,(if q8? 'flash_attn_combine_q8 (if (eq? dty 'f16) 'flash_attn_combine_f16 'flash_attn_combine))
           (offsets prefix) (workgroup ,wg)
-          (buffers (part ro f32) ,@(if q8? '((xq wo u32) (xd wo f32)) '((d wo f32))))
+          (buffers (part ro f32) ,@(if q8? '((xq wo u32) (xd wo f32)) `((d wo ,(elem-ty dty)))))
           (push ,@(u32s 'nq 'nh 'hsv 'nchunks) ,@(if q8? '() (u32s 'd1 'd2 'd3)))
           (shared (red f32 32))
           (let ([tid (local-id 0)] [h (group-id 0)])
@@ -990,7 +1065,7 @@
                             (let ([pb (* (+ pbase c) (+ hsv 2))])
                               (when (> (load part (+ pb 1)) 0.0)
                                 (set! acc (fma (load part (+ pb 2 dd)) (exp (- (load part pb) mx)) acc)))))
-                          (store d (+ (* h d1) (* qi d2) (* bi d3) dd) (select (> total 0.0) (/ acc total) 0.0)))))))))]))
+                          ,(store-f32 dty 'd '(+ (* h d1) (* qi d2) (* bi d3) dd) '(select (> total 0.0) (/ acc total) 0.0)))))))))]))
 
   ;; ---- int8 dot products (CUDA only: dp4a / warp shuffles are PTX intrinsics) ----------------------
   ;; Learned from ggml-cuda's mul_mat_vec_q (its PTX is ~13k dp4a): quantize the activations to

@@ -150,6 +150,7 @@ impl<'a> Ctx<'a> {
             "FUSED_ROW" => self.tree_fused_row(tree, id),
             "FUSED_NR" => self.tree_fused_nr(tree, id),
             "FUSED_GU" => self.tree_fused_gu(tree, id),
+            "CUSTOM" => self.paged_custom(tree, id).map(Some),
             _ => Ok(None),
         }
     }
@@ -764,5 +765,100 @@ impl<'a> Ctx<'a> {
         }
         let expr = format!("(k:flash-attn '{kt} '{vt} {mk} {sc} {maxkv})");
         self.tree_launch(tree, &expr, bindings, &push, [nq, nh, nb])
+    }
+}
+
+/// What a `CUSTOM` node's `userdata` (ggml keeps it in `op_params[4..6]`) says: kind (4 bits), kv heads
+/// (4), block size (8), max context length (16), scale (f32). See `Ctx::custom` in `cuda/lower.rs`.
+struct PagedParams {
+    kind: u8,
+    kv_heads: u32,
+    block_size: u32,
+    max_ctx: u32,
+    scale: f32,
+}
+
+fn paged_params(t: &Tensor) -> PagedParams {
+    let ud = t.op_params[4] as u32 as u64 | (t.op_params[5] as u32 as u64) << 32;
+    PagedParams {
+        kind: (ud & 15) as u8,
+        kv_heads: ((ud >> 4) & 15) as u32,
+        block_size: ((ud >> 8) & 255) as u32,
+        max_ctx: ((ud >> 16) & 0xffff) as u32,
+        scale: f32::from_bits((ud >> 32) as u32),
+    }
+}
+
+/// Scratch for the partial results of paged attention: [m, l, o[hs]] per (chunk, head, sequence).
+pub(super) fn paged_scratch(graph: &Graph, id: TensorId) -> u64 {
+    let t = &graph.tensors[id];
+    let p = paged_params(t);
+    if p.kind != 1 {
+        return 0;
+    }
+    let Some(q) = t.src(0).map(|q| &graph.tensors[q]) else { return 0 };
+    let nchunks = ceil_div(p.max_ctx, FA_CHUNK) as u64;
+    4 * nchunks * q.ne[1] as u64 * q.ne[2] as u64 * (q.ne[0] as u64 + 2)
+}
+
+impl<'a> Ctx<'a> {
+    /// Paged attention and the cache write (Scheme's `paged-attention` / `paged-cache-write`) on Tree
+    /// kernels, over vLLM's pool layouts: keys `[blocks, kv_heads, hs/8, bs, 8]`, values
+    /// `[blocks, kv_heads, hs, bs]`, f16. Attention is split over chunks of `FA_CHUNK` keys
+    /// (`k:paged-attn-part`) and merged by the flash-attention combine kernel.
+    pub(super) fn paged_custom(&self, tree: &TreeKernels, id: TensorId) -> Result<Vec<LaunchDesc>> {
+        let t = self.t(id);
+        let p = paged_params(t);
+        let s = |i| self.src(t, i);
+        let f16 = |x: &Tn| x.ty == Ty::F16;
+        match p.kind {
+            1 => {
+                let (q, kc, vc, tables, lens) = (self.tn(s(0)?), self.tn(s(1)?), self.tn(s(2)?), self.tn(s(3)?), self.tn(s(4)?));
+                let td = self.tn(id);
+                let (hs, heads, seqs) = (q.ne[0], q.ne[1], q.ne[2]);
+                if !(f16(&q) && f16(&kc) && f16(&vc) && f16(&td)) {
+                    return unsupported(t, "paged attention takes f16 q, caches and output");
+                }
+                if tables.ty != Ty::I32 || lens.ty != Ty::I32 {
+                    return unsupported(t, "block tables and context lengths are i32");
+                }
+                if q.nb[1] != hs || q.nb[2] != hs * heads || td.ne[..3] != q.ne[..3] || td.nb[1] != hs || td.nb[2] != hs * heads {
+                    return unsupported(t, "paged attention takes a contiguous q and an output of its shape");
+                }
+                if hs % 32 != 0 || p.kv_heads == 0 || heads % p.kv_heads != 0 {
+                    return unsupported(t, "paged attention takes a head size that is a multiple of 32 and heads that divide by the kv heads");
+                }
+                let nchunks = ceil_div(p.max_ctx, FA_CHUNK);
+                let off = self.layout.scratch[self.pos[&id]].ok_or_else(|| Error::Invalid("paged attention scratch was not planned".into()))?;
+                let part = Range::new(Space::Step, self.arena_base + off, paged_scratch(self.graph, id));
+                let (kvh, kvb) = (hs * p.block_size, p.kv_heads * hs * p.block_size);
+                let push = [heads, nchunks, heads / p.kv_heads, tables.ne[0], kvb, kvh, p.scale.to_bits()];
+                let bindings = vec![q.range, kc.range, vc.range, tables.range, lens.range, part];
+                let a = self.launch(tree.blob(&format!("(k:paged-attn-part {hs} {} {FA_CHUNK})", p.block_size))?, bindings, words(&push), [nchunks, heads, seqs])?;
+                let b = self.launch(
+                    tree.blob("(k:flash-attn-combine #f 'f16)")?,
+                    vec![part, td.range],
+                    words(&[1, heads, hs, nchunks, td.nb[1], 0, td.nb[2]]),
+                    [heads, seqs, 1],
+                )?;
+                Ok(vec![a, b])
+            }
+            2 => {
+                let (key, value, kc, vc, slots) = (self.tn(s(0)?), self.tn(s(1)?), self.tn(s(2)?), self.tn(s(3)?), self.tn(s(4)?));
+                let tokens = key.ne[1];
+                if !(f16(&key) && f16(&value) && f16(&kc) && f16(&vc)) {
+                    return unsupported(t, "the cache write takes f16 keys, values and caches");
+                }
+                if slots.nelements() != 2 * tokens || key.nb[1] != key.ne[0] || value.nb[1] != value.ne[0] || key.ne != value.ne || p.kv_heads == 0 || key.ne[0] % p.kv_heads != 0 {
+                    return unsupported(t, "the cache write takes dense keys and values and one i64 slot per token");
+                }
+                let hs = key.ne[0] / p.kv_heads;
+                let n = key.nelements();
+                let push = [n, hs, p.kv_heads, p.kv_heads * hs * p.block_size, hs * p.block_size];
+                let blob = tree.blob(&format!("(k:paged-cache-write {})", p.block_size))?;
+                Ok(vec![self.launch(blob, vec![key.range, value.range, kc.range, vc.range, slots.range], words(&push), self.tree_grid(ceil_div(n, WG)))?])
+            }
+            _ => unsupported(t, "unknown custom op"),
+        }
     }
 }
