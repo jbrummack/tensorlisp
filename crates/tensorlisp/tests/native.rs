@@ -365,6 +365,30 @@ fn paged_attention_matches_dense() {
     }
 }
 
+/// Rows long enough for the two-pass argmax (chunks of 2048): the maximum repeated in several chunks
+/// must resolve to the first, with the maximum in the last element too.
+#[cfg(feature = "native-cuda-tree")]
+#[test]
+fn argmax_of_long_rows() {
+    for n in [100usize, 16384, 20000, 262144] {
+        let program = format!("(model am (inputs [x f32 ({n} 3)]) (outputs [i (ggml-argmax x) 1]))");
+        let path = write(&format!("argmax-{n}"), &program, &[]);
+        let mut x = noise(&[3, n], 5);
+        // row 0: the same maximum in three chunks; row 1: the maximum in the last element; row 2: noise
+        for j in [n / 3, n / 2 + 1, n - 1] {
+            x[[0, j]] = 5.0;
+        }
+        x[[1, n - 1]] = 9.0;
+        // The first maximum (ggml's CPU backend returns the last one of equal values, torch the first).
+        let first = |r: usize| (0..n).fold(0, |best, j| if x[[r, j]] > x[[r, best]] { j } else { best });
+        let native = Model::load(&path, Device::Native).unwrap();
+        let got = run(&native, "am", &[("x", &x)]);
+        let want: Vec<f32> = (0..3).map(first).map(|j| j as f32).collect();
+        assert_eq!(got[0].1.iter().copied().collect::<Vec<_>>(), want, "n = {n}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 #[test]
 fn state_and_set_rows_persist_between_runs() {
     let program = r#"

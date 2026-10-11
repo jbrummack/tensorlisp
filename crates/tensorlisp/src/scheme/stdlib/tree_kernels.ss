@@ -7,7 +7,7 @@
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
   (export k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
-          k:matmul k:matmul-cm k:matvec k:rope k:set-rows k:argmax k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
+          k:matmul k:matmul-cm k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
   (define wg 256)
@@ -782,6 +782,53 @@
              (var res u32 ncols)
              (for (ri 0 (num-subgroups)) (set! res (min res (load redi ri))))
              (when (= tid 0) (store d row (i32 res))))))))
+
+  ;; Long rows (the logits of a vocabulary): a workgroup per chunk of `chunk` elements finds the chunk's
+  ;; maximum and the first index of it, (value, index as f32) pairs go to `part`; k:argmax-final merges them.
+  ;; grid: chunks x rows.   push: nrows ncols a1 nchunks
+  (define (k:argmax-part chunk)
+    `(kernel argmax_part
+       (offsets prefix) (workgroup ,wg)
+       (buffers (a ro f32) (part wo f32))
+       (push ,@(u32s 'nrows 'ncols 'a1 'nchunks))
+       (shared (red f32 32) (redi u32 32))
+       (let ([tid (local-id 0)] [ch (group-id 0)] [row (group-id 1)])
+         (let ([base (* row a1)] [c0 (* ch ,chunk)])
+           (let ([c1 (min (+ c0 ,chunk) ncols)])
+             (var best f32 -inf.0)
+             (for (c (+ c0 tid) c1 ,wg) (set! best (max best (load a (+ base c)))))
+             ,@(reduce 'max 'best 'gmax)
+             (var first u32 ncols)
+             (for (c (+ c0 tid) c1 ,wg)
+               (when (and (= (load a (+ base c)) gmax) (< c first)) (set! first c)))
+             (let ([s (subgroup-min first)]) (when (= (lane) 0) (store redi (subgroup-id) s)))
+             (barrier)
+             (var res u32 ncols)
+             (for (ri 0 (num-subgroups)) (set! res (min res (load redi ri))))
+             (when (= tid 0)
+               (store part (* 2 (+ (* row nchunks) ch)) gmax)
+               (store part (+ (* 2 (+ (* row nchunks) ch)) 1) (f32 res))))))))
+
+  ;; grid: rows.   push: nrows nchunks
+  (define (k:argmax-final)
+    `(kernel argmax_final
+       (offsets prefix) (workgroup ,wg)
+       (buffers (part ro f32) (d wo i32))
+       (push ,@(u32s 'nrows 'nchunks))
+       (shared (red f32 32) (redi u32 32))
+       (let ([tid (local-id 0)] [row (group-id 0)])
+         (var best f32 -inf.0)
+         (for (c tid nchunks ,wg) (set! best (max best (load part (* 2 (+ (* row nchunks) c))))))
+         ,@(reduce 'max 'best 'gmax)
+         (var first u32 4294967295)
+         (for (c tid nchunks ,wg)
+           (when (= (load part (* 2 (+ (* row nchunks) c))) gmax)
+             (set! first (min first (u32 (load part (+ (* 2 (+ (* row nchunks) c)) 1)))))))
+         (let ([s (subgroup-min first)]) (when (= (lane) 0) (store redi (subgroup-id) s)))
+         (barrier)
+         (var res u32 4294967295)
+         (for (ri 0 (num-subgroups)) (set! res (min res (load redi ri))))
+         (when (= tid 0) (store d row (i32 res))))))
 
   ;; ---- flash attention ---------------------------------------------------------------------------
 

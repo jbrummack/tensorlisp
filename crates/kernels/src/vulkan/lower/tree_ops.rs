@@ -86,6 +86,20 @@ pub(super) fn fa_split_plan(graph: &Graph, id: TensorId) -> Option<FaSplit> {
     Some(FaSplit { nchunks, bytes: 4 * nq * nh * nb * nchunks as u64 * (hsv + 2) })
 }
 
+/// Rows at least this long (a vocabulary's logits) take two argmax passes: a workgroup per chunk of
+/// `ARGMAX_CHUNK` elements, then a merge. Scratch: (value, index) as two f32 per (chunk, row).
+const ARGMAX_CHUNK: u32 = 2048;
+const ARGMAX_SPLIT_FROM: u32 = 16384;
+
+pub(super) fn argmax_split_bytes(graph: &Graph, id: TensorId) -> u64 {
+    let t = &graph.tensors[id];
+    let Some(a) = t.src(0).map(|a| &graph.tensors[a]) else { return 0 };
+    if t.op != "ARGMAX" || a.ne[0] < ARGMAX_SPLIT_FROM as i64 || std::env::var_os("TL_TREE_NOSPLIT").is_some() {
+        return 0;
+    }
+    8 * ceil_div(a.ne[0] as u32, ARGMAX_CHUNK) as u64 * a.ne[1] as u64
+}
+
 /// Where a producer that writes int8 blocks puts them: `xq` (one byte per element) then `xd` (an f32
 /// scale per 32 elements), in the tensor's own allocation.
 pub(super) fn q8_ranges(td: &Tn) -> (Range, Range) {
@@ -676,6 +690,15 @@ impl<'a> Ctx<'a> {
         let (ta, td) = (self.tn(a), self.tn(id));
         if ta.ty != Ty::F32 || td.ty != Ty::I32 || ta.nb[0] != 1 || ta.ne[2] != 1 || ta.ne[3] != 1 {
             return Ok(None);
+        }
+        let bytes = argmax_split_bytes(self.graph, id);
+        if bytes > 0 {
+            let off = self.layout.scratch[self.pos[&id]].ok_or_else(|| Error::Invalid("argmax scratch was not planned".into()))?;
+            let part = Range::new(Space::Step, self.arena_base + off, bytes);
+            let nchunks = ceil_div(ta.ne[0], ARGMAX_CHUNK);
+            let a = self.launch(tree.blob(&format!("(k:argmax-part {ARGMAX_CHUNK})"))?, vec![ta.range, part], words(&[ta.ne[1], ta.ne[0], ta.nb[1], nchunks]), [nchunks, ta.ne[1], 1])?;
+            let b = self.launch(tree.blob("(k:argmax-final)")?, vec![part, td.range], words(&[ta.ne[1], nchunks]), [ta.ne[1], 1, 1])?;
+            return Ok(Some(vec![a, b]));
         }
         let push = [ta.ne[1], ta.ne[0], ta.nb[1]];
         self.tree_launch(tree, "(k:argmax)", vec![ta.range, td.range], &push, self.tree_grid(ta.ne[1]))

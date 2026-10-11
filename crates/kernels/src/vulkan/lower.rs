@@ -462,6 +462,9 @@ pub fn scratch_bytes(graph: &Graph, id: TensorId, caps: &Caps, tree: bool) -> u6
         if let Some(p) = tree_ops::fa_split_plan(graph, id) {
             return p.bytes.max(fa_plan(graph, caps, id).map_or(0, |p| p.scratch));
         }
+        if graph.tensors[id].op == "ARGMAX" {
+            return tree_ops::argmax_split_bytes(graph, id);
+        }
     }
     match graph.tensors[id].op.as_str() {
         "FLASH_ATTN_EXT" => fa_plan(graph, caps, id).map_or(0, |p| p.scratch),

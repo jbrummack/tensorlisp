@@ -28,6 +28,8 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
 pub type CUevent = *mut c_void;
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
 /// Always 64-bit: the driver API's pointer type regardless of host pointer width.
 pub type CUdeviceptr = c_ulonglong;
 
@@ -73,6 +75,13 @@ driver_api! {
     cuEventCreate: fn(event: *mut CUevent, flags: c_uint) -> CUresult,
     cuEventRecord: fn(event: CUevent, stream: CUstream) -> CUresult,
     cuEventQuery: fn(event: CUevent) -> CUresult,
+    cuEventElapsedTime: fn(ms: *mut f32, start: CUevent, end: CUevent) -> CUresult,
+    cuStreamBeginCapture_v2: fn(stream: CUstream, mode: c_int) -> CUresult,
+    cuStreamEndCapture: fn(stream: CUstream, graph: *mut CUgraph) -> CUresult,
+    cuGraphInstantiateWithFlags: fn(exec: *mut CUgraphExec, graph: CUgraph, flags: c_ulonglong) -> CUresult,
+    cuGraphLaunch: fn(exec: CUgraphExec, stream: CUstream) -> CUresult,
+    cuGraphExecDestroy: fn(exec: CUgraphExec) -> CUresult,
+    cuGraphDestroy: fn(graph: CUgraph) -> CUresult,
     cuEventSynchronize: fn(event: CUevent) -> CUresult,
     cuEventDestroy_v2: fn(event: CUevent) -> CUresult,
     cuModuleLoadDataEx: fn(

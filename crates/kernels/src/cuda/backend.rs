@@ -20,28 +20,113 @@
 //! use to overlap work). Host copies are the stream-ordered async variants; a
 //! read synchronizes the stream.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::sys::{self, CUdeviceptr, CUevent, CUDA_ERROR_NOT_READY, CUDA_SUCCESS};
+use super::sys::{self, CUdeviceptr, CUevent, CUgraphExec, CUDA_ERROR_NOT_READY, CUDA_SUCCESS};
 use super::{check, Arg, BufRef, Buffer, Device, Func, Kernel};
 use crate::sched::backend::{Backend, Launch, Limits, MemKind};
 use crate::sched::blob::{Code, KernelBlob, Target};
 use crate::{Dims, Error, Result};
 
+/// Per-kernel GPU time (`TL_CUDA_PROFILE=1`): launches are timed with events one by one, so a run is
+/// slower; the table (label, launches, total ms) is printed when the last handle to the backend goes.
+#[derive(Default)]
+struct Profile {
+    on: bool,
+    kernels: Mutex<HashMap<String, (u64, f64)>>,
+}
+
+impl Drop for Profile {
+    fn drop(&mut self) {
+        let kernels = self.kernels.lock().unwrap();
+        if !self.on || kernels.is_empty() {
+            return;
+        }
+        let mut rows: Vec<_> = kernels.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+        let total: f64 = rows.iter().map(|r| r.1 .1).sum();
+        eprintln!("cuda profile: {total:.2} ms over {} kernels", rows.len());
+        for (label, (n, ms)) in rows.iter().take(30) {
+            eprintln!("  {ms:9.3} ms {n:6} x {:8.1} us  {label}", ms * 1e3 / *n as f64);
+        }
+    }
+}
+
+/// CUDA graphs of repeated submissions. A decode step launches the same few hundred kernels with the
+/// same buffers, push constants and grids every time; once a submission equals the previous one it is
+/// captured from the stream into a graph, and later equal submissions are one `cuGraphLaunch` instead of
+/// hundreds of `cuLaunchKernel` calls (`TL_CUDA_GRAPHS=0` turns it off).
+struct Graphs {
+    dev: Arc<Device>,
+    on: bool,
+    last: Mutex<Vec<u64>>,
+    execs: Mutex<Vec<(Vec<u64>, CUgraphExec)>>,
+}
+
+/// Graphs kept (the oldest goes first).
+const GRAPHS: usize = 8;
+
+impl Drop for Graphs {
+    fn drop(&mut self) {
+        let execs = self.execs.get_mut().unwrap();
+        if execs.is_empty() || self.dev.make_current().is_err() {
+            return;
+        }
+        if let Some(drv) = sys::driver() {
+            for (_, e) in execs.drain(..) {
+                unsafe { (drv.cuGraphExecDestroy)(e) };
+            }
+        }
+    }
+}
+
+// SAFETY: a CUgraphExec is a driver handle used under the device's context.
+unsafe impl Send for Graphs {}
+unsafe impl Sync for Graphs {}
+
+/// Everything a submission's kernels depend on, flattened: equal keys launch the same work.
+fn graph_key(groups: &[Vec<Launch<'_, Cuda>>]) -> Vec<u64> {
+    let mut key = Vec::new();
+    for l in groups.iter().flatten() {
+        key.push(l.pipeline.func.0 as u64);
+        for b in &l.bindings {
+            key.push(b.buffer.ptr + b.offset);
+        }
+        key.extend(l.push.chunks(8).map(|c| {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            u64::from_le_bytes(w)
+        }));
+        key.push(l.grid[0] as u64 | (l.grid[1] as u64) << 32);
+        key.push(l.grid[2] as u64 | u64::MAX << 32);
+    }
+    key
+}
+
 #[derive(Clone)]
 pub struct Cuda {
     dev: Arc<Device>,
+    profile: Arc<Profile>,
+    graphs: Arc<Graphs>,
 }
 
 impl Cuda {
     pub fn system_default() -> Result<Cuda> {
-        Ok(Cuda { dev: Arc::new(Device::system_default()?) })
+        Ok(Cuda::from_device(Arc::new(Device::system_default()?)))
     }
 
     /// Wraps an existing device (e.g. the one a native executor already owns).
     pub fn from_device(dev: Arc<Device>) -> Cuda {
-        Cuda { dev }
+        let on = std::env::var_os("TL_CUDA_PROFILE").is_some_and(|v| v != "0");
+        let graphs = Graphs {
+            dev: dev.clone(),
+            on: !on && std::env::var("TL_CUDA_GRAPHS").map_or(true, |v| v != "0"),
+            last: Mutex::new(Vec::new()),
+            execs: Mutex::new(Vec::new()),
+        };
+        Cuda { dev, profile: Arc::new(Profile { on, kernels: Mutex::new(HashMap::new()) }), graphs: Arc::new(graphs) }
     }
 
     pub fn device(&self) -> &Arc<Device> {
@@ -50,6 +135,7 @@ impl Cuda {
 }
 
 pub struct Pipeline {
+    label: String,
     func: Func,
     threads: [u32; 3],
     bindings: usize,
@@ -80,6 +166,98 @@ impl Drop for Pending {
 
 fn driver() -> Result<&'static sys::Driver> {
     sys::driver().ok_or(Error::NoDevice)
+}
+
+impl Cuda {
+    /// Launches every kernel of `groups` on the stream, one after the other.
+    fn launch_all(&self, groups: &[Vec<Launch<'_, Cuda>>]) -> Result<()> {
+        for l in groups.iter().flatten() {
+            let p = l.pipeline;
+            if l.bindings.len() != p.bindings || l.push.len() != p.push_bytes {
+                return Err(Error::Invalid(format!(
+                    "launch has {} bindings and {} push bytes, its kernel takes {} and {}",
+                    l.bindings.len(),
+                    l.push.len(),
+                    p.bindings,
+                    p.push_bytes
+                )));
+            }
+            let mut args: Vec<Arg<'_>> = l.bindings.iter().map(|b| Arg::Buf(BufRef { buf: b.buffer, offset: b.offset as usize })).collect();
+            if p.push_bytes > 0 {
+                args.push(Arg::Bytes(l.push));
+            }
+            if self.profile.on {
+                self.dev.make_current()?;
+                let drv = driver()?;
+                let (mut a, mut b): (CUevent, CUevent) = (std::ptr::null_mut(), std::ptr::null_mut());
+                check(unsafe { (drv.cuEventCreate)(&mut a, 0) })?;
+                check(unsafe { (drv.cuEventCreate)(&mut b, 0) })?;
+                check(unsafe { (drv.cuEventRecord)(a, self.dev.stream) })?;
+                self.dev.launch_func(p.func, &args, Dims::new(l.grid, p.threads))?;
+                check(unsafe { (drv.cuEventRecord)(b, self.dev.stream) })?;
+                check(unsafe { (drv.cuEventSynchronize)(b) })?;
+                let mut ms = 0f32;
+                check(unsafe { (drv.cuEventElapsedTime)(&mut ms, a, b) })?;
+                unsafe {
+                    (drv.cuEventDestroy_v2)(a);
+                    (drv.cuEventDestroy_v2)(b);
+                }
+                let mut k = self.profile.kernels.lock().unwrap();
+                let e = k.entry(p.label.clone()).or_default();
+                e.0 += 1;
+                e.1 += ms as f64;
+                continue;
+            }
+            self.dev.launch_func(p.func, &args, Dims::new(l.grid, p.threads))?;
+        }
+        Ok(())
+    }
+
+    /// `launch_all`, or the graph of an identical earlier submission: the first repeat of a submission is
+    /// captured while it launches, later ones replay the graph.
+    fn launch_or_replay(&self, groups: &[Vec<Launch<'_, Cuda>>]) -> Result<()> {
+        let g = &self.graphs;
+        if !g.on {
+            return self.launch_all(groups);
+        }
+        let key = graph_key(groups);
+        self.dev.make_current()?;
+        let drv = driver()?;
+        let cached = g.execs.lock().unwrap().iter().find(|(k, _)| *k == key).map(|(_, e)| *e);
+        if let Some(exec) = cached {
+            return check(unsafe { (drv.cuGraphLaunch)(exec, self.dev.stream) });
+        }
+        let repeat = {
+            let mut last = g.last.lock().unwrap();
+            let same = *last == key;
+            *last = key.clone();
+            same
+        };
+        if !repeat {
+            return self.launch_all(groups);
+        }
+        // CU_STREAM_CAPTURE_MODE_RELAXED: other threads' driver calls do not invalidate the capture.
+        check(unsafe { (drv.cuStreamBeginCapture_v2)(self.dev.stream, 2) })?;
+        let launched = self.launch_all(groups);
+        let mut graph: sys::CUgraph = std::ptr::null_mut();
+        let ended = check(unsafe { (drv.cuStreamEndCapture)(self.dev.stream, &mut graph) });
+        launched?;
+        ended?;
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let made = check(unsafe { (drv.cuGraphInstantiateWithFlags)(&mut exec, graph, 0) });
+        unsafe { (drv.cuGraphDestroy)(graph) };
+        made?;
+        {
+            let mut execs = g.execs.lock().unwrap();
+            execs.push((key, exec));
+            if execs.len() > GRAPHS {
+                let (_, old) = execs.remove(0);
+                unsafe { (drv.cuGraphExecDestroy)(old) };
+            }
+        }
+        // The capture recorded the kernels without running them.
+        check(unsafe { (drv.cuGraphLaunch)(exec, self.dev.stream) })
+    }
 }
 
 impl Backend for Cuda {
@@ -184,28 +362,12 @@ impl Backend for Cuda {
             _ => return Err(Error::Invalid(format!("the CUDA backend takes CUDA C or PTX blobs, `{}` is {:?}", blob.entry, blob.target))),
         };
         let func = self.dev.resolve(&Kernel { library, entry: blob.entry.clone() })?;
-        Ok(Pipeline { func, threads: blob.sig.workgroup, bindings: blob.sig.bindings.len(), push_bytes: blob.sig.push_bytes as usize })
+        Ok(Pipeline { label: blob.label.clone(), func, threads: blob.sig.workgroup, bindings: blob.sig.bindings.len(), push_bytes: blob.sig.push_bytes as usize })
     }
 
     fn submit(&self, groups: &[Vec<Launch<'_, Self>>]) -> Result<Pending> {
         // One in-order stream: program order is the schedule, groups are only a hint.
-        for l in groups.iter().flatten() {
-            let p = l.pipeline;
-            if l.bindings.len() != p.bindings || l.push.len() != p.push_bytes {
-                return Err(Error::Invalid(format!(
-                    "launch has {} bindings and {} push bytes, its kernel takes {} and {}",
-                    l.bindings.len(),
-                    l.push.len(),
-                    p.bindings,
-                    p.push_bytes
-                )));
-            }
-            let mut args: Vec<Arg<'_>> = l.bindings.iter().map(|b| Arg::Buf(BufRef { buf: b.buffer, offset: b.offset as usize })).collect();
-            if p.push_bytes > 0 {
-                args.push(Arg::Bytes(l.push));
-            }
-            self.dev.launch_func(p.func, &args, Dims::new(l.grid, p.threads))?;
-        }
+        self.launch_or_replay(groups)?;
         self.dev.make_current()?;
         let drv = driver()?;
         let mut event: CUevent = std::ptr::null_mut();
