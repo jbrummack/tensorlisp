@@ -136,7 +136,13 @@ impl<'a> Ctx<'a> {
             (xq, xd, Some(self.launch(blob, vec![tb.range, xq, xd], words(&[groups, k, tb.nb[1]]), self.tree_grid(ceil_div(groups, WG)))?))
         };
 
-        let rows = std::env::var("TL_TREE_DOT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        // Rows per subgroup share the activation loads; each adds a sum per column per lane, so many columns
+        // want fewer (measured on Gemma 4 E2B decode, RTX 3080: 1 up to 4 columns, 4 up to 16, then 2).
+        let rows = std::env::var("TL_TREE_DOT_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(match n {
+            0..=4 => 1,
+            5..=16 => 4,
+            _ => 2,
+        });
         let dot = tree.blob(&format!("(k:matvec-q8 {n} {rows})"))?;
         let sg = self.caps.subgroup_size;
         let push = [m, k, ta.nb[1], k / 4, k / 32, td.nb[1]];
