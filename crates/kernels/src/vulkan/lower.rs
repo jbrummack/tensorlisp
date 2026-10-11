@@ -31,13 +31,18 @@ use crate::{Error, Result};
 
 /// Loads and caches shader variants by name and specialization constants.
 pub struct Shaders {
-    lib: SpvLibrary,
+    lib: Option<SpvLibrary>,
     cache: Mutex<HashMap<(String, Vec<u32>), Arc<KernelBlob>>>,
 }
 
 impl Shaders {
     pub fn new(lib: SpvLibrary) -> Self {
-        Shaders { lib, cache: Mutex::new(HashMap::new()) }
+        Shaders { lib: Some(lib), cache: Mutex::new(HashMap::new()) }
+    }
+
+    /// No ggml shaders (a backend that only runs Tree kernels).
+    pub fn none() -> Self {
+        Shaders { lib: None, cache: Mutex::new(HashMap::new()) }
     }
 
     pub fn get(&self, name: &str, spec: &[u32]) -> Result<Arc<KernelBlob>> {
@@ -45,10 +50,13 @@ impl Shaders {
         if let Some(b) = self.cache.lock().unwrap().get(&key) {
             return Ok(b.clone());
         }
-        if !self.lib.contains(name) {
+        let Some(lib) = &self.lib else {
+            return Err(Error::Invalid(format!("no ggml shader library on this backend (wanted `{name}`)")));
+        };
+        if !lib.contains(name) {
             return Err(Error::Invalid(format!("the ggml shader library has no `{name}`")));
         }
-        let blob = Arc::new(self.lib.load(name, spec)?);
+        let blob = Arc::new(lib.load(name, spec)?);
         self.cache.lock().unwrap().insert(key, blob.clone());
         Ok(blob)
     }

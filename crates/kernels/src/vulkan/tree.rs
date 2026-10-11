@@ -14,7 +14,7 @@ use crate::sched::spirv;
 use crate::sched::{KernelBlob, OffsetMode};
 use crate::{Error, Result};
 
-type Compile = dyn Fn(&str) -> Result<Vec<u8>> + Send + Sync;
+type Compile = dyn Fn(&str) -> Result<KernelBlob> + Send + Sync;
 
 pub struct TreeKernels {
     compile: Box<Compile>,
@@ -24,7 +24,22 @@ pub struct TreeKernels {
 }
 
 impl TreeKernels {
+    /// A compiler to SPIR-V bytes (little-endian words).
     pub fn new(only: bool, compile: impl Fn(&str) -> Result<Vec<u8>> + Send + Sync + 'static) -> TreeKernels {
+        TreeKernels::from_blobs(only, move |expr| {
+            let bytes = compile(expr)?;
+            if bytes.len() % 4 != 0 {
+                return Err(Error::Invalid(format!("tree kernel {expr} compiled to a partial word")));
+            }
+            let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            // Tree kernels are `OffsetMode::Prefix`: the backend passes each binding's residual byte
+            // offset first, the kernel adds it to its indices.
+            spirv::blob(words, OffsetMode::Prefix, vec![])
+        })
+    }
+
+    /// A compiler that produces whole blobs (e.g. PTX for the CUDA backend).
+    pub fn from_blobs(only: bool, compile: impl Fn(&str) -> Result<KernelBlob> + Send + Sync + 'static) -> TreeKernels {
         TreeKernels { compile: Box::new(compile), cache: Mutex::new(HashMap::new()), only }
     }
 
@@ -34,12 +49,7 @@ impl TreeKernels {
         if let Some(b) = self.cache.lock().unwrap().get(expr) {
             return Ok(b.clone());
         }
-        let bytes = (self.compile)(expr)?;
-        if bytes.len() % 4 != 0 {
-            return Err(Error::Invalid(format!("tree kernel {expr} compiled to a partial word")));
-        }
-        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
-        let mut blob = spirv::blob(words, OffsetMode::Prefix, vec![])?;
+        let mut blob = (self.compile)(expr)?;
         blob.label = format!("tree:{expr}");
         let blob = Arc::new(blob);
         self.cache.lock().unwrap().insert(expr.to_string(), blob.clone());

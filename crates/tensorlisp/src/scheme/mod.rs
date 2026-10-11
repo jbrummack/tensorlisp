@@ -109,7 +109,7 @@ fn boot() -> Result<Scheme> {
     }
 
     // The environment Tree kernel expressions are compiled in (see `tree_compile`).
-    scheme.eval("(define-top-level-value '$tl-tree-env (environment '(rnrs) '(tl tree) '(tl tree opt) '(tl tree kernels)))")?;
+    scheme.eval("(define-top-level-value '$tl-tree-env (environment '(rnrs) '(tl tree) '(tl tree opt) '(tl tree kernels) '(tl tree ptx)))")?;
 
     // ggml assertions on this thread raise Scheme errors (see core.ss).
     crate::guard::install();
@@ -182,6 +182,27 @@ fn with_scheme<R: Send + 'static>(f: impl FnOnce(&Scheme) -> R + Send + 'static)
 
 /// Compiles a Tree kernel expression, e.g. `(k:binary 'add)`, to SPIR-V bytes (little-endian
 /// words) on the Scheme thread. The generators are in `stdlib/tree_kernels.ss`.
+#[cfg(any(feature = "native-vulkan", feature = "native-cuda-tree"))]
+pub(crate) fn tree_compile_src(expr: &str, compile: &str) -> String {
+    // TL_TREE_PASSES: the optimization passes run on the kernel first (default fold,licm,cse,dce;
+    // "none" skips them), see stdlib/tree_opt.ss.
+    let passes = std::env::var("TL_TREE_PASSES").unwrap_or_else(|_| "fold,licm,cse,dce".into());
+    let list: Vec<&str> = passes.split(',').filter(|p| !p.is_empty() && *p != "none").collect();
+    if list.is_empty() {
+        format!("(eval '({compile} {expr}) $tl-tree-env)")
+    } else {
+        format!("(eval '({compile} (optimize {expr} '({}))) $tl-tree-env)", list.join(" "))
+    }
+}
+
+/// Compiles a Tree kernel expression to PTX on the Scheme thread: `(ptx-text entry accesses push-bytes
+/// workgroup)` as `compile-kernel-ptx` returns it.
+#[cfg(feature = "native-cuda-tree")]
+pub(crate) fn tree_compile_ptx(expr: &str) -> Result<Value> {
+    let src = tree_compile_src(expr, "compile-kernel-ptx");
+    with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+}
+
 #[cfg(feature = "native-vulkan")]
 pub(crate) fn tree_compile(expr: &str) -> Result<Vec<u8>> {
     // TL_TREE_PASSES: the optimization passes run on the kernel first (default fold,licm,cse,dce;

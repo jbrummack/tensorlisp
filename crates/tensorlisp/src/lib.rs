@@ -20,7 +20,10 @@ mod native_ir;
 #[cfg(target_os = "macos")]
 #[path = "native_metal.rs"]
 mod native;
-#[cfg(all(feature = "native-cuda", not(target_os = "macos")))]
+#[cfg(all(feature = "native-cuda-tree", not(target_os = "macos")))]
+#[path = "native_cuda_tree.rs"]
+mod native;
+#[cfg(all(feature = "native-cuda", not(feature = "native-cuda-tree"), not(target_os = "macos")))]
 #[path = "native_cuda.rs"]
 mod native;
 #[cfg(all(feature = "native-vulkan", not(feature = "native-cuda"), not(target_os = "macos")))]

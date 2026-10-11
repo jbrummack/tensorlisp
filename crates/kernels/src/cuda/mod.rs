@@ -21,6 +21,9 @@ use sys::{
 };
 
 pub mod backend;
+/// The Tree-kernel executor on the CUDA backend (needs the `vulkan` feature for the shared lowering).
+#[cfg(feature = "vulkan")]
+pub mod tree;
 pub mod exec;
 pub mod lower;
 pub mod paged_attn;

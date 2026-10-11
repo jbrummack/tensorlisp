@@ -606,3 +606,61 @@ fn q8_matvec_repacked() {
         println!("{m:>8} {k:>6} | {t_plain:>6.4}ms {:>6.0} | {t_packed:>6.4}ms {:>6.0}", bytes_w / t_plain / 1e6, bytes_w / t_packed / 1e6);
     }
 }
+
+// ---- tensor cores: mma.sync fragments -------------------------------------------------------------
+
+/// `k:matmul-cm` (cooperative-matrix forms) compiled to PTX `mma.sync.m16n8k16`: against the CPU at
+/// awkward shapes, then timed against the scalar tiled kernel.
+#[test]
+fn tensor_core_matmul_as_ptx() {
+    let scheme = Scheme::new().unwrap();
+    for lib in [SPIRV_LIB, TREE_LIB, KERNELS_LIB, PTX_LIB] {
+        scheme.eval(lib).unwrap();
+    }
+    scheme.eval("(define-top-level-value '$env (environment '(rnrs) '(tl tree) '(tl tree kernels) '(tl tree ptx)))").unwrap();
+    let cuda = match Cuda::system_default() {
+        Ok(c) => c,
+        Err(tensorlisp_kernels::Error::NoDevice) if std::env::var_os("TL_ALLOW_NO_GPU").is_some() => return,
+        Err(e) => panic!("{e}"),
+    };
+    let e = Engine::new(Arc::new(cuda));
+    let compile = |expr: &str| {
+        let reply = scheme.eval(&format!("(eval '(compile-kernel-ptx {expr}) $env)")).unwrap_or_else(|err| panic!("{expr}: {err}"));
+        blob_from_reply(expr, reply)
+    };
+    let run = |k: &Arc<KernelBlob>, tile: [usize; 2], m: usize, n: usize, kk: usize, a: &[f32], b: &[f32]| {
+        let (la, lb, lc) = (4 * m * kk, 4 * n * kk, 4 * m * n);
+        let (ob, oc) = (align(la), align(la) + align(lb));
+        let push = [m as u32, n as u32, kk as u32, kk as u32, kk as u32, m as u32, 0, 0, 0, 0, 0, 0, 1, 1, 1];
+        let grid = [m.div_ceil(tile[0]) as u32, n.div_ceil(tile[1]) as u32, 1];
+        let l = launch(k, vec![step(0, la), step(ob, lb), step(oc, lc)], &push, grid);
+        let got = run_one(&e, l.clone(), &[(0, bytes(a)), (ob, bytes(b))], oc + align(lc), (oc, lc));
+        (got, l, oc + align(lc), ob)
+    };
+    for (m, n, kk) in [(64usize, 64usize, 64usize), (100, 37, 70), (17, 130, 33), (257, 5, 16)] {
+        let (a, b) = (noise(m * kk, 1), noise(n * kk, 2));
+        let want = cpu_matmul(&a, &b, m, n, kk);
+        for cfg in ["64 64 32 2 2", "32 32 16 1 1", "64 32 32 2 1", "32 32 32 2 2"] {
+            let p: Vec<usize> = cfg.split(' ').map(|x| x.parse().unwrap()).collect();
+            let k = compile(&format!("(k:matmul-cm 'f32 {cfg})"));
+            let (got, ..) = run(&k, [p[0], p[1]], m, n, kk, &a, &b);
+            close(&format!("mma {cfg} {m}x{n}x{kk}"), &got, &want, 5e-3);
+        }
+    }
+    if std::env::var_os("TL_BENCH").is_none() {
+        println!("timing skipped (set TL_BENCH=1)");
+        return;
+    }
+    println!("\ntiming (wall ms per launch)");
+    for (m, n, kk) in [(768usize, 192usize, 768usize), (3072, 1024, 768), (768, 1024, 3072)] {
+        let (a, b) = (noise(m * kk, 1), noise(n * kk, 2));
+        let mut cells = Vec::new();
+        for (name, expr, tile) in [("scalar 64x64", "(k:matmul 'f32 64 64 32 4 4)".to_string(), [64, 64]), ("mma 64x64x16", "(k:matmul-cm 'f32 64 64 16 2 2)".to_string(), [64, 64]), ("mma 32x32x32", "(k:matmul-cm 'f32 32 32 32 2 2)".to_string(), [32, 32])] {
+            let k = compile(&expr);
+            let (_, l, step_bytes, ob) = run(&k, tile, m, n, kk, &a, &b);
+            let ms = time_launch(&e, &l, &[(0, bytes(&a)), (ob, bytes(&b))], step_bytes, 100);
+            cells.push(format!("{name} {ms:.3} ms ({:.1} TFLOP/s)", 2.0 * (m * n * kk) as f64 / ms / 1e9));
+        }
+        println!("matmul {m}x{n}x{kk}: {}", cells.join(" | "));
+    }
+}

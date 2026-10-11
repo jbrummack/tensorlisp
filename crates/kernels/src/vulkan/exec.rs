@@ -19,8 +19,8 @@ use crate::plan::{align, plan_spread, BufId, Layout, Leaves};
 use crate::sched::{Backend, CompiledPlan, Engine, ModelMem, Session, Ticket};
 use crate::{Error, Result};
 
-pub struct Executor {
-    pub engine: Arc<Engine<Vulkan>>,
+pub struct Executor<B: Backend = Vulkan> {
+    pub engine: Arc<Engine<B>>,
     shaders: Shaders,
     pub caps: Caps,
     tree: Option<TreeKernels>,
@@ -29,7 +29,7 @@ pub struct Executor {
     paged: Option<TreeKernels>,
 }
 
-impl Executor {
+impl Executor<Vulkan> {
     /// Wraps `vk`, loading ggml's precompiled shader library (see
     /// `scripts/build-ggml-vulkan-shaders.sh`; `TL_GGML_SPV` overrides the directory).
     pub fn new(vk: Vulkan) -> Result<Executor> {
@@ -39,6 +39,14 @@ impl Executor {
             .ok_or_else(|| Error::Invalid(format!("no precompiled ggml Vulkan shaders in {}: run scripts/build-ggml-vulkan-shaders.sh", dir.display())))?;
         let caps = vk.caps();
         Ok(Executor { engine: Arc::new(Engine::new(Arc::new(vk))), shaders: Shaders::new(lib), caps, tree: None, paged: None })
+    }
+}
+
+impl<B: Backend> Executor<B> {
+    /// An executor over another backend, which can only run Tree kernels (set them with
+    /// [`Executor::set_tree`], `only`); `caps` describes its device for the lowering.
+    pub fn with_backend(backend: B, caps: Caps) -> Executor<B> {
+        Executor { engine: Arc::new(Engine::new(Arc::new(backend))), shaders: Shaders::none(), caps, tree: None, paged: None }
     }
 
     /// Lowers nodes with a Tree generator to generated kernels (ggml's shaders stay the fallback
@@ -52,13 +60,13 @@ impl Executor {
         self.paged = Some(tree);
     }
 
-    pub fn backend(&self) -> &Arc<Vulkan> {
+    pub fn backend(&self) -> &Arc<B> {
         self.engine.backend()
     }
 
     /// Lowers every node, then compiles the launches into a plan. Missing ops are
     /// all reported in one error.
-    pub fn compile(&self, graph: Graph, leaves: &Leaves) -> Result<Program> {
+    pub fn compile(&self, graph: Graph, leaves: &Leaves) -> Result<Program<B>> {
         let caps = self.caps;
         let mut graph = graph;
         if std::env::var_os("TL_NATIVE_TRACE").is_some() {
@@ -182,19 +190,19 @@ impl Executor {
 }
 
 /// A compiled graph: the plan plus how to feed it and read it back.
-pub struct Program {
-    engine: Arc<Engine<Vulkan>>,
+pub struct Program<B: Backend = Vulkan> {
+    engine: Arc<Engine<B>>,
     /// Step-arena ranges copied to the host along with every run (the graph's outputs and taps).
     reads: Vec<(u64, u64)>,
-    plan: CompiledPlan<Vulkan>,
+    plan: CompiledPlan<B>,
     pub layout: Layout,
     arena_base: u64,
     inputs: Mutex<Vec<Option<Vec<u8>>>>,
     /// The finished submission; its arena holds the results until the next run.
-    last: Mutex<Option<Ticket<Vulkan>>>,
+    last: Mutex<Option<Ticket<B>>>,
 }
 
-impl Program {
+impl<B: Backend> Program<B> {
     pub fn launch_count(&self) -> usize {
         self.plan.launch_count()
     }
@@ -210,7 +218,7 @@ impl Program {
     }
 
     /// Submits the plan with the staged inputs and waits for it.
-    pub fn run(&self, model: &Arc<ModelMem<Vulkan>>, session: Option<&Arc<Session<Vulkan>>>) -> Result<()> {
+    pub fn run(&self, model: &Arc<ModelMem<B>>, session: Option<&Arc<Session<B>>>) -> Result<()> {
         let staged = self.inputs.lock().unwrap();
         let mut writes: Vec<(u64, &[u8])> = Vec::new();
         for (i, data) in staged.iter().enumerate() {

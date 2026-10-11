@@ -268,6 +268,24 @@ had not reached full clocks after 20 launches). Findings: unrolled, independent 
 branch on PTX (predication was slower). Not done: wiring Tree kernels into the CUDA native
 executor (the kernels run through the scheduler only), a full-model run on CUDA.
 
+### Tree kernels in the native CUDA executor (`native-cuda-tree`)
+
+`--features native-cuda-tree` (on `tensorlisp` / `tensorlisp-cli`, implies `native-cuda`, builds `tensorlisp-kernels` with
+`vulkan` for the shared lowering; ash is dlopen'd, no SDK needed) runs `--device native` through the Vulkan executor's lowering
+with PTX instead of SPIR-V: `vulkan::exec::Executor<B>` and `Program<B>` are generic over the scheduler backend,
+`cuda::tree::executor` describes the device (`Cuda::tree_caps`: 32-wide warps, dp4a, `mma.sync` standing in for cooperative
+matrices on sm_80+), `TreeKernels::from_blobs` takes a compiler that returns whole blobs (`compile-kernel-ptx`, raw offsets), and
+`src/native_cuda_tree.rs` is the glue. Every node must have a Tree kernel (`only` mode; the rest fail by name: IM2COL, PAD,
+POOL_2D, CONV_2D_DW, some UNARY, UPSCALE, odd MUL_MAT types). Checked on the RTX 3080: TIPSv2 text, PP-OCRv6 det + rec, T5Gemma2
+text generation (same text as the CPU backend), Gemma 4 E2B q8_0 (32 greedy tokens equal to transformers), batched dense and
+paged decoding of T5Gemma2; Gemma 4 paged differs from dense/sequential at one near-tie token in one of four sequences.
+Gemma 4 E2B q8_0 aggregate tokens/s, 6-token prompts (the NVRTC executor / Tree on PTX): 1 sequence 36 / 131 (sequential
+decode-step), batched dense 1: 37 / 140, 4: 90 / 517, 8: 110 / 737; from 16 sequences on the q8_0 matrix path is slow
+(16: 186 / 67, 64: 635 / 689): the next thing to tune.
+
+Bug found on the way: the PTX `exp` returned NaN for -inf (its error-correction term is inf - inf), which only shows with masked
+keys *inside* a valid range (masked suffixes are never evaluated); fixed, regression test `attention_with_large_head_sizes`.
+
 ## Learning from ggml-cuda's PTX
 
 Method: `scripts/ggml-cuda-ptx.bat mmvq softmax norm rope mmf template-instances/mmq-instance-q8_0

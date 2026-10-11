@@ -277,6 +277,31 @@ fn rope_pooling_depthwise_argmax() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Head sizes of real decoders (128, 256): one query over a long cache (the split path) and several
+/// queries, with grouped K/V heads and a padding mask that has holes (exp of -inf must be 0).
+#[test]
+fn attention_with_large_head_sizes() {
+    for (hs, nq, nk) in [(128usize, 1usize, 300usize), (256, 1, 1000), (256, 1, 100), (256, 5, 60), (256, 40, 70)] {
+        let program = format!(
+            r#"
+          (import (tl attn))
+          (model sdpa (inputs [q f32 ({hs} {nq} 4 1)] [k f32 ({hs} {nk} 1 1)] [v f32 ({hs} {nk} 1 1)] [valid f32 ({nk} 1)])
+            (define mask (attn:padding-mask valid {nq}))
+            (outputs [flash (attn:sdpa q k v 'mask mask 'flash #t) 3]))
+        "#
+        );
+        let path = write(&format!("hs-{hs}-{nq}-{nk}"), &program, &[]);
+        let (q, k, v) = (noise(&[1, 4, nq, hs], 1), noise(&[1, 1, nk, hs], 2), noise(&[1, 1, nk, hs], 3));
+        let mut valid = ArrayD::<f32>::zeros(IxDyn(&[1, nk]));
+        // masked keys in the middle of the valid range, so exp(-inf) is evaluated
+        for j in (0..nk * 3 / 4).filter(|j| j % 3 != 1) {
+            valid[[0, j]] = 1.0;
+        }
+        same_as_cpu(&path, "sdpa", &[("q", &q), ("k", &k), ("v", &v), ("valid", &valid)], 8e-3);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 #[test]
 fn state_and_set_rows_persist_between_runs() {
     let program = r#"

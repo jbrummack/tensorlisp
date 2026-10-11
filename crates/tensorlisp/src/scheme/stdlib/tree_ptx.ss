@@ -41,9 +41,9 @@
     (or (hashtable-ref (ps-memo st) key #f)
         (let ([v (build)]) (hashtable-set! (ps-memo st) key v) v)))
 
-  (define (cls ty) (case ty [(f32) 'f] [(i32 u32) 'r] [(bool) 'p] [(u16) 'h] [else (error 'tree-ptx "no register class" ty)]))
-  (define (tsfx ty) (case ty [(f32) "f32"] [(u32) "u32"] [(i32) "s32"] [(u16) "u16"] [else (error 'tree-ptx "no type suffix" ty)]))
-  (define (esize ty) (if (eq? ty 'u16) 2 4))
+  (define (cls ty) (case ty [(f32) 'f] [(i32 u32) 'r] [(bool) 'p] [(u16 f16) 'h] [else (error 'tree-ptx "no register class" ty)]))
+  (define (tsfx ty) (case ty [(f32) "f32"] [(u32) "u32"] [(i32) "s32"] [(u16) "u16"] [(f16) "b16"] [else (error 'tree-ptx "no type suffix" ty)]))
+  (define (esize ty) (if (memq ty '(u16 f16)) 2 4))
 
   (define (hex8 n)
     (let ([s (string-upcase (number->string n 16))])
@@ -54,7 +54,7 @@
     (case ty
       [(f32) (ins! st "mov.f32 ~a, ~a;" dst src)]
       [(i32 u32) (ins! st "mov.b32 ~a, ~a;" dst src)]
-      [(u16) (ins! st "mov.b16 ~a, ~a;" dst src)]
+      [(u16 f16) (ins! st "mov.b16 ~a, ~a;" dst src)]
       [(bool) (ins! st "mov.pred ~a, ~a;" dst src)]))
 
   (define (new-val st ty) (cons (reg! st (cls ty)) ty))
@@ -156,6 +156,8 @@
         [(and (eq? s 'u16) (eq? t 'u32)) (unop st "cvt.u32.u16 ~a, ~a;" t (car v))]
         [(and (eq? s 'u16) (eq? t 'i32)) (unop st "cvt.u32.u16 ~a, ~a;" t (car v))]
         [(and (memq s '(u32 i32)) (eq? t 'u16)) (unop st "cvt.u16.u32 ~a, ~a;" t (car v))]
+        [(and (eq? s 'f32) (eq? t 'f16)) (unop st "cvt.rn.f16.f32 ~a, ~a;" t (car v))]
+        [(and (eq? s 'f16) (eq? t 'f32)) (unop st "cvt.f32.f16 ~a, ~a;" t (car v))]
         [else (fail form "cannot convert ~a to ~a" s t)])))
 
   ;; Approximate-instruction building blocks.
@@ -171,7 +173,14 @@
       (ins! st "ex2.approx.ftz.f32 ~a, ~a;" (car d) (car t))
       (ins! st "mul.f32 ~a, ~a, ~a;" (car e) (car u) ln2)
       (ins! st "fma.rn.f32 ~a, ~a, ~a, ~a;" (car r) (car d) (car e) (car d))
-      r))
+      ;; The correction term is inf - inf = NaN at the ends of the range: exp(-inf) = 0, exp(+inf) = inf
+      ;; (masked attention scores are -inf). NaN inputs stay NaN: both comparisons are false for them.
+      (let ([lo (new-val st 'bool)] [hi (new-val st 'bool)] [r0 (new-val st 'f32)] [r1 (new-val st 'f32)])
+        (ins! st "setp.lt.f32 ~a, ~a, 0fC2D20000;" (car lo) x)
+        (ins! st "selp.f32 ~a, 0f00000000, ~a, ~a;" (car r0) (car r) (car lo))
+        (ins! st "setp.gt.f32 ~a, ~a, 0f42D20000;" (car hi) x)
+        (ins! st "selp.f32 ~a, 0f7F800000, ~a, ~a;" (car r1) (car r0) (car hi))
+        r1)))
 
   (define (f-tanh st x)
     ;; tanh x = sign(x) (1 - e) / (1 + e), e = exp(-2|x|)
@@ -247,6 +256,7 @@
                 [vals (map (lambda (a) (cx-as st a env t e)) args)])
            (when (eq? t 'bool) (fail e "~a on bool" h))
            (when (eq? t 'u16) (fail e "~a on u16: convert with (u32 ...) first" h))
+           (when (eq? t 'f16) (fail e "~a on f16: f16 is for storage and matrices only" h))
            (when (and (memq h bit-ops) (eq? t 'f32)) (fail e "~a on f32" h))
            (cond
              [(and (eq? h '-) (null? (cdr vals)))
@@ -290,7 +300,7 @@
                    (if (and (eq? space 'global) (eq? access 'ro)) ".nc" "")
                    (tsfx elem) (car d) addr)
              d))]
-        [(memq h '(f32 i32 u32 u16))
+        [(memq h '(f32 i32 u32 u16 f16))
          (let* ([t0 (ty-of (car args) env)]
                 [v (cx st (car args) env (if (memq t0 '(ilit flit)) (if (eq? t0 'ilit) h 'f32) #f))])
            (cast st e v h))]
@@ -403,6 +413,100 @@
     (unless (and (integer? d) (<= 0 d 2)) (fail form "dimension must be 0, 1 or 2"))
     d)
 
+  ;; ---- cooperative matrices (mma.sync) -------------------------------------------------------------
+
+  (define (cm-lookup form env name)
+    (let ([b (lookup form env name)])
+      (unless (eq? (vector-ref b 0) 'cmat) (fail form "~a is not a cooperative matrix" name))
+      b))
+
+  ;; The lane's place in the m16n8k16 fragments: g = lane / 4 (row group), t2 = 2 * (lane % 4).
+  (define (frag-g st)
+    (memo! st 'frag-g (lambda () (let ([r (reg! st 'r)]) (pre! st "shr.u32 ~a, ~a, 2;" r (special st "%laneid")) r))))
+  (define (frag-t2 st)
+    (memo! st 'frag-t2
+      (lambda ()
+        (let ([a (reg! st 'r)] [r (reg! st 'r)])
+          (pre! st "and.b32 ~a, ~a, 3;" a (special st "%laneid"))
+          (pre! st "shl.b32 ~a, ~a, 1;" r a)
+          r))))
+
+  (define (add-const! st reg c)
+    (if (= c 0)
+        reg
+        (let ([d (reg! st 'r)]) (ins! st "add.u32 ~a, ~a, ~a;" d reg c) d)))
+
+  ;; Element offset (in elements) of matrix element (row, col) = (rr + rc, cr + cc) from the matrix
+  ;; corner, for a row-major (row * stride + col) or column-major (col * stride + row) layout.
+  (define (frag-offset st stride layout rr rc cr cc)
+    (let ([row (add-const! st rr rc)] [col (add-const! st cr cc)] [d (reg! st 'r)])
+      (if (eq? layout 'row)
+          (ins! st "mad.lo.u32 ~a, ~a, ~a, ~a;" d row stride col)
+          (ins! st "mad.lo.u32 ~a, ~a, ~a, ~a;" d col stride row))
+      d))
+
+  ;; Address of element `base + off` in the same space as `addr` (a shared 32-bit or global 64-bit address).
+  (define (offset-addr st space addr off esz)
+    (if (eq? space 'shared)
+        (let ([a (reg! st 'r)]) (ins! st "mad.lo.u32 ~a, ~a, ~a, ~a;" a off esz addr) a)
+        (let ([w (reg! st 'rd)] [a (reg! st 'rd)])
+          (ins! st "mul.wide.u32 ~a, ~a, ~a;" w off esz)
+          (ins! st "add.u64 ~a, ~a, ~a;" a addr w)
+          a)))
+
+  (define (layout-of form l)
+    (case l [(row col) l] [else (fail form "layout must be row or col")]))
+
+  ;; (cm-load M buf idx stride row|col): the lane's fragment of the 16x16 matrix whose corner is
+  ;; element idx of buf (f16). Pairs of halves that are adjacent in memory are one 32-bit load, which
+  ;; needs idx, stride and the element offsets even.
+  (define (cm-load! st form env args)
+    (let* ([b (cm-lookup form env (car args))] [regs (vector-ref b 1)] [use (vector-ref b 2)]
+           [layout (layout-of form (car (cddddr args)))]
+           [stride (car (cx-as st (cadddr args) env 'u32 form))])
+      (let-values ([(addr elem access space) (element-addr st form env (cadr args) (caddr args))])
+        (unless (eq? elem 'f16) (fail form "cm-load reads f16 data on the PTX target"))
+        (let* ([g (frag-g st)] [t2 (frag-t2 st)]
+               [space-s (if (eq? space 'shared) "shared" "global")]
+               [pair-adjacent (if (eq? use 'a) (eq? layout 'row) (eq? layout 'col))]
+               ;; (row-reg row-const col-reg col-const) of the first element of fragment register i
+               [first-elem
+                (lambda (i)
+                  (if (eq? use 'a)
+                      ;; a0: (g, t2) a1: (g + 8, t2) a2: (g, t2 + 8) a3: (g + 8, t2 + 8)
+                      (list g (if (odd? i) 8 0) t2 (if (>= i 2) 8 0))
+                      ;; b regs 2h + q: k = t2 + 8q (+ 0 / 1), n = g + 8h
+                      (list t2 (* 8 (mod i 2)) g (* 8 (div i 2)))))]
+               [step (lambda (e) (if (eq? use 'a) (list (car e) (cadr e) (caddr e) (+ (cadddr e) 1)) (list (car e) (+ (cadr e) 1) (caddr e) (cadddr e))))])
+          (for-each
+            (lambda (reg i)
+              (let* ([e0 (first-elem i)] [e1 (step e0)]
+                     [o0 (apply frag-offset st stride layout e0)])
+                (if pair-adjacent
+                    (ins! st "ld.~a.b32 ~a, [~a];" space-s reg (offset-addr st space addr o0 2))
+                    (let ([o1 (apply frag-offset st stride layout e1)] [h0 (reg! st 'h)] [h1 (reg! st 'h)])
+                      (ins! st "ld.~a.b16 ~a, [~a];" space-s h0 (offset-addr st space addr o0 2))
+                      (ins! st "ld.~a.b16 ~a, [~a];" space-s h1 (offset-addr st space addr o1 2))
+                      (ins! st "mov.b32 ~a, {~a, ~a};" reg h0 h1)))))
+            regs (let loop ([i 0] [acc '()]) (if (= i 4) (reverse acc) (loop (+ i 1) (cons i acc)))))))))
+
+  ;; (cm-store M buf idx stride row|col): the accumulator's eight values to f32 elements.
+  (define (cm-store! st form env args)
+    (let* ([b (cm-lookup form env (car args))] [regs (vector-ref b 1)]
+           [layout (layout-of form (car (cddddr args)))]
+           [stride (car (cx-as st (cadddr args) env 'u32 form))])
+      (unless (eq? (vector-ref b 2) 'c) (fail form "cm-store stores accumulators"))
+      (let-values ([(addr elem access space) (element-addr st form env (cadr args) (caddr args))])
+        (unless (eq? elem 'f32) (fail form "cm-store writes f32 data on the PTX target"))
+        (let ([g (frag-g st)] [t2 (frag-t2 st)] [space-s (if (eq? space 'shared) "shared" "global")])
+          ;; c[4h + 2r + j]: row g + 8r, column t2 + j + 8h
+          (let loop ([i 0] [regs regs])
+            (unless (null? regs)
+              (let* ([h (div i 4)] [r (div (mod i 4) 2)] [j (mod i 2)]
+                     [off (frag-offset st stride layout g (* 8 r) t2 (+ j (* 8 h)))])
+                (ins! st "st.~a.f32 [~a], ~a;" space-s (offset-addr st space addr off 4) (car regs)))
+              (loop (+ i 1) (cdr regs))))))))
+
   ;; ---- statements --------------------------------------------------------------------------------
 
   (define (cstmts st stmts env)
@@ -468,6 +572,37 @@
            env)]
         [(for) (cfor st s env) env]
         [(barrier) (ins! st "bar.sync 0;") env]
+        [(cmat)
+         ;; (cmat name use type): a 16x16 matrix held as the fragments of mma.sync.m16n8k16 -- a, b: f16,
+         ;; four 32-bit registers (two halves each); c: f32, eight registers (two n8 halves)
+         (let* ([name (car args)] [use (cadr args)] [ty (caddr args)])
+           (hashtable-set! (ps-memo st) 'mma #t)
+           (unless (or (and (memq use '(a b)) (eq? ty 'f16)) (and (eq? use 'c) (eq? ty 'f32)))
+             (fail s "the PTX target has a and b matrices of f16 and c matrices of f32"))
+           (let ([regs (if (eq? use 'c)
+                           (map (lambda (i) (reg! st 'f)) '(0 1 2 3 4 5 6 7))
+                           (map (lambda (i) (reg! st 'r)) '(0 1 2 3)))])
+             (cons (cons name (vector 'cmat regs use ty)) env)))]
+        [(cm-zero)
+         (for-each (lambda (r) (ins! st "mov.f32 ~a, 0f00000000;" r)) (vector-ref (cm-lookup s env (car args)) 1))
+         env]
+        [(cm-load)
+         (cm-load! st s env args)
+         env]
+        [(cm-store)
+         (cm-store! st s env args)
+         env]
+        [(cm-muladd)
+         ;; (cm-muladd dst a b c): dst = a * b + c, two m16n8k16 products (the n halves)
+         (let ([d (vector-ref (cm-lookup s env (car args)) 1)] [a (vector-ref (cm-lookup s env (cadr args)) 1)]
+               [b (vector-ref (cm-lookup s env (caddr args)) 1)] [c (vector-ref (cm-lookup s env (cadddr args)) 1)])
+           (for-each
+             (lambda (h)
+               (let ([part (lambda (l) (list (list-ref l (* 4 h)) (list-ref l (+ (* 4 h) 1)) (list-ref l (+ (* 4 h) 2)) (list-ref l (+ (* 4 h) 3))))])
+                 (ins! st "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {~a}, {~a}, {~a, ~a}, {~a};"
+                       (join (part d) ", ") (join a ", ") (list-ref b (* 2 h)) (list-ref b (+ (* 2 h) 1)) (join (part c) ", "))))
+             '(0 1))
+           env)]
         [else (fail s "unknown statement ~a" h)])))
 
   ;; Loops whose bounds are literal integers and that run few times are unrolled here, the
@@ -548,9 +683,9 @@
                           (let ([n (hashtable-ref (ps-counts st) (car c) 0)])
                             (fmt "  .reg .~a %~a<~a>;" (cdr c) (car c) (max n 1))))
                         '((p . pred) (r . b32) (f . f32) (rd . b64) (h . b16)))]
-             [decls (map (lambda (s) (fmt "  .shared .align 4 .b8 sh_~a[~a];" (car s) (* (esize (cadr s)) (caddr s)))) shared-specs)]
+             [decls (map (lambda (s) (fmt "  .shared .align 16 .b8 sh_~a[~a];" (car s) (* (esize (cadr s)) (caddr s)))) shared-specs)]
              [text (join (append
-                           (list ".version 7.0" ".target sm_70" ".address_size 64" ""
+                           (list ".version 7.0" (if (hashtable-ref (ps-memo st) 'mma #f) ".target sm_80" ".target sm_70") ".address_size 64" ""
                                  (fmt ".visible .entry ~a(" name)
                                  (join params ",\n")
                                  ")"
