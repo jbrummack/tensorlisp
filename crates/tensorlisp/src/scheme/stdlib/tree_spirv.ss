@@ -113,7 +113,7 @@
                     caps
                     exts
                     ext-insts
-                    (list (list 14 0 1) entry mode)
+                    (list (list 14 0 (if (memv 5345 (module-caps m)) 3 1)) entry mode)
                     (reverse (module-annot m))
                     (reverse (module-globals m))
                     (list (list 54 void fn 0 fn-type) (list 248 entry-label))

@@ -516,5 +516,10 @@
   (define optimize
     (case-lambda
       [(k) (optimize k default-passes)]
-      [(k passes) (fold-left (lambda (k p) (run-pass p k)) k passes)]))
+      ;; kernels with cooperative matrices are left alone: the passes do not look inside cm-* statements
+      [(k passes) (if (has-cmat? k) k (fold-left (lambda (k p) (run-pass p k)) k passes))]))
+
+  (define (has-cmat? x)
+    (cond [(pair? x) (or (eq? (car x) 'cmat) (has-cmat? (car x)) (has-cmat? (cdr x)))]
+          [else #f]))
 )

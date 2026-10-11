@@ -120,6 +120,8 @@ pub struct Features {
     pub buffer_address: bool,
     /// `OpSDot` on packed 4x8-bit integers (VK_KHR_shader_integer_dot_product), the dp4a of PTX.
     pub int_dot: bool,
+    /// VK_KHR_cooperative_matrix with the f16 x f16 + f32 16x16x16 subgroup-scope shape (tensor cores).
+    pub coopmat: bool,
 }
 
 /// What the kernel selection logic needs to know about the device.
@@ -133,6 +135,8 @@ pub struct Caps {
     pub fp16: bool,
     /// Packed int8 dot products in shaders (`OpSDot`).
     pub int_dot: bool,
+    /// Cooperative matrices (f16 inputs, f32 accumulator, 16x16x16, subgroup scope).
+    pub coopmat: bool,
     pub shared_memory: u32,
     pub max_groups: [u32; 3],
     /// `maxStorageBufferRange`: the largest binding.
@@ -633,6 +637,7 @@ impl Vulkan {
                 subgroup_extended_types: f12.shader_subgroup_extended_types == vk::TRUE,
                 buffer_address: false,
                 int_dot: false,
+                coopmat: false,
             };
             // Integer dot products live in an extension struct (core in Vulkan 1.3).
             let ext_ok = unsafe { instance.enumerate_device_extension_properties(phys) }.is_ok_and(|exts| {
@@ -644,26 +649,60 @@ impl Vulkan {
                 unsafe { instance.get_physical_device_features2(phys, &mut f2) };
                 has.int_dot = dot.shader_integer_dot_product == vk::TRUE;
             }
+            // Cooperative matrices: the extension, its feature bit, and the one shape the Tree
+            // kernels use among the shapes the device lists.
+            let cm_ext = unsafe { instance.enumerate_device_extension_properties(phys) }.is_ok_and(|exts| {
+                exts.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == ash::khr::cooperative_matrix::NAME)
+            });
+            if cm_ext && has.float16 && f12.vulkan_memory_model == vk::TRUE && std::env::var_os("TL_VULKAN_NOCOOPMAT").is_none() {
+                let mut cm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut cm);
+                unsafe { instance.get_physical_device_features2(phys, &mut f2) };
+                if cm.cooperative_matrix == vk::TRUE {
+                    let loader = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+                    let shapes = unsafe { loader.get_physical_device_cooperative_matrix_properties(phys) }.unwrap_or_default();
+                    has.coopmat = shapes.iter().any(|p| {
+                        p.m_size == 16
+                            && p.n_size == 16
+                            && p.k_size == 16
+                            && p.a_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                            && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                            && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                            && p.scope == vk::ScopeKHR::SUBGROUP
+                    });
+                }
+            }
         }
         let mut e11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(has.storage16);
         let mut e12 = vk::PhysicalDeviceVulkan12Features::default()
             .storage_buffer8_bit_access(has.storage8)
             .shader_float16(has.float16)
             .shader_int8(has.int8)
+            .vulkan_memory_model(has.coopmat)
             .shader_subgroup_extended_types(has.subgroup_extended_types);
         let mut e2 = vk::PhysicalDeviceFeatures2::default().features(
             vk::PhysicalDeviceFeatures::default().shader_int16(has.shader_int16).shader_int64(has.shader_int64),
         );
         let mut edot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default().shader_integer_dot_product(has.int_dot);
-        let dot_ext = [ash::khr::shader_integer_dot_product::NAME.as_ptr()];
+        let mut ecm = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(has.coopmat);
+        let mut ext_names: Vec<*const std::ffi::c_char> = Vec::new();
+        if has.int_dot {
+            ext_names.push(ash::khr::shader_integer_dot_product::NAME.as_ptr());
+        }
+        if has.coopmat {
+            ext_names.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+        }
         let mut create = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info);
         if props.api_version >= vk::API_VERSION_1_2 && api >= vk::API_VERSION_1_2 {
             e2 = e2.push_next(&mut e11).push_next(&mut e12);
             if has.int_dot {
                 e2 = e2.push_next(&mut edot);
-                create = create.enabled_extension_names(&dot_ext);
             }
-            create = create.push_next(&mut e2);
+            if has.coopmat {
+                e2 = e2.push_next(&mut ecm);
+            }
+            create = create.enabled_extension_names(&ext_names).push_next(&mut e2);
         }
         let device = unsafe { instance.create_device(phys, &create, None) }
             .map_err(|e| Error::Execution(format!("vulkan create_device: {e}")))?;
@@ -718,6 +757,7 @@ impl Vulkan {
             subgroup_arithmetic,
             fp16: has.float16,
             int_dot: has.int_dot,
+            coopmat: has.coopmat,
             shared_memory: l.max_compute_shared_memory_size,
             max_groups: l.max_compute_work_group_count,
             max_storage_range: l.max_storage_buffer_range as u64,

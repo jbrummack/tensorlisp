@@ -86,6 +86,9 @@ fn every_generator_compiles_and_validates() {
         "(k:norm-rope 64 #t 'norm 'f32 #f)",
         "(k:gateup-q8 2 2)",
         "(k:gateup-q8 1 1)",
+        "(k:matmul-cm 'f32 64 64 32 2 2)",
+        "(k:matmul-cm 'f16 32 32 16 1 1)",
+        "(k:matmul-cm 'q8_0 64 32 32 2 1)",
         "(k:matvec-q8 1 1 3)",
         "(k:matvec-q8 2 2 2)",
     ];
@@ -103,7 +106,7 @@ fn every_generator_compiles_and_validates() {
         if let Some(exe) = &validator {
             let path = std::env::temp_dir().join(format!("tree-lib-{}.spv", std::process::id()));
             std::fs::write(&path, &b).unwrap();
-            let out = Command::new(exe).args(["--target-env", "vulkan1.1"]).arg(&path).output().unwrap();
+            let out = Command::new(exe).args(["--target-env", "vulkan1.2"]).arg(&path).output().unwrap();
             let _ = std::fs::remove_file(&path);
             assert!(out.status.success(), "spirv-val rejected {expr}:\n{}", String::from_utf8_lossy(&out.stderr));
         }

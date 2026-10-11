@@ -572,6 +572,30 @@ impl<'a> Ctx<'a> {
             eprintln!("tree matmul {atype} m={m} n={n} k={k} batch={batch} -> tile {bm}x{bn}x{bk} regs {tm}x{tn}");
         }
         let push = [m, n, k, ta.nb[1], tb.nb[1], td.nb[1], ta.nb[2], ta.nb[3], tb.nb[2], tb.nb[3], td.nb[2], td.nb[3], ne12, r2, r3];
+        // Tensor cores (cooperative matrices, f16 inputs with f32 accumulation) when the device has
+        // them and there are enough columns to fill a 16x16 fragment; TL_TREE_NOCM=1 keeps the scalar
+        // kernel (exact f32), TL_TREE_CM="bm bn bk wm wn" forces a tile.
+        if self.caps.coopmat && self.caps.subgroup_size == 32 && n >= 16 && std::env::var_os("TL_TREE_NOCM").is_none() {
+            // 64x64 tiles when there are enough of them to fill the GPU (two and a bit per SM), else
+            // 32x32 tiles with four subgroups (measured on TIPSv2's n = 192 products, docs/design/tree.md).
+            let tiles64 = ceil_div(m, 64) * ceil_div(n, 64) * batch;
+            let cores = self.caps.shader_cores;
+            let (mut cbm, mut cbn, mut cbk, mut wm, mut wn) = if n < 32 {
+                (64, 16, 16, 2, 1)
+            } else if tiles64 >= cores * 2 + cores / 4 {
+                (64, 64, 16, 2, 2)
+            } else {
+                (32, 32, 32, 2, 2)
+            };
+            if let Ok(v) = std::env::var("TL_TREE_CM") {
+                let p: Vec<u32> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if let [a, b, c, d, e] = p[..] {
+                    (cbm, cbn, cbk, wm, wn) = (a, b, c, d, e);
+                }
+            }
+            let grid = [ceil_div(m, cbm), ceil_div(n, cbn), batch];
+            return self.tree_launch(tree, &format!("(k:matmul-cm '{atype} {cbm} {cbn} {cbk} {wm} {wn})"), vec![ta.range, tb.range, td.range], &push, grid);
+        }
         let grid = [ceil_div(m, bm), ceil_div(n, bn), batch];
         self.tree_launch(tree, &format!("(k:matmul '{atype} {bm} {bn} {bk} {tm} {tn})"), vec![ta.range, tb.range, td.range], &push, grid)
     }

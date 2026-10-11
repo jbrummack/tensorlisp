@@ -46,6 +46,7 @@
           [(bool) (global! m 20 id)]
           [(void) (global! m 19 id)]
           [(u16) (capability! m 22) (capability! m 4433) (extension! m "SPV_KHR_16bit_storage") (global! m 21 id 16 0)]
+          [(f16) (capability! m 9) (capability! m 4433) (extension! m "SPV_KHR_16bit_storage") (global! m 22 id 16)]
           [(vec2f) (global! m 23 id (type-id m 'f32) 2)]
           [else (error 'tree "unknown type" t)]))))
 
@@ -62,7 +63,7 @@
               [(f32) (global! m 43 ty id (f32-bits v))]
               [else (global! m 43 ty id (bitwise-and v #xffffffff))]))))))
 
-  (define (value-type? t) (and (memq t '(f32 i32 u32 bool u16)) #t))
+  (define (value-type? t) (and (memq t '(f32 i32 u32 bool u16 f16)) #t))
 
   ;; ---- environment -------------------------------------------------------------------------
   ;; name -> #(val id type) | #(var ptr type) | #(push index type) | #(buf var elem access)
@@ -125,7 +126,7 @@
            [(memq h '(and or not)) 'bool]
            [(eq? h 'load)
             (let ([b (buffer-like e env (cadr e))]) (vector-ref b 2))]
-           [(memq h '(f32 i32 u32 u16)) h]
+           [(memq h '(f32 i32 u32 u16 f16)) h]
            [(eq? h 'select) (common e (map (lambda (a) (ty-of a env)) (cddr e)))]
            [(eq? h 'guard) (common e (map (lambda (a) (ty-of a env)) (cddr e)))]
            [(memq h float-unary) 'f32]
@@ -221,7 +222,7 @@
     (cached! m (list 'buf-offset k)
       (lambda ()
         (let ([raw (push-value m k 'u32)] [id (fresh! m)])
-          (prelude! m 194 (type-id m 'u32) id raw (const m 'u32 (if (eq? elem 'u16) 1 2)))
+          (prelude! m 194 (type-id m 'u32) id raw (const m 'u32 (if (memq elem '(u16 f16)) 1 2)))
           id))))
 
   (define (element-ptr m form env name idx)
@@ -273,6 +274,8 @@
         [(and (memq s '(i32 u32)) (memq t '(i32 u32))) (emit-op m 124 t (car v))]
         [(and (eq? s 'u16) (memq t '(u32 i32))) (let ([u (emit-op m 113 'u32 (car v))]) (if (eq? t 'u32) u (emit-op m 124 t (car u))))]
         [(and (eq? s 'u32) (eq? t 'u16)) (emit-op m 113 t (car v))]
+        [(and (eq? s 'f32) (eq? t 'f16)) (emit-op m 115 t (car v))]
+        [(and (eq? s 'f16) (eq? t 'f32)) (emit-op m 115 t (car v))]
         [(and (eq? s 'i32) (eq? t 'u16)) (emit-op m 113 t (car (emit-op m 124 'u32 (car v))))]
         [else (fail form "cannot convert ~a to ~a" s t)])))
 
@@ -305,6 +308,7 @@
                 [vals (map (lambda (a) (cx-as m a env t e)) args)])
            (when (eq? t 'bool) (fail e "~a on bool" h))
            (when (eq? t 'u16) (fail e "~a on u16: convert with (u32 ...) first" h))
+           (when (eq? t 'f16) (fail e "~a on f16: f16 is for storage and matrices only" h))
            (when (and (memq h bit-ops) (eq? t 'f32)) (fail e "~a on f32" h))
            (cond
              [(and (eq? h '-) (null? (cdr vals)))
@@ -340,7 +344,7 @@
          (let* ([p (element-ptr m e env (car args) (cadr args))] [id (fresh! m)])
            (body! m 61 (type-id m (cdr p)) id (car p))
            (cons id (cdr p)))]
-        [(memq h '(f32 i32 u32 u16))
+        [(memq h '(f32 i32 u32 u16 f16))
          (let* ([t0 (ty-of (car args) env)]
                 [v (cx m (car args) env (if (memq t0 '(ilit flit)) (if (eq? t0 'ilit) h 'f32) #f))])
            (cast m e v h))]
@@ -451,6 +455,25 @@
 
   (define (label! m id) (body! m 248 id))
 
+  ;; Cooperative matrices (VK_KHR_cooperative_matrix): 16x16, subgroup scope. Uses: a, b (f16 or f32
+  ;; inputs) and c (accumulator).
+  (define (cm-type m form use ty)
+    (unless (memq use '(a b c)) (fail form "matrix use must be a, b or c"))
+    (unless (memq ty '(f16 f32)) (fail form "matrix element type must be f16 or f32"))
+    (capability! m 6022)
+    (capability! m 5345)
+    (extension! m "SPV_KHR_vulkan_memory_model")
+    (extension! m "SPV_KHR_cooperative_matrix")
+    (intern! m (list 'cm use ty)
+      (lambda (id)
+        (global! m 4456 id (type-id m ty) (const m 'u32 3) (const m 'u32 16) (const m 'u32 16)
+                 (const m 'u32 (case use [(a) 0] [(b) 1] [else 2]))))))
+
+  (define (cm-lookup form env name)
+    (let ([b (lookup form env name)])
+      (unless (eq? (vector-ref b 0) 'cmat) (fail form "~a is not a cooperative matrix" name))
+      b))
+
   (define (local-variable m ty)
     (let ([id (fresh! m)])
       (local-var! m 59 (ptr-type m 7 (type-id m ty)) id 7)
@@ -528,6 +551,53 @@
            (label! m merge)
            env)]
         [(for) (cfor m s env) env]
+        [(cmat)
+         ;; (cmat name use type): a 16x16 cooperative matrix variable; use a | b | c, type f16 | f32
+         (let* ([name (car args)] [use (cadr args)] [ty (caddr args)]
+                [tid (cm-type m s use ty)] [ptr (fresh! m)])
+           (local-var! m 59 (ptr-type m 7 tid) ptr 7)
+           (cons (cons name (vector 'cmat ptr use ty tid)) env))]
+        [(cm-zero)
+         (let ([b (cm-lookup s env (car args))])
+           (body! m 62 (vector-ref b 1) (intern! m (list 'cm-null (vector-ref b 4)) (lambda (id) (global! m 46 (vector-ref b 4) id))))
+           env)]
+        [(cm-load cm-store)
+         ;; (cm-load M buf idx stride row|col), (cm-store M buf idx stride row|col): element idx of
+         ;; buf (a buffer or shared array) is the matrix's corner; stride in elements
+         (let* ([b (cm-lookup s env (car args))]
+                [p (element-ptr m s env (cadr args) (caddr args))]
+                [stride (cx-as m (cadddr args) env 'u32 s)]
+                [layout (case (car (cddddr args)) [(row) 0] [(col) 1] [else (fail s "layout must be row or col")])]
+                [lay (const m 'u32 layout)])
+           (cond
+             [(eq? h 'cm-load)
+              (let ([id (fresh! m)])
+                (body! m 4457 (vector-ref b 4) id (car p) lay (car stride))
+                (body! m 62 (vector-ref b 1) id))
+              env]
+             [else
+              (let ([id (fresh! m)])
+                (body! m 61 (vector-ref b 4) id (vector-ref b 1))
+                (body! m 4458 (car p) id lay (car stride)))
+              env]))]
+        [(cm-convert)
+         ;; (cm-convert dst src): element type conversion (f32 -> f16)
+         (let ([d (cm-lookup s env (car args))] [src (cm-lookup s env (cadr args))] [v (fresh! m)] [r (fresh! m)])
+           (body! m 61 (vector-ref src 4) v (vector-ref src 1))
+           (body! m 115 (vector-ref d 4) r v)
+           (body! m 62 (vector-ref d 1) r)
+           env)]
+        [(cm-muladd)
+         ;; (cm-muladd dst a b c): dst = a * b + c
+         (let* ([d (cm-lookup s env (car args))] [a (cm-lookup s env (cadr args))]
+                [bb (cm-lookup s env (caddr args))] [c (cm-lookup s env (cadddr args))]
+                [la (fresh! m)] [lb (fresh! m)] [lc (fresh! m)] [r (fresh! m)])
+           (body! m 61 (vector-ref a 4) la (vector-ref a 1))
+           (body! m 61 (vector-ref bb 4) lb (vector-ref bb 1))
+           (body! m 61 (vector-ref c 4) lc (vector-ref c 1))
+           (body! m 4459 (vector-ref d 4) r la lb lc)
+           (body! m 62 (vector-ref d 1) r)
+           env)]
         [(barrier)
          (body! m 224 (const m 'u32 2) (const m 'u32 2) (const m 'u32 #x108))
          env]
@@ -571,7 +641,7 @@
     (let* ([name (car spec)] [access (cadr spec)] [elem (caddr spec)]
            [eid (type-id m elem)]
            [rt (intern! m (list 'rtarray eid)
-                 (lambda (id) (global! m 29 id eid) (annotate! m 71 id 6 (if (eq? elem 'u16) 2 4))))]
+                 (lambda (id) (global! m 29 id eid) (annotate! m 71 id 6 (if (memq elem '(u16 f16)) 2 4))))]
            [st (intern! m (list 'bufstruct eid access)
                  (lambda (id)
                    (global! m 30 id rt)

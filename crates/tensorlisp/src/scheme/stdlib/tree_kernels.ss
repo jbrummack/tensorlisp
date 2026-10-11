@@ -7,7 +7,7 @@
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
   (export k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
-          k:matmul k:matvec k:rope k:set-rows k:argmax k:flash-attn k:flash-attn-part k:flash-attn-combine k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
+          k:matmul k:matmul-cm k:matvec k:rope k:set-rows k:argmax k:flash-attn k:flash-attn-part k:flash-attn-combine k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
   (define wg 256)
@@ -475,6 +475,84 @@
                                     (when (and (< mm m) (< nn n))
                                       (store c (+ doff (* nn d1) mm) ,(acc i j)))))
                                js))
+                        is))))))))
+
+  ;; The same product on tensor cores (cooperative matrices, f16 inputs, f32 accumulation): the
+  ;; shared tiles are f16, a workgroup is WM x WN subgroups of 32 lanes, each subgroup owns
+  ;; (BM/WM/16) x (BN/WN/16) 16x16 accumulators.  Same buffers and push words as k:matmul.  The
+  ;; accumulators go through shared memory to the destination, so edges and strides need no care.
+  (define (k:matmul-cm atype BM BN BK WM WN)
+    (let* ([nsg (* WM WN)] [nt (* 32 nsg)] [ld (+ BK 8)]
+           [fm (div BM (* WM 16))] [fn (div BN (* WN 16))]
+           [is (range 0 fm)] [js (range 0 fn)] [ks (range 0 (div BK 16))])
+      (define (acc i j) (name 'acc_ i '_ j))
+      (define (fa i) (name 'fa_ i))
+      (define (fb j) (name 'fb_ j))
+      `(kernel ,(name 'matmulcm_ atype '_ BM 'x BN 'x BK '_ WM 'x WN)
+         (offsets prefix) (workgroup ,nt)
+         (buffers (a ro ,(elem-ty atype)) (b ro f32) (c wo f32))
+         (push ,@(u32s 'm 'n 'k 'a1 'b1 'd1 'a2 'a3 'b2 'b3 'd2 'd3 'ne12 'r2 'r3))
+         (shared (as f16 ,(* BM ld)) (bs f16 ,(* BN ld)) (cs f32 ,(* 256 nsg)))
+         (let ([tid (local-id 0)]
+               [m0 (* (group-id 0) ,BM)]
+               [n0 (* (group-id 1) ,BN)]
+               [sg (/ (local-id 0) 32)]
+               [l (rem (local-id 0) 32)]
+               [z (group-id 2)])
+           (let ([i2 (rem z ne12)] [i3 (/ z ne12)] [wm (rem sg ,WM)] [wn (/ sg ,WM)])
+             (let ([aoff (+ (* (/ i2 r2) a2) (* (/ i3 r3) a3))]
+                   [boff (+ (* i2 b2) (* i3 b3))]
+                   [doff (+ (* i2 d2) (* i3 d3))])
+               ,@(apply append (map (lambda (i) (map (lambda (j) `(cmat ,(acc i j) c f32)) js)) is))
+               ,@(map (lambda (i) `(cmat ,(fa i) a f16)) is)
+               ,@(map (lambda (j) `(cmat ,(fb j) b f16)) js)
+               ,@(apply append (map (lambda (i) (map (lambda (j) `(cm-zero ,(acc i j))) js)) is))
+               (for (k0 0 k ,BK)
+                 ,@(tile-loads (* BM BK) nt
+                     (lambda (l2)
+                       `(let ([mm (/ ,l2 ,BK)] [kk (rem ,l2 ,BK)])
+                          (store as (+ (* mm ,ld) kk)
+                                 (f16 (guard (and (< (+ m0 mm) m) (< (+ k0 kk) k))
+                                             ,(a-elem atype '(+ aoff (* (+ m0 mm) a1)) '(+ k0 kk))
+                                             0.0))))))
+                 ,@(tile-loads (* BN BK) nt
+                     (lambda (l2)
+                       `(let ([nn (/ ,l2 ,BK)] [kk (rem ,l2 ,BK)])
+                          (store bs (+ (* nn ,ld) kk)
+                                 (f16 (guard (and (< (+ n0 nn) n) (< (+ k0 kk) k))
+                                             (load b (+ boff (* (+ n0 nn) b1) k0 kk))
+                                             0.0))))))
+                 (barrier)
+                 ,@(apply append
+                     (map (lambda (s)
+                            (append
+                              (map (lambda (i)
+                                     `(cm-load ,(fa i) as (+ (* (+ (* wm ,(* fm 16)) ,(* i 16)) ,ld) ,(* s 16)) ,ld row))
+                                   is)
+                              (map (lambda (j)
+                                     `(cm-load ,(fb j) bs (+ (* (+ (* wn ,(* fn 16)) ,(* j 16)) ,ld) ,(* s 16)) ,ld col))
+                                   js)
+                              (apply append
+                                (map (lambda (i)
+                                       (map (lambda (j) `(cm-muladd ,(acc i j) ,(fa i) ,(fb j) ,(acc i j))) js))
+                                     is))))
+                          ks))
+                 (barrier))
+               ,@(apply append
+                   (map (lambda (i)
+                          (apply append
+                            (map (lambda (j)
+                                   `((cm-store ,(acc i j) cs (* sg 256) 16 col)
+                                     (barrier)
+                                     ,@(map (lambda (e)
+                                              `(let ([idx (+ l ,(* e 32))])
+                                                 (let ([mm (+ m0 (* wm ,(* fm 16)) ,(* i 16) (rem idx 16))]
+                                                       [nn (+ n0 (* wn ,(* fn 16)) ,(* j 16) (/ idx 16))])
+                                                   (when (and (< mm m) (< nn n))
+                                                     (store c (+ doff (* nn d1) mm) (load cs (+ (* sg 256) idx)))))))
+                                            (range 0 8))
+                                     (barrier)))
+                                 js)))
                         is))))))))
 
   ;; ---- matrix-vector (a few columns) -----------------------------------------------------------

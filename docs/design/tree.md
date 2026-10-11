@@ -423,3 +423,42 @@ K path are still 3 launches, gate/up/gelu-mul 3 (a mat-vec pair with the gelu-mu
 
 Conclusion: with the mat-vecs at ~80% of the card's bandwidth, removing launches no longer pays on
 this driver; the next gains are in the f32 mat-vec path and in prefill (matrix products).
+
+## Tensor cores: cooperative matrices (`k:matmul-cm`)
+
+Tree has `f16` as a storage/matrix type and cooperative-matrix forms (SPIR-V target only, for now):
+
+```scheme
+(cmat acc c f32) (cmat fa a f16) (cmat fb b f16)      ; 16x16 matrices, uses a | b | c
+(cm-zero acc)
+(cm-load fa buf idx stride row|col)                   ; buf: a buffer or shared array
+(cm-muladd acc fa fb acc)                             ; acc = fa * fb + acc
+(cm-store acc buf idx stride row|col)  (cm-convert dst src)
+```
+
+They compile to `VK_KHR_cooperative_matrix` (capability CooperativeMatrixKHR, which needs the Vulkan
+memory model, so such modules declare it). The optimizer leaves kernels with `cmat` alone. The device
+enables the extension when it lists f16 x f16 + f32 16x16x16 at subgroup scope (`Caps.coopmat`;
+`TL_VULKAN_NOCOOPMAT=1` turns it off).
+
+`k:matmul-cm atype BM BN BK WM WN` has the buffers and push words of `k:matmul` (f32, f16 and q8_0
+weights, batching, edges): shared f16 tiles filled like the scalar kernel (dequantizing while
+filling), WM x WN subgroups with (BM/WM/16) x (BN/WN/16) accumulators each, results through shared
+memory to the destination. The native executor uses it for products with 16 or more columns
+(`TL_TREE_NOCM=1` keeps the exact f32 kernel, `TL_TREE_CM="bm bn bk wm wn"` forces a tile): 64x64x16
+(2x2 subgroups) when there are at least ~2.25 tiles per SM, 32x32x32 otherwise (an n = 192 product
+of TIPSv2 has only 36 64x64 tiles for 68 SMs), 64x16 under 32 columns.
+
+Measured on the RTX 3080 (GPU microseconds per launch, `tests/tree_matmul_cm.rs`):
+
+| m x n x k | scalar tiled | tensor cores |
+|---|---|---|
+| 768 x 192 x 768 | 78 | 29 (32x32x32) |
+| 3072 x 192 x 768 | 205 | 58 |
+| 768 x 192 x 3072 | 292 | 128 |
+| 768 x 1024 x 768 | 187 | 62 |
+| 3072 x 1024 x 768 | 694 | 168 (29 TFLOPS) |
+
+TIPSv2 text encoder, whole model on Tree kernels: 9.98 ms to 4.78 ms per run (ggml's shaders 5.53 ms),
+cosine to the CPU backend 0.9999998 (the inputs of the products are rounded to f16). Gemma's decode
+step is unchanged (its products have one column). The PTX target has no equivalent yet (`mma.sync`).
