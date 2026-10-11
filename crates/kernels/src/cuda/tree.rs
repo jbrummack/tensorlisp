@@ -28,6 +28,7 @@ impl Cuda {
             fp16: true,
             int_dot: true,
             coopmat: self.attribute(sys::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, 0) >= 8 && std::env::var_os("TL_TREE_NOCM").is_none(),
+            int_mma: self.attribute(sys::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, 0) >= 8 && std::env::var_os("TL_TREE_NOMMA").is_none(),
             shared_memory: self.attribute(sys::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, 48 * 1024).min(48 * 1024),
             max_groups: limits.max_groups,
             max_storage_range: u64::MAX / 2,

@@ -137,6 +137,8 @@ pub struct Caps {
     pub int_dot: bool,
     /// Cooperative matrices (f16 inputs, f32 accumulator, 16x16x16, subgroup scope).
     pub coopmat: bool,
+    /// int8 tensor cores (`mma.sync` m16n8k32 s8, PTX only): q8_0 products with many columns.
+    pub int_mma: bool,
     pub shared_memory: u32,
     pub max_groups: [u32; 3],
     /// `maxStorageBufferRange`: the largest binding.
@@ -758,6 +760,7 @@ impl Vulkan {
             fp16: has.float16,
             int_dot: has.int_dot,
             coopmat: has.coopmat,
+            int_mma: false,
             shared_memory: l.max_compute_shared_memory_size,
             max_groups: l.max_compute_work_group_count,
             max_storage_range: l.max_storage_buffer_range as u64,

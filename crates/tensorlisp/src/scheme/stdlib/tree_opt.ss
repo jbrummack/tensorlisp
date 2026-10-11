@@ -520,6 +520,6 @@
       [(k passes) (if (has-cmat? k) k (fold-left (lambda (k p) (run-pass p k)) k passes))]))
 
   (define (has-cmat? x)
-    (cond [(pair? x) (or (eq? (car x) 'cmat) (has-cmat? (car x)) (has-cmat? (cdr x)))]
+    (cond [(pair? x) (or (eq? (car x) 'cmat) (eq? (car x) 'mma-s8) (has-cmat? (car x)) (has-cmat? (cdr x)))]
           [else #f]))
 )

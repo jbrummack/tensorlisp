@@ -7,7 +7,7 @@
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
   (export k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
-          k:matmul k:matmul-cm k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
+          k:matmul k:matmul-cm k:matmul-q8mma k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
   (define wg 256)
@@ -552,6 +552,95 @@
                                                      (store c (+ doff (* nn d1) mm) (load cs (+ (* sg 256) idx)))))))
                                             (range 0 8))
                                      (barrier)))
+                                 js)))
+                        is))))))))
+
+  ;; q8_0 weights x int8 activations (k:quantize-q8) on the int8 tensor cores (PTX only: mma.sync m16n8k32).
+  ;; One k step is one q8_0 block: the integer product of a 32-wide weight block and activation block is
+  ;; scaled by their two scales and added to an f32 accumulator, so the result is the dp4a mat-vec's.
+  ;; A tile of BM rows x BN columns per workgroup, WM x WN warps each owning (BM/WM) x (BN/WN) of it.
+  ;; push: m n k a1 xq1 xd1 d1   (a1: q8_0 blocks per weight row, xq1: u32 words between activation columns,
+  ;; xd1: scales between columns, d1: output stride between columns; k % 32 == 0)
+  (define (k:matmul-q8mma BM BN WM WN)
+    (let* ([nsg (* WM WN)] [nt (* 32 nsg)]
+           [fm (div BM (* WM 16))] [fn (div BN (* WN 8))]
+           [is (range 0 fm)] [js (range 0 fn)] [es '(0 1 2 3)])
+      (define (acc i j e) (name 'acc_ i '_ j '_ e))
+      (define (ar i q) (name 'ar_ i '_ q))
+      (define (br j q) (name 'br_ j '_ q))
+      (define (row i) `(+ (* wm ,(* fm 16)) ,(* i 16) g))
+      (define (col j) `(+ (* wn ,(* fn 8)) ,(* j 8)))
+      (unless (and (= (mod (* BM 8) nt) 0) (= (mod (* BN 8) nt) 0) (= (* fm WM 16) BM) (= (* fn WN 8) BN))
+        (error 'k:matmul-q8mma "tile does not divide the workgroup" BM BN WM WN))
+      `(kernel ,(name 'matmul_q8mma_ BM 'x BN '_ WM 'x WN)
+         (offsets prefix) (workgroup ,nt)
+         (buffers (a ro u16) (xq ro u32) (xd ro f32) (c wo f32))
+         (push ,@(u32s 'm 'n 'k 'a1 'xq1 'xd1 'd1))
+         (shared (as u32 ,(* BM 12)) (bs u32 ,(* BN 12)) (asc f32 ,BM) (bsc f32 ,BN))
+         (let ([tid (local-id 0)] [m0 (* (group-id 0) ,BM)] [n0 (* (group-id 1) ,BN)])
+           (let ([sg (/ tid 32)] [l (rem tid 32)] [nkb (/ k 32)])
+             (let ([wm (rem sg ,WM)] [wn (/ sg ,WM)] [g (/ l 4)] [t (rem l 4)])
+               ,@(apply append (map (lambda (i) (apply append (map (lambda (j) (map (lambda (e) `(var ,(acc i j e) f32 0.0)) es)) js))) is))
+               ,@(map (lambda (e) `(var ,(name 'ia e) i32 0)) es)
+               (for (kb 0 nkb)
+                 ;; the weight tile: eight words per row (the 32 int8 of the block, 2-byte aligned in the file)
+                 ,@(map (lambda (e)
+                          `(let ([idx (+ tid ,(* e nt))])
+                             (let ([mm (/ idx 8)] [w (rem idx 8)])
+                               (let ([base (* (+ (* (+ m0 mm) a1) kb) 17)] [ok (< (+ m0 mm) m)])
+                                 (store as (+ (* mm 12) w)
+                                        (guard ok (bit-or (u32 (load a (+ base 1 (* w 2)))) (shl (u32 (load a (+ base 2 (* w 2)))) 16)) 0))
+                                 (when (= w 0) (store asc mm (guard ok (half->f32 (load a base)) 0.0)))))))
+                        (range 0 (div (* BM 8) nt)))
+                 ,@(map (lambda (e)
+                          `(let ([idx (+ tid ,(* e nt))])
+                             (let ([nn (/ idx 8)] [w (rem idx 8)])
+                               (let ([ok (< (+ n0 nn) n)])
+                                 (store bs (+ (* nn 12) w) (guard ok (load xq (+ (* (+ n0 nn) xq1) (* kb 8) w)) 0))
+                                 (when (= w 0) (store bsc nn (guard ok (load xd (+ (* (+ n0 nn) xd1) kb)) 0.0)))))))
+                        (range 0 (div (* BN 8) nt)))
+                 (barrier)
+                 ,@(apply append
+                     (map (lambda (i)
+                            `((var ,(ar i 0) u32 (load as (+ (* ,(row i) 12) t)))
+                              (var ,(ar i 1) u32 (load as (+ (* (+ ,(row i) 8) 12) t)))
+                              (var ,(ar i 2) u32 (load as (+ (* ,(row i) 12) 4 t)))
+                              (var ,(ar i 3) u32 (load as (+ (* (+ ,(row i) 8) 12) 4 t)))
+                              (var ,(name 'wl_ i) f32 (load asc ,(row i)))
+                              (var ,(name 'wh_ i) f32 (load asc (+ ,(row i) 8)))))
+                          is))
+                 ,@(apply append
+                     (map (lambda (j)
+                            `((var ,(br j 0) u32 (load bs (+ (* (+ ,(col j) g) 12) t)))
+                              (var ,(br j 1) u32 (load bs (+ (* (+ ,(col j) g) 12) 4 t)))
+                              (var ,(name 'xs_ j '_ 0) f32 (load bsc (+ ,(col j) (* t 2))))
+                              (var ,(name 'xs_ j '_ 1) f32 (load bsc (+ ,(col j) (* t 2) 1)))))
+                          js))
+                 ,@(apply append
+                     (map (lambda (i)
+                            (apply append
+                              (map (lambda (j)
+                                     `(,@(map (lambda (e) `(set! ,(name 'ia e) 0)) es)
+                                       (mma-s8 ,(map (lambda (e) (name 'ia e)) es)
+                                               ,(map (lambda (q) (ar i q)) '(0 1 2 3))
+                                               ,(list (br j 0) (br j 1)))
+                                       (set! ,(acc i j 0) (fma (f32 ia0) (* ,(name 'wl_ i) ,(name 'xs_ j '_ 0)) ,(acc i j 0)))
+                                       (set! ,(acc i j 1) (fma (f32 ia1) (* ,(name 'wl_ i) ,(name 'xs_ j '_ 1)) ,(acc i j 1)))
+                                       (set! ,(acc i j 2) (fma (f32 ia2) (* ,(name 'wh_ i) ,(name 'xs_ j '_ 0)) ,(acc i j 2)))
+                                       (set! ,(acc i j 3) (fma (f32 ia3) (* ,(name 'wh_ i) ,(name 'xs_ j '_ 1)) ,(acc i j 3)))))
+                                   js)))
+                          is))
+                 (barrier))
+               ,@(apply append
+                   (map (lambda (i)
+                          (apply append
+                            (map (lambda (j)
+                                   (map (lambda (e)
+                                          `(let ([mm (+ m0 ,(row i) ,(if (>= e 2) 8 0))]
+                                                 [nn (+ n0 ,(col j) (* t 2) ,(mod e 2))])
+                                             (when (and (< mm m) (< nn n))
+                                               (store c (+ (* nn d1) mm) ,(acc i j e)))))
+                                        es))
                                  js)))
                         is))))))))
 

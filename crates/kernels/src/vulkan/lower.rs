@@ -455,6 +455,9 @@ pub fn scratch_bytes(graph: &Graph, id: TensorId, caps: &Caps, tree: bool) -> u6
             let k = t.src(0).map_or(0, |w| graph.tensors[w].ne[0]) as u64;
             return if graph.q8_out.contains(&x) || graph.q8_side.contains_key(&x) { 0 } else { align(k) + k / 8 };
         }
+        if let Some(p) = tree_ops::q8_mma_plan(graph, caps, id) {
+            return align(p.xq_bytes) + p.xd_bytes;
+        }
         if let Some(p) = tree_ops::q8_dot_plan(graph, caps, id) {
             let quantized = graph.tensors[id].src(1).is_some_and(|b| graph.q8_out.contains(&graph.root(b).0) || graph.q8_side.contains_key(&graph.root(b).0));
             return if quantized { 0 } else { align(p.xq_bytes) + p.xd_bytes };

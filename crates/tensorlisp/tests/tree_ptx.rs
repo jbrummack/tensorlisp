@@ -664,3 +664,148 @@ fn tensor_core_matmul_as_ptx() {
         println!("matmul {m}x{n}x{kk}: {}", cells.join(" | "));
     }
 }
+
+/// The q8_0 weight x f32 activation product of prefill (`k:matmul-cm`: the tile is dequantized to f16 in shared
+/// memory, `mma.sync`), at Gemma 4 E2B's shapes, against a CPU reference on the first rows; timed with
+/// `TL_BENCH=1`. `TL_CM_CFGS="64 64 16 2 2;..."` overrides the tiles.
+#[test]
+fn q8_matmul_cm_throughput() {
+    let scheme = Scheme::new().unwrap();
+    for lib in [SPIRV_LIB, TREE_LIB, KERNELS_LIB, PTX_LIB] {
+        scheme.eval(lib).unwrap();
+    }
+    scheme.eval("(define-top-level-value '$env (environment '(rnrs) '(tl tree) '(tl tree kernels) '(tl tree ptx)))").unwrap();
+    let cuda = match Cuda::system_default() {
+        Ok(c) => c,
+        Err(tensorlisp_kernels::Error::NoDevice) if std::env::var_os("TL_ALLOW_NO_GPU").is_some() => return,
+        Err(e) => panic!("{e}"),
+    };
+    let e = Engine::new(Arc::new(cuda));
+    let bench = std::env::var_os("TL_BENCH").is_some();
+    let cfgs: Vec<String> = match std::env::var("TL_CM_CFGS") {
+        Ok(v) => v.split(';').map(str::to_string).collect(),
+        Err(_) => ["64 64 16 2 2", "64 64 32 2 2", "128 64 32 4 2", "128 128 32 4 2"].map(str::to_string).to_vec(),
+    };
+    let shapes: &[(usize, usize, usize)] = if bench { &[(12288, 406, 1536), (6144, 406, 1536), (1536, 406, 6144), (2048, 406, 1536)] } else { &[(512, 100, 256)] };
+    for &(m, n, k) in shapes {
+        let (wbytes, wvals) = q8_0_matrix(m, k, 1);
+        let b = noise(n * k, 2);
+        let rows = 64.min(m);
+        let want = cpu_matmul(&wvals[..rows * k], &b, rows, n, k);
+        for cfg in &cfgs {
+            let p: Vec<usize> = cfg.split(' ').map(|x| x.parse().unwrap()).collect();
+            let blob = {
+                let expr = format!("(k:matmul-cm 'q8_0 {cfg})");
+                let reply = scheme.eval(&format!("(eval '(compile-kernel-ptx {expr}) $env)")).unwrap_or_else(|err| panic!("{expr}: {err}"));
+                blob_from_reply(&expr, reply)
+            };
+            let (la, lb, lc) = (wbytes.len(), 4 * n * k, 4 * m * n);
+            let (ob, oc) = (align(la), align(la) + align(lb));
+            let push = [m as u32, n as u32, k as u32, (k / 32) as u32, k as u32, m as u32, 0, 0, 0, 0, 0, 0, 1, 1, 1];
+            let grid = [m.div_ceil(p[0]) as u32, n.div_ceil(p[1]) as u32, 1];
+            let l = launch(&blob, vec![step(0, la), step(ob, lb), step(oc, lc)], &push, grid);
+            let inputs = [(0u64, wbytes.clone()), (ob, bytes(&b))];
+            let step_bytes = oc + align(lc);
+            let got = run_one(&e, l.clone(), &inputs, step_bytes, (oc, lc));
+            // output is [n][m]: compare the first `rows` rows of every column
+            let mut g = Vec::new();
+            for col in 0..n {
+                g.extend_from_slice(&got[col * m..col * m + rows]);
+            }
+            let mut w = Vec::new();
+            for col in 0..n {
+                w.extend_from_slice(&want[col * rows..(col + 1) * rows]);
+            }
+            close(&format!("q8 cm {cfg} {m}x{n}x{k}"), &g, &w, 5e-3);
+            if bench {
+                let ms = time_launch(&e, &l, &inputs, step_bytes, 50);
+                println!("q8 cm {cfg} {m}x{n}x{k}: {ms:.3} ms {:.1} TFLOP/s", 2.0 * (m * n * k) as f64 / ms / 1e9);
+            }
+        }
+    }
+}
+
+fn words_of(w: &[u32]) -> Vec<u8> {
+    w.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// `k:matmul-q8mma`: q8_0 weights x int8-quantized activations on the int8 tensor cores (`mma.sync`
+/// m16n8k32), against an exact reference (integer dot per block, scaled in f64); timed with `TL_BENCH=1`
+/// next to the f16 tensor-core kernel. `TL_Q8MMA_CFGS="64 64 2 2;..."` overrides the tiles (BM BN WM WN).
+#[test]
+fn q8_matmul_on_int8_tensor_cores() {
+    let scheme = Scheme::new().unwrap();
+    for lib in [SPIRV_LIB, TREE_LIB, KERNELS_LIB, PTX_LIB] {
+        scheme.eval(lib).unwrap();
+    }
+    scheme.eval("(define-top-level-value '$env (environment '(rnrs) '(tl tree) '(tl tree kernels) '(tl tree ptx)))").unwrap();
+    let cuda = match Cuda::system_default() {
+        Ok(c) => c,
+        Err(tensorlisp_kernels::Error::NoDevice) if std::env::var_os("TL_ALLOW_NO_GPU").is_some() => return,
+        Err(e) => panic!("{e}"),
+    };
+    let e = Engine::new(Arc::new(cuda));
+    let bench = std::env::var_os("TL_BENCH").is_some();
+    let cfgs: Vec<String> = match std::env::var("TL_Q8MMA_CFGS") {
+        Ok(v) => v.split(';').map(str::to_string).collect(),
+        Err(_) => ["64 64 2 2", "128 64 4 2", "64 128 2 2", "128 128 4 2"].map(str::to_string).to_vec(),
+    };
+    let shapes: &[(usize, usize, usize)] = if bench {
+        &[(12288, 406, 1536), (6144, 406, 1536), (1536, 406, 6144), (2048, 406, 1536)]
+    } else {
+        &[(70, 37, 96), (256, 100, 256), (130, 5, 64)]
+    };
+    for &(m, n, k) in shapes {
+        let (wbytes, _) = q8_0_matrix(m, k, 1);
+        let x = noise(n * k, 2);
+        let (mut xq, mut xd) = (Vec::new(), Vec::new());
+        for col in 0..n {
+            let (q, d) = quantize_q8(&x[col * k..(col + 1) * k]);
+            xq.extend(q);
+            xd.extend(d);
+        }
+        // exact reference on the first rows
+        let rows = 64.min(m);
+        let mut want = vec![0f32; rows * n];
+        for col in 0..n {
+            for r in 0..rows {
+                let mut s = 0f64;
+                for b in 0..k / 32 {
+                    let blk = &wbytes[(r * (k / 32) + b) * 34..][..34];
+                    let ws = f16_value(u16::from_le_bytes([blk[0], blk[1]])) as f64;
+                    let mut dot = 0i64;
+                    for i in 0..32 {
+                        let q = (xq[col * k / 4 + b * 8 + i / 4] >> (8 * (i % 4))) as u8 as i8;
+                        dot += blk[2 + i] as i8 as i64 * q as i64;
+                    }
+                    s += ws * xd[col * (k / 32) + b] as f64 * dot as f64;
+                }
+                want[col * rows + r] = s as f32;
+            }
+        }
+        for cfg in &cfgs {
+            let p: Vec<usize> = cfg.split(' ').map(|x| x.parse().unwrap()).collect();
+            let expr = format!("(k:matmul-q8mma {cfg})");
+            let reply = scheme.eval(&format!("(eval '(compile-kernel-ptx {expr}) $env)")).unwrap_or_else(|err| panic!("{expr}: {err}"));
+            let blob = blob_from_reply(&expr, reply);
+            let (la, lq, ld, lc) = (wbytes.len(), 4 * xq.len(), 4 * xd.len(), 4 * m * n);
+            let (oq, od) = (align(la), align(la) + align(lq));
+            let oc = od + align(ld);
+            let push = [m as u32, n as u32, k as u32, (k / 32) as u32, (k / 4) as u32, (k / 32) as u32, m as u32];
+            let grid = [m.div_ceil(p[0]) as u32, n.div_ceil(p[1]) as u32, 1];
+            let l = launch(&blob, vec![step(0, la), step(oq, lq), step(od, ld), step(oc, lc)], &push, grid);
+            let inputs = [(0u64, wbytes.clone()), (oq, words_of(&xq)), (od, bytes(&xd))];
+            let step_bytes = oc + align(lc);
+            let got = run_one(&e, l.clone(), &inputs, step_bytes, (oc, lc));
+            let mut g = Vec::new();
+            for col in 0..n {
+                g.extend_from_slice(&got[col * m..col * m + rows]);
+            }
+            close(&format!("q8 mma {cfg} {m}x{n}x{k}"), &g, &want, 1e-4);
+            if bench {
+                let ms = time_launch(&e, &l, &inputs, step_bytes, 50);
+                println!("q8 mma {cfg} {m}x{n}x{k}: {ms:.3} ms {:.1} TOP/s", 2.0 * (m * n * k) as f64 / ms / 1e9);
+            }
+        }
+    }
+}

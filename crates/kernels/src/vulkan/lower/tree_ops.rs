@@ -33,6 +33,19 @@ pub(super) struct DotPlan {
 }
 
 pub(super) fn q8_dot_plan(graph: &Graph, caps: &Caps, id: TensorId) -> Option<DotPlan> {
+    q8_plan(graph, caps, id, false)
+}
+
+/// The same product with more columns than the dp4a mat-vec takes, on the int8 tensor cores (PTX): the
+/// activations are quantized into scratch first, then `k:matmul-q8mma`.
+pub(super) fn q8_mma_plan(graph: &Graph, caps: &Caps, id: TensorId) -> Option<DotPlan> {
+    q8_plan(graph, caps, id, true)
+}
+
+fn q8_plan(graph: &Graph, caps: &Caps, id: TensorId, mma: bool) -> Option<DotPlan> {
+    if mma && !caps.int_mma {
+        return None;
+    }
     // Quantizing the activations to int8 changes results by ~0.5% (what ggml's CPU and CUDA backends
     // do too); TL_TREE_DOT=0 keeps the f32 path.
     if !caps.int_dot || std::env::var("TL_TREE_DOT").is_ok_and(|v| v == "0") || caps.subgroup_size == 0 || 128 % caps.subgroup_size != 0 {
@@ -56,7 +69,7 @@ pub(super) fn q8_dot_plan(graph: &Graph, caps: &Caps, id: TensorId) -> Option<Do
     // TL_TREE_DOT_MAXN: the most columns the dp4a mat-vec takes (default 64; it holds a
     // sum per column per lane and beats dequantizing q8_0 inside the tensor-core matmul up to there).
     let maxn: i64 = std::env::var("TL_TREE_DOT_MAXN").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
-    if !(1..=maxn).contains(&n) {
+    if mma != (n > maxn) || n < 1 {
         return None;
     }
     let words = n as u64 * k as u64 / 4;
@@ -149,6 +162,41 @@ impl<'a> Ctx<'a> {
         let grid = [ceil_div(m, (128 / sg) * rows), 1, 1];
         let d = self.launch(dot, vec![ta.range, xq, xd, td.range], words(&push), grid)?;
         Ok(Some(quant.into_iter().chain([d]).collect()))
+    }
+
+    /// A q8_0 product with many columns: quantize the activations to int8 into scratch, then the int8
+    /// tensor-core matmul (`k:matmul-q8mma`, one q8_0 block per k step).
+    fn tree_q8_mma(&self, tree: &TreeKernels, id: TensorId, plan: DotPlan) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let (a, b) = (self.src(t, 0)?, self.src(t, 1)?);
+        let (ta, tb, td) = (self.tn(a), self.tn(b), self.tn(id));
+        let (m, k, n) = (ta.ne[1], ta.ne[0], plan.n);
+        let off = self.layout.scratch[self.pos[&id]].ok_or_else(|| Error::Invalid("q8 matmul scratch was not planned".into()))?;
+        let xq = Range::new(Space::Step, self.arena_base + off, plan.xq_bytes);
+        let xd = Range::new(Space::Step, self.arena_base + off + align(plan.xq_bytes), plan.xd_bytes);
+        let groups = n * k / 4;
+        let quant = self.launch(tree.blob("(k:quantize-q8)")?, vec![tb.range, xq, xd], words(&[groups, k, tb.nb[1]]), self.tree_grid(ceil_div(groups, WG)))?;
+        // 128x128 tiles when there are enough of them to fill the GPU twice over, else smaller ones.
+        let tiles = |bm: u32, bn: u32| ceil_div(m, bm) * ceil_div(n, bn);
+        let want = 2 * self.caps.shader_cores;
+        let (bm, bn, wm, wn) = if std::env::var("TL_TREE_MMA_TILE").is_ok() {
+            let p: Vec<u32> = std::env::var("TL_TREE_MMA_TILE").unwrap().split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            (p[0], p[1], p[2], p[3])
+        } else if tiles(128, 128) >= want {
+            (128, 128, 4, 2)
+        } else if tiles(128, 64) >= want {
+            (128, 64, 4, 2)
+        } else {
+            (64, 64, 2, 2)
+        };
+        let push = [m, n, k, ta.nb[1], k / 4, k / 32, td.nb[1]];
+        let mm = self.launch(
+            tree.blob(&format!("(k:matmul-q8mma {bm} {bn} {wm} {wn})"))?,
+            vec![ta.range, xq, xd, td.range],
+            words(&push),
+            [ceil_div(m, bm), ceil_div(n, bn), 1],
+        )?;
+        Ok(Some(vec![quant, mm]))
     }
 
     pub(super) fn lower_tree(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
@@ -541,6 +589,9 @@ impl<'a> Ctx<'a> {
         let (ta, tb, td) = (self.tn(a), self.tn(b), self.tn(id));
         if let Some(plan) = q8_dot_plan(self.graph, &self.caps, id) {
             return self.tree_q8_dot(tree, id, plan);
+        }
+        if let Some(plan) = q8_mma_plan(self.graph, &self.caps, id) {
+            return self.tree_q8_mma(tree, id, plan);
         }
         let Some(atype) = weight_name(ta.ty) else { return Ok(None) };
         if tb.ty != Ty::F32 || td.ty != Ty::F32 || ta.nb[0] != 1 || tb.nb[0] != 1 || td.nb[0] != 1 || ta.ne[0] != tb.ne[0] {

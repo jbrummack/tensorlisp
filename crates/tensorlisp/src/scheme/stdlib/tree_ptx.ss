@@ -603,6 +603,19 @@
                        (join (part d) ", ") (join a ", ") (list-ref b (* 2 h)) (list-ref b (+ (* 2 h) 1)) (join (part c) ", "))))
              '(0 1))
            env)]
+        [(mma-s8)
+         ;; (mma-s8 (d0 d1 d2 d3) (a0 a1 a2 a3) (b0 b1)): d += a * b for one m16n8k32 int8 product, PTX only.
+         ;; The d vars (i32) are the accumulators; a and b are the lane's u32 fragment words (four int8 each):
+         ;; a0 (row g, k 4t..), a1 (row g + 8, k 4t..), a2 (row g, k 16 + 4t..), a3 (row g + 8, k 16 + 4t..),
+         ;; b0 (k 4t.., col g), b1 (k 16 + 4t.., col g); d0 (row g, col 2t), d1 (g, 2t + 1), d2 (g + 8, 2t),
+         ;; d3 (g + 8, 2t + 1), with g = lane / 4 and t = lane % 4.
+         (let* ([regs (lambda (names) (map (lambda (n) (vector-ref (lookup s env n) 1)) names))]
+                [d (regs (car args))] [a (regs (cadr args))] [b (regs (caddr args))])
+           (unless (and (= (length d) 4) (= (length a) 4) (= (length b) 2)) (fail s "mma-s8 takes 4 accumulators, 4 a words and 2 b words"))
+           (hashtable-set! (ps-memo st) 'mma #t)
+           (ins! st "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {~a}, {~a}, {~a}, {~a};"
+                 (join d ", ") (join a ", ") (join b ", ") (join d ", "))
+           env)]
         [else (fail s "unknown statement ~a" h)])))
 
   ;; Loops whose bounds are literal integers and that run few times are unrolled here, the
