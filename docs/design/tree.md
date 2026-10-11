@@ -288,6 +288,24 @@ bandwidth). The dp4a mat-vec is generic in the column count and now takes up to 
 is compute-bound and the tensor cores stay. `native.rs::paged_attention_matches_dense` checks the paged kernels against dense
 attention on the same K/V (hs 64..512, grouped heads, shuffled blocks, unequal lengths): 2.5e-4 on PTX, 7e-4 on Vulkan.
 
+PTX tuning that followed (Gemma 4 E2B q8_0, RTX 3080 at a 300 W cap; `TL_CUDA_PROFILE=1` prints a per-kernel table
+when the backend drops, `TL_CUDA_GRAPHS=0` and `TL_TREE_NOMMA=1` switch the first and last item off):
+
+* **CUDA graphs.** `cuda::backend` captures a submission that equals the previous one (same kernels, buffers, push
+  words, grids) into a graph and replays it with one `cuGraphLaunch`; single-sequence decode 7.2 -> 5.7 ms.
+* **Two-pass argmax** for rows of 16384 or more (`k:argmax-part` / `k:argmax-final`): the logits argmax took 300 us on one
+  workgroup. Ties still resolve to the first maximum (ggml's CPU backend picks the last).
+* **dp4a mat-vec rows by column count**: 1 row per subgroup up to 4 columns, 4 up to 16, 2 above. 64 sequences 66 -> 41 ms.
+* **Int8 tensor cores for prefill** (`mma-s8` statement, `k:matmul-q8mma`, `Caps::int_mma`): a q8_0 product with more than 64
+  columns quantizes the activations to int8 (scratch) and runs `mma.sync.m16n8k32.s8`; one q8_0 block is one k step, scaled
+  per block into an f32 accumulator. 12288x406x1536: 0.65 ms against 1.59 ms for the f16 tile matmul (21 against 10 T-ops/s);
+  the long-prompt sweep's GPU time went from 72.5 s to 46 s. Ablation of the kernel: without global loads it runs at ~70
+  T-ops/s, without the mma the loads alone cost half the time, so the remaining cost is staging the 34-byte q8_0 blocks (two
+  16-bit loads per word). Next step there: 16-byte loads of raw row chunks (8 blocks, k % 256 == 0) with the realignment done
+  at fragment load. ncu is installed but the driver denies counter access (ERR_NVGPUCTRPERM) without admin rights.
+* Single-sequence decode is now 5.2 ms a step (190 tokens/s, 36 on the NVRTC executor). Left in the profile: ~270 launches
+  of the mat-vec at ~60% of the weights' bandwidth bound, prefill flash attention (~20% of a long-prompt run).
+
 Bug found on the way: the PTX `exp` returned NaN for -inf (its error-correction term is inf - inf), which only shows with masked
 keys *inside* a valid range (masked suffixes are never evaluated); fixed, regression test `attention_with_large_head_sizes`.
 
