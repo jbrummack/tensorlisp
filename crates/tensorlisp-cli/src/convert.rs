@@ -1,30 +1,33 @@
-use std::{
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use half::{bf16, f16};
-use memmap2::Mmap;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
 use serde_json::json;
 use tensorlisp::{DType, gguf::GgufFile, gguf::GgufWriter};
 
+use crate::source::{self, Source, TensorEntry};
 use crate::common::{glob_match, human_bytes, print_json, read_assets, read_program, shape_string, split_assignment};
 
 #[derive(Args)]
 pub struct ConvertArgs {
-    /// .safetensors files, or directories containing them.
+    /// .safetensors files, directories containing them, https:// URLs, or
+    /// `hf:ORG/REPO[@REV]` (all of a Hugging Face repo's .safetensors; uses
+    /// HF_TOKEN). URLs are streamed with Range requests: each tensor is
+    /// downloaded, converted and written in turn, so the source is never on disk.
     #[arg(required = true)]
-    pub inputs: Vec<PathBuf>,
+    pub inputs: Vec<String>,
     #[arg(short, long)]
     pub output: PathBuf,
     /// Program to store in the file (it can also be added later with `tl pack`).
     #[arg(long)]
     pub program: Option<PathBuf>,
-    /// Type of float tensors: keep, f32, f16 or bf16. With f16/bf16, 1-D
-    /// tensors (biases, norms) stay f32. f64 becomes f32 with `keep`.
+    /// Type of float tensors: keep, f32, f16, bf16 or a quantized type (q8_0,
+    /// q4_0, q4_K, q6_K, ...). With anything but f32, 1-D tensors (biases,
+    /// norms) stay f32. A quantized type applies to 2-D+ tensors with at least
+    /// --min-elements values whose rows fit its blocks; other matrices become
+    /// f16. f64 becomes f32 with `keep`.
     #[arg(long, default_value = "keep")]
     pub dtype: String,
     /// Remove this prefix from tensor names (repeatable; the first match is removed).
@@ -42,6 +45,13 @@ pub struct ConvertArgs {
     /// RMSNorm scales by (1 + w): `--offset '*norm.weight=1'` stores 1 + w.
     #[arg(long)]
     pub offset: Vec<String>,
+    /// With a quantized --dtype, store tensors whose (original) name matches
+    /// this glob as f16 instead, e.g. '*embed*' or 'lm_head*' (repeatable).
+    #[arg(long)]
+    pub no_quant: Vec<String>,
+    /// With a quantized --dtype, matrices with fewer values stay f16.
+    #[arg(long, default_value_t = 1024)]
+    pub min_elements: usize,
     /// Only convert tensors whose (original) name matches this glob (repeatable).
     #[arg(long)]
     pub include: Vec<String>,
@@ -69,27 +79,6 @@ pub struct PackArgs {
     /// Embed a file the program reads with (asset NAME), NAME=PATH (repeatable).
     #[arg(long = "asset")]
     pub assets: Vec<String>,
-}
-
-fn safetensors_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for input in inputs {
-        if input.is_dir() {
-            let mut found: Vec<_> = std::fs::read_dir(input)?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
-                .collect();
-            found.sort();
-            if found.is_empty() {
-                bail!("no .safetensors files in {}", input.display());
-            }
-            files.extend(found);
-        } else {
-            files.push(input.clone());
-        }
-    }
-    Ok(files)
 }
 
 fn to_f32(dtype: Dtype, bytes: &[u8]) -> Vec<f32> {
@@ -128,14 +117,19 @@ fn int_to_i32(dtype: Dtype, bytes: &[u8]) -> Result<Vec<u8>> {
 enum Target {
     Keep,
     Float(DType),
+    Quant(DType),
 }
 
-/// The stored type for a safetensors dtype, or None if unsupported.
-fn stored_type(dtype: Dtype, ndim: usize, target: &Target) -> Option<DType> {
+/// The stored type for a safetensors dtype, or None if unsupported. `quant_ok`
+/// says whether this tensor may take a quantized target.
+fn stored_type(dtype: Dtype, ndim: usize, target: &Target, quant_ok: bool) -> Option<DType> {
     let float = |native: DType| match target {
         Target::Keep => Some(native),
         Target::Float(t) if ndim <= 1 && *t != DType::F32 => Some(DType::F32),
         Target::Float(t) => Some(*t),
+        Target::Quant(_) if ndim <= 1 => Some(DType::F32),
+        Target::Quant(q) if quant_ok => Some(*q),
+        Target::Quant(_) => Some(DType::F16),
     };
     match dtype {
         Dtype::F32 | Dtype::F64 => float(DType::F32),
@@ -148,18 +142,62 @@ fn stored_type(dtype: Dtype, ndim: usize, target: &Target) -> Option<DType> {
     }
 }
 
-fn convert_bytes(dtype: Dtype, stored: DType, bytes: &[u8]) -> Result<Vec<u8>> {
+fn elem_size(dtype: Dtype) -> Option<usize> {
+    Some(match dtype {
+        Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+        Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
+        Dtype::F16 | Dtype::BF16 | Dtype::I16 | Dtype::U16 => 2,
+        Dtype::I8 | Dtype::U8 | Dtype::BOOL => 1,
+        _ => return None,
+    })
+}
+
+/// Converts whole rows of `row_elems` values (a quantized type needs them whole).
+fn convert_rows(dtype: Dtype, stored: DType, row_elems: usize, offset: Option<f32>, bytes: &[u8]) -> Result<Vec<u8>> {
     let native = matches!(
         (dtype, stored.name()),
         (Dtype::F32, "f32") | (Dtype::F16, "f16") | (Dtype::BF16, "bf16") | (Dtype::I8, "i8") | (Dtype::I16, "i16") | (Dtype::I32, "i32")
     );
-    if native {
+    if native && offset.is_none() {
         return Ok(bytes.to_vec());
     }
     match dtype {
-        Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64 => Ok(encode(stored, &to_f32(dtype, bytes))),
+        Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64 => {
+            let mut values = to_f32(dtype, bytes);
+            if let Some(offset) = offset {
+                values.iter_mut().for_each(|v| *v += offset);
+            }
+            if stored.is_quantized() { Ok(stored.from_f32(&values, row_elems)?) } else { Ok(encode(stored, &values)) }
+        }
         _ => int_to_i32(dtype, bytes),
     }
+}
+
+/// Reads one tensor from `source` and converts it, a few rows at a time, so the
+/// working set stays near `CHUNK` bytes beyond the output however big the tensor is.
+fn convert_tensor(source: &Source, t: &TensorEntry, stored: DType, offset: Option<f32>) -> Result<Vec<u8>> {
+    const CHUNK: usize = 128 << 20;
+    let size = elem_size(t.dtype).context("unsupported dtype")?;
+    let row_elems = t.shape.last().copied().unwrap_or(1).max(1);
+    let elems: usize = t.shape.iter().product();
+    if (t.end - t.start) as usize != elems * size {
+        bail!("{} bytes of data for {} values of {:?}", t.end - t.start, elems, t.dtype);
+    }
+    let rows = elems / row_elems;
+    let rows_per_chunk = (CHUNK / (row_elems * size)).max(1);
+    let mut out = Vec::with_capacity(stored.row_size(row_elems) * rows);
+    let mut row = 0;
+    while row < rows {
+        let n = rows_per_chunk.min(rows - row);
+        let (start, end) = (t.start + (row * row_elems * size) as u64, t.start + ((row + n) * row_elems * size) as u64);
+        out.extend(convert_rows(t.dtype, stored, row_elems, offset, &source.read(start, end)?)?);
+        row += n;
+    }
+    Ok(out)
+}
+
+fn source_is_remote(source: &Source) -> bool {
+    matches!(source, Source::Remote { .. })
 }
 
 fn rename(name: &str, args: &ConvertArgs, renames: &[(&str, &str)], prefixes: &[(&str, &str)]) -> String {
@@ -177,7 +215,10 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
         "f32" => Target::Float(DType::F32),
         "f16" => Target::Float(DType::F16),
         "bf16" => Target::Float(DType::BF16),
-        other => bail!("unknown --dtype {other:?} (expected keep, f32, f16 or bf16)"),
+        other => match DType::parse(other) {
+            Ok(q) if q.is_quantized() && q.can_quantize_to() => Target::Quant(q),
+            _ => bail!("unknown --dtype {other:?} (expected keep, f32, f16, bf16 or a quantized type such as q8_0, q4_0, q4_K)"),
+        },
     };
     let renames: Vec<_> = args.rename.iter().map(|r| split_assignment(r)).collect::<Result<_>>()?;
     let prefixes: Vec<_> = args.replace_prefix.iter().map(|r| split_assignment(r)).collect::<Result<_>>()?;
@@ -195,14 +236,9 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
         tensorlisp::program_entries(program, assets.clone()).context("the program is invalid")?;
     }
 
-    let files = safetensors_files(&args.inputs)?;
-    let maps: Vec<Mmap> = files
-        .iter()
-        .map(|f| {
-            let file = File::open(f).with_context(|| format!("opening {}", f.display()))?;
-            Ok(unsafe { Mmap::map(&file)? })
-        })
-        .collect::<Result<_>>()?;
+    // The sources (and, for URLs, just their headers) are read before the writer
+    // exists; tensor data is only read while the file is written.
+    let sources = source::open_all(&args.inputs)?;
 
     let mut writer = GgufWriter::new();
     if let Some(program) = &program {
@@ -218,38 +254,47 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
 
     let mut report = Vec::new();
     let mut skipped = Vec::new();
-    for (path, map) in files.iter().zip(&maps) {
-        let st = SafeTensors::deserialize(map).with_context(|| format!("reading {}", path.display()))?;
-        let mut tensors = st.tensors();
-        tensors.sort_by_key(|(_, view)| view.data().as_ptr() as usize);
-        for (name, view) in tensors {
-            let included = args.include.is_empty() || args.include.iter().any(|g| glob_match(g, &name));
-            if !included || args.exclude.iter().any(|g| glob_match(g, &name)) {
-                skipped.push(name);
+    for (_, source, entries) in &sources {
+        for t in entries {
+            let name = &t.name;
+            let included = args.include.is_empty() || args.include.iter().any(|g| glob_match(g, name));
+            if !included || args.exclude.iter().any(|g| glob_match(g, name)) {
+                skipped.push(name.clone());
                 continue;
             }
-            let dtype = view.dtype();
-            let shape = view.shape().to_vec();
-            let stored = stored_type(dtype, shape.len(), &target)
+            let (dtype, shape) = (t.dtype, t.shape.clone());
+            let is_float = matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64);
+            let quant_ok = match &target {
+                Target::Quant(q) => {
+                    is_float
+                        && shape.iter().product::<usize>() >= args.min_elements
+                        && shape.last().is_some_and(|row| row % q.block_size() == 0)
+                        && !args.no_quant.iter().any(|g| glob_match(g, name))
+                }
+                _ => false,
+            };
+            let stored = stored_type(dtype, shape.len(), &target, quant_ok)
                 .with_context(|| format!("tensor {name}: unsupported safetensors dtype {dtype:?}"))?;
-            let new_name = rename(&name, args, &renames, &prefixes);
-            let data = view.data();
-            let bytes_name = new_name.clone();
-            let offset = offsets.iter().find(|(g, _)| glob_match(g, &name)).map(|(_, v)| *v);
-            if offset.is_some() && !matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64) {
+            if elem_size(dtype).is_some_and(|size| (t.end - t.start) as usize != shape.iter().product::<usize>() * size) {
+                bail!("tensor {name}: {} bytes of data do not match shape {}", t.end - t.start, shape_string(&shape));
+            }
+            let new_name = rename(name, args, &renames, &prefixes);
+            let offset = offsets.iter().find(|(g, _)| glob_match(g, name)).map(|(_, v)| *v);
+            if offset.is_some() && !is_float {
                 bail!("--offset matches {name}, which is not a float tensor");
             }
+            let bytes_name = new_name.clone();
             writer
-                .add_tensor_with(&new_name, stored, &shape, move || match offset {
-                    Some(offset) => {
-                        let values: Vec<f32> = to_f32(dtype, data).into_iter().map(|v| v + offset).collect();
-                        Ok(encode(stored, &values))
+                .add_tensor_with(&new_name, stored, &shape, move || {
+                    let bytes = convert_tensor(source, t, stored, offset)
+                        .map_err(|e| tensorlisp::Error::Input(format!("tensor {bytes_name}: {e:#}")))?;
+                    if source_is_remote(source) {
+                        eprintln!("  {bytes_name}: {}", human_bytes(bytes.len()));
                     }
-                    None => convert_bytes(dtype, stored, data)
-                        .map_err(|e| tensorlisp::Error::Input(format!("tensor {bytes_name}: {e}"))),
+                    Ok(bytes)
                 })
                 .with_context(|| format!("tensor {name}"))?;
-            report.push((name, new_name, format!("{dtype:?}").to_lowercase(), stored, shape));
+            report.push((name.clone(), new_name, format!("{dtype:?}").to_lowercase(), stored, shape));
         }
     }
     writer.write(&args.output).with_context(|| format!("writing {}", args.output.display()))?;

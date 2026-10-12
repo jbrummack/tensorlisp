@@ -91,3 +91,46 @@ short prompts (0.8 MiB vs 11.2 MiB per sequence at 6 tokens; 7.9 MiB at 406 toke
 the block table is sized to the longest sequence). Gemma 4's KV cache is small (one KV head,
 15 layers), so attention is a minor part of a step and the paged kernel's advantage over
 dense flash attention is small here.
+
+
+## Audio (streaming)
+
+`audio.ss` ports Gemma 4's audio tower (a Universal Speech Model conformer: 2 strided 3x3 convs, 12 layers of
+FFN / chunked local attention with relative positions / light depthwise conv / FFN, an output projection and the
+embedder into the language model's space), `asr.ss` the language model's side (`fill-audio`, `step-audio`) and the
+pipelines. The tower is causal (a frame sees itself and the 11 before it; the depthwise conv has kernel 5 and looks
+back), so it runs as a stream: 12 tokens (480 ms, 48 mel frames) per call with the last 11 keys/values and the last
+4 conv inputs of each layer kept in `define-state` tensors. The language model is plain causal, so the prompt before
+the audio, the audio chunks as they arrive and the text after the audio fill one KV cache one block after the
+other. The log-mel front end is Rust (`tensorlisp::usm_mel`, computed as frames complete; matches transformers'
+`Gemma4AudioFeatureExtractor` to 5e-7).
+
+```sh
+# Google's QAT q4_0 files and the tokenizer
+hf download google/gemma-4-E2B-it-qat-q4_0-gguf gemma-4-E2B_q4_0-it.gguf gemma-4-E2B-it-mmproj.gguf
+hf download google/gemma-4-E2B-it tokenizer.json
+./build_audio.sh gemma4-audio.gguf gemma-4-E2B_q4_0-it.gguf gemma-4-E2B-it-mmproj.gguf tokenizer.json
+tl run gemma4-audio.gguf --device gpu --entry transcribe --raw audio=@speech.wav \
+    --raw $'pre=<|turn>user\nTranscribe this audio.<|audio>' --raw $'post=<audio|><turn|>\n<|turn>model\n'
+```
+
+`tl merge` (used by `merge.sh`) builds the one GGUF: the text model's llama.cpp tensor names become the ones
+`gemma4.ss` reads (so it is the same program as for the safetensors conversion; the QAT checkpoint has different
+weights than google/gemma-4-E2B-it but the same layout and no norm offsets), the audio tower's bf16 matrices become
+f16. Two things about the mmproj file are not what the names suggest: `per_dim_scale` holds `softplus(per_dim_scale)`
+already, and `conv_norm` is the norm before the light conv, `norm_conv` the one after it. The clipping bounds of
+the tower's linears (`*.input_min` and so on, 120 sets of 4 scalars) are in `audio_clips.ss`, generated from the file.
+
+| entry / pipeline | what |
+|---|---|
+| `audio-chunk` | mel window [51, 128] + masks -> 12 audio tokens [12, 1536] (and the tower output) |
+| `fill-audio`, `step-audio` | language model on a block of positions where some are audio tokens (`amask`) |
+| `transcribe` (stream `audio`, strings `pre`, `post`) | emits `token`/`id` while generating, `stage` markers |
+| `transcribe-ref`, `transcribe-oneshot` | the same from precomputed audio embeddings, incremental and in one block |
+| `audio-test`, `mel-test` | the tower chunk by chunk / the front end alone, for comparisons |
+
+`reference_audio.py` runs transformers' `Gemma4ForConditionalGeneration` on the unquantized QAT checkpoint
+(`google/gemma-4-E2B-it-qat-q4_0-unquantized`): the port's audio embeddings match its tower to 2e-4 of their range
+(f16 weights and activations), and the greedy transcripts of three clips (6.2, 5.5 and 20.4 s, `say` voices) are
+word for word the reference's. Over RPC (`tests/real_audio.rs`, docs/design/serve.md) the first token comes about
+90 ms after the audio ends.

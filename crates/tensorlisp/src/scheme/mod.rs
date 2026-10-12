@@ -51,7 +51,7 @@ const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? mod
     image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array image-tile \
     audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
     array-shape array-affine array-reshape \
-    postprocess results pipeline run output stream-recv emit client-call client-sample detokenize token-id define-state define-param lora-config! lora-attach! lora-delta state effect paged-attention paged-cache-write device array-length array->list list->array array-slice array-transpose array-take array-argmax \
+    postprocess results pipeline run output stream-recv emit client-call client-sample detokenize token-id define-state define-param lora-config! lora-attach! lora-delta state effect paged-attention paged-cache-write device usm-mel-new usm-mel-push! usm-mel-frames usm-mel-window array-length array-zeros array-concat array->list list->array array-slice array-transpose array-take array-argmax \
     image-letterbox boxes-convert nms detect boxes-scale boxes-clip boxes-unletterbox dbscan cluster-centroids \
     text-boxes text-boxes-order image-crop-text ctc-greedy vocabulary vocabulary-size vocabulary-text \
     mil-trace:add mil-trace:silu mil-trace:sigmoid mil-trace:reshape-2d mil-trace:reshape-3d mil-trace:reshape-4d \

@@ -15,6 +15,7 @@ pub mod error;
 pub mod gguf;
 mod guard;
 mod host;
+pub mod usm_mel;
 #[cfg(native_device)]
 mod native_ir;
 #[cfg(all(target_os = "macos", not(feature = "native-metal-tree")))]

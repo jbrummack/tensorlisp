@@ -39,6 +39,8 @@ pub(crate) enum HostValue {
     Emitter(crate::stream::Emit),
     /// A `(client-call ...)` or `(client-sample ...)` being assembled or answered.
     Callback(Box<CallbackCall>),
+    /// Gemma 4's audio front end, fed audio as it arrives.
+    Mel(Box<crate::usm_mel::UsmMel>),
 }
 
 pub(crate) enum CallbackKind {
@@ -85,6 +87,7 @@ impl HostValue {
             HostValue::Stream(_) => "stream",
             HostValue::Emitter(_) => "emitter",
             HostValue::Callback(_) => "callback",
+            HostValue::Mel(_) => "melstream",
         }
     }
 }
@@ -499,6 +502,29 @@ extern "C" fn tl_host_tensor_reshape(id: i64, d0: i64, d1: i64, d2: i64, d3: i64
 /// A new 1-d array of `n` zeros, filled with `tl_host_tensor_set`.
 extern "C" fn tl_host_tensor_new(n: i64) -> i64 {
     ffi(|| Ok(insert(HostValue::Tensor(ArrayD::zeros(IxDyn(&[n.max(0) as usize]))))))
+}
+
+/// A new zero array of up to four dims (numpy order; a trailing 0 means no such axis).
+extern "C" fn tl_host_tensor_zeros(d0: i64, d1: i64, d2: i64, d3: i64) -> i64 {
+    ffi(|| {
+        let dims: Vec<usize> = [d0, d1, d2, d3].into_iter().take_while(|&d| d > 0).map(|d| d as usize).collect();
+        if dims.is_empty() {
+            return Err("zeros needs at least one positive dimension".into());
+        }
+        Ok(insert(HostValue::Tensor(ArrayD::zeros(IxDyn(&dims)))))
+    })
+}
+
+/// `a` and `b` joined along `axis` (numpy order).
+extern "C" fn tl_host_tensor_concat(a: i64, b: i64, axis: i64) -> i64 {
+    ffi(|| {
+        let (a, b) = (tensor(a)?, tensor(b)?);
+        if axis < 0 || axis as usize >= a.ndim() || a.ndim() != b.ndim() {
+            return Err(format!("can't join shapes {:?} and {:?} along axis {axis}", a.shape(), b.shape()));
+        }
+        let joined = ndarray::concatenate(Axis(axis as usize), &[a.view(), b.view()]).map_err(|e| e.to_string())?;
+        Ok(insert(HostValue::Tensor(joined)))
+    })
 }
 
 extern "C" fn tl_host_tensor_set(id: i64, i: i64, v: f64) -> i64 {
@@ -963,6 +989,51 @@ extern "C" fn tl_host_run_output(run: i64, i: i64) -> i64 {
     })
 }
 
+// --- Gemma 4's streaming log-mel front end: `(usm-mel-new)`, `(usm-mel-push! ms audio)`, `(usm-mel-window ms from n)`.
+
+extern "C" fn tl_host_mel_new() -> i64 {
+    ffi(|| Ok(insert(HostValue::Mel(Box::new(crate::usm_mel::UsmMel::new())))))
+}
+
+/// Feeds an audio chunk (16 kHz mono); returns the number of frames so far + 1.
+extern "C" fn tl_host_mel_push(mel: i64, audio: i64) -> i64 {
+    ffi(|| {
+        let samples = get(audio, |v| match v {
+            HostValue::Audio(a) if a.sample_rate == 16000 => Ok(a.samples.clone()),
+            HostValue::Audio(a) => Err(format!("the audio front end takes 16 kHz audio, this is {} Hz", a.sample_rate)),
+            other => Err(format!("expected audio, not a {}", other.kind())),
+        })?;
+        with_registry(|r| match r.values.get_mut(&mel) {
+            Some((_, HostValue::Mel(m))) => {
+                m.push(&samples);
+                Ok(m.frames() as i64 + 1)
+            }
+            _ => Err(format!("host value {mel} is not an audio front end")),
+        })
+    })
+}
+
+/// Frames so far, + 1.
+extern "C" fn tl_host_mel_frames(mel: i64) -> i64 {
+    ffi(|| {
+        with_registry(|r| match r.values.get(&mel) {
+            Some((_, HostValue::Mel(m))) => Ok(m.frames() as i64 + 1),
+            _ => Err(format!("host value {mel} is not an audio front end")),
+        })
+    })
+}
+
+/// Frames `from .. from + n` as an [n, 128] array, zeros where there are none.
+extern "C" fn tl_host_mel_window(mel: i64, from: i64, n: i64) -> i64 {
+    ffi(|| {
+        let window = with_registry(|r| match r.values.get(&mel) {
+            Some((_, HostValue::Mel(m))) => Ok(m.window(from, n.max(0) as usize)),
+            _ => Err(format!("host value {mel} is not an audio front end")),
+        })?;
+        Ok(insert(HostValue::Tensor(window.into_dyn())))
+    })
+}
+
 // --- Callbacks: `(client-call name arg ...)` and `(client-sample logits ...)` in pipelines.
 
 fn new_callback(kind: CallbackKind, logits: Option<ArrayD<f32>>, history: Vec<i32>) -> i64 {
@@ -1292,6 +1363,8 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_tensor_len", tl_host_tensor_len as *const _),
         ("tl_host_tensor_get", tl_host_tensor_get as *const _),
         ("tl_host_tensor_slice", tl_host_tensor_slice as *const _),
+        ("tl_host_tensor_zeros", tl_host_tensor_zeros as *const _),
+        ("tl_host_tensor_concat", tl_host_tensor_concat as *const _),
         ("tl_host_tensor_transpose", tl_host_tensor_transpose as *const _),
         ("tl_host_tensor_take", tl_host_tensor_take as *const _),
         ("tl_host_tensor_argmax", tl_host_tensor_argmax as *const _),
@@ -1311,6 +1384,10 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_run_error", tl_host_run_error as *const _),
         ("tl_host_run_output_name", tl_host_run_output_name as *const _),
         ("tl_host_run_output", tl_host_run_output as *const _),
+        ("tl_host_mel_new", tl_host_mel_new as *const _),
+        ("tl_host_mel_push", tl_host_mel_push as *const _),
+        ("tl_host_mel_window", tl_host_mel_window as *const _),
+        ("tl_host_mel_frames", tl_host_mel_frames as *const _),
         ("tl_host_cb_call", tl_host_cb_call as *const _),
         ("tl_host_cb_sample", tl_host_cb_sample as *const _),
         ("tl_host_cb_arg", tl_host_cb_arg as *const _),

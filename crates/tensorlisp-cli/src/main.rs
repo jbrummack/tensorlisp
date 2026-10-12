@@ -3,9 +3,11 @@ mod check;
 mod common;
 mod convert;
 mod inspect;
+mod merge;
 mod npy;
 mod quantize;
 mod run;
+mod source;
 mod train;
 
 use std::path::PathBuf;
@@ -44,6 +46,8 @@ enum Command {
     Compare(run::CompareArgs),
     /// Quantize the weights of a GGUF file.
     Quantize(quantize::QuantizeArgs),
+    /// Build one GGUF from the tensors of several, renaming them.
+    Merge(merge::MergeArgs),
     /// Fine-tune LoRA adapters of a program on JSON lines and save them in PEFT's format.
     Train(train::TrainArgs),
 }
@@ -95,6 +99,7 @@ fn main() {
         Command::Process(args) => run::process(args, cli.json),
         Command::Compare(args) => run::compare(args, cli.json),
         Command::Quantize(args) => quantize::run(args, cli.json),
+        Command::Merge(args) => merge::run(args, cli.json),
         Command::Train(args) => train::run(args, cli.json),
     };
     match result {

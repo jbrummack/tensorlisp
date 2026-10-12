@@ -473,3 +473,40 @@ fn pipelines_call_back_into_the_client() {
     assert!(err.contains("started without callbacks"), "{err}");
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn host_arrays_and_the_audio_front_end() {
+    let program = r#"
+      (model id (inputs [x f32 (4 1)]) (outputs [y (ggml-scale x 1.0) 1]))
+      (pipeline arrays ([a array])
+        (results [joined (array-concat a (array-zeros 2 3))] [rows (array-concat a a)] [zeros (array-zeros 2)]))
+      (pipeline mel ([audio audio])
+        (let* ([ms (usm-mel-new)]
+               [first (usm-mel-push! ms audio)])
+          (usm-mel-push! ms audio)
+          (results [frames (array-reshape (list->array (list first (usm-mel-frames ms))) 2)]
+                   [edge (usm-mel-window ms -1 2)])))
+    "#;
+    let path = write("host-arrays", program);
+    let model = Model::load(&path, Device::Cpu).unwrap();
+    let a = ndarray::arr2(&[[1.0f32, 2.0, 3.0]]).into_dyn();
+    let out = model.pipeline("arrays", vec![("a".into(), RawInput::Array(a.clone()))]).unwrap();
+    let get = |name: &str| out.iter().find(|(n, _)| n == name).unwrap().1.as_array().unwrap().clone();
+    assert_eq!(get("joined"), ndarray::arr2(&[[1.0f32, 2.0, 3.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]).into_dyn());
+    assert_eq!(get("rows").shape(), [2, 3]);
+    assert_eq!(get("zeros"), ndarray::arr1(&[0.0f32, 0.0]).into_dyn());
+    let err = model.pipeline("arrays", vec![("a".into(), RawInput::Array(ndarray::arr1(&[1.0f32]).into_dyn()))]).unwrap_err().to_string();
+    assert!(err.contains("array-concat"), "{err}");
+
+    // One second of a tone: (16000 + 160 - 321) / 160 + 1 = 99 frames, and 99 + 99 more for the same audio again.
+    let samples: Vec<f32> = (0..16000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+    let audio = tensorlisp::autopro::audio::Audio::new(samples, 16000);
+    let out = model.pipeline("mel", vec![("audio".into(), RawInput::Audio(audio))]).unwrap();
+    let get = |name: &str| out.iter().find(|(n, _)| n == name).unwrap().1.as_array().unwrap().clone();
+    assert_eq!(get("frames").iter().copied().collect::<Vec<_>>(), [99.0, 199.0]);
+    let edge = get("edge").into_dimensionality::<ndarray::Ix2>().unwrap();
+    assert_eq!(edge.shape(), [2, 128]);
+    assert!(edge.row(0).iter().all(|&v| v == 0.0), "frame -1 does not exist");
+    assert!(edge.row(1).iter().any(|&v| v != 0.0) && edge.row(1).iter().all(|&v| v >= 0.001f32.ln() - 1e-4), "frame 0 is a log-mel row (ln(mel + 0.001) is at least ln 0.001)");
+    std::fs::remove_file(path).unwrap();
+}

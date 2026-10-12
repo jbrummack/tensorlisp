@@ -258,7 +258,18 @@ fn run_pipeline(model: &Model, name: &str, args: &RunArgs, load_ms: f64, json: b
     let mut times = Vec::new();
     for example in examples {
         let start = Instant::now();
-        results.push(model.pipeline(name, example)?);
+        // What the pipeline emits while it runs is printed as it comes, with the time since the start.
+        let emit: tensorlisp::Emit = std::sync::Arc::new(move |output, chunk| {
+            let what = match &chunk {
+                tensorlisp::Chunk::Text(t) => format!("{t:?}"),
+                tensorlisp::Chunk::Array(a) => format!("array {:?}", a.shape()),
+                tensorlisp::Chunk::Audio(a) => format!("audio of {} samples", a.samples.len()),
+                tensorlisp::Chunk::Image(i) => format!("image {}x{}", i.width(), i.height()),
+            };
+            eprintln!("  [{:8.1} ms] {output}: {what}", start.elapsed().as_secs_f64() * 1e3);
+            true
+        });
+        results.push(model.pipeline_streaming(name, example, Some(emit))?);
         times.push(start.elapsed().as_secs_f64() * 1e3);
     }
     let files = match &args.output {

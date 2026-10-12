@@ -140,18 +140,25 @@
 (define (softcapped logits)
   (ggml-scale (ggml-tanh (ggml-scale logits (/ 1.0 softcap))) softcap))
 
+;; The decoder stack over embeddings [1536, n] at `positions`; `ple-embeds` are what the per-layer
+;; inputs are projected from (the embeddings themselves for text). Returns the last layer's output.
+(define (decode-stack ids positions embeds ple-embeds)
+  (let ([ple (per-layer-inputs ids ple-embeds)]
+        [masks (cons (position-mask positions #f) (position-mask positions sliding-window))])
+    (let loop ([i 0] [x embeds])
+      (if (= i layers) x (loop (+ i 1) (layer x i positions masks ple))))))
+
+(define (token-embeds ids)
+  (ggml-reshape-2d (ggml-scale (nn:embedding "embed_tokens.weight" ids) embed-scale) hidden (dim ids 0)))
+
+(define (logits-of hidden-state)
+  (ggml-mul-mat (weight "embed_tokens.weight") (rms-norm hidden-state "norm")))
+
 (model step (inputs [token i32 (_ 1)] [pos i32 (_ 1)])
   (define ids (flat token))
-  (define positions (flat pos))
   (define n (dim ids 0))
-  (define embeds (ggml-reshape-2d (ggml-scale (nn:embedding "embed_tokens.weight" ids) embed-scale) hidden n))
-  (define ple (per-layer-inputs ids embeds))
-  (define masks (cons (position-mask positions #f) (position-mask positions sliding-window)))
-  (define last-hidden
-    (let ([x (let loop ([i 0] [x embeds])
-               (if (= i layers) x (loop (+ i 1) (layer x i positions masks ple))))])
-      (rms-norm (tensor:slice x 1 (- n 1) 1) "norm")))
-  (define raw (ggml-mul-mat (weight "embed_tokens.weight") last-hidden))
+  (define embeds (token-embeds ids))
+  (define raw (logits-of (tensor:slice (decode-stack ids (flat pos) embeds embeds) 1 (- n 1) 1)))
   (outputs [logits (softcapped raw) 2] [next (ggml-argmax raw) 1]))
 
 ;; --- pipeline

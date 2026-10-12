@@ -284,6 +284,10 @@ A typical port:
 
 ```sh
 tl convert model.safetensors --strip-prefix model. -o weights.gguf  # weights only
+# streaming: inputs can be URLs or hf:ORG/REPO[@REV] (HF_TOKEN for gated repos). Each tensor is
+# fetched with a Range request, converted (f16/bf16, or q8_0/q4_0/q4_K/... with --dtype) and
+# written in turn, so a 44 GB f32 checkpoint never touches the disk; memory stays near one chunk (128 MiB).
+tl convert hf:org/big-model --dtype q8_0 --no-quant '*embed*' -o model-q8.gguf
 tl inspect weights.gguf                        # tensor names, types, shapes
 # write net.ss; tap intermediate tensors that PyTorch also exposes
 tl check weights.gguf --program net.ss -i x=1,3,224,224   # graph nodes + shapes, no compute

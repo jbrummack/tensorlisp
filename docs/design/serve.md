@@ -158,6 +158,30 @@ and not part of this crate. There is no authentication: run the connection throu
 until the transport grows it. Tests: `tests/reverse.rs` (an in-process worker and the real `tl-serve` binary
 dialing a test scheduler, including redialing after the scheduler drops the connection).
 
+## Streaming audio into Gemma 4
+
+`ports/gemma4` has the `transcribe` pipeline (see its README): a `stream` input of 16 kHz audio chunks, a log-mel
+front end that produces frames as the samples arrive, the streaming conformer, and the q4_0 language model filling
+its KV cache with the audio tokens block by block, so that when the audio ends only the last partial chunk, the text
+after the audio and one forward pass are left. `crates/tensorlisp-serve/tests/real_audio.rs` (ignored; the header has the
+command line) pushes a 20.4 s clip in 100 ms pieces over RPC, once paced in real time and once all at once, M1 Pro,
+Google's QAT q4_0 files on ggml's Metal backend, release build:
+
+| | first token after the audio ended | the whole answer (353 characters) |
+|---|---|---|
+| audio streamed in real time | **88 to 104 ms** (4 runs) | 0.94 to 1.15 s |
+| the same audio sent at once, at the end | about 735 ms | 1.6 to 1.9 s |
+
+Of the 90 ms, the last partial chunk through the conformer is about 27 ms and the final block (up to 11 leftover audio
+tokens + the 6 text tokens, padded to a fixed 24 positions so the graph is built once) another 63 ms: a 35-layer q4_0
+decoder pass over a handful of positions costs 27 ms (4 positions) to 60 ms (16 to 32) because it streams the
+weights once; each generated token after that is 14 ms. While the audio plays the pipeline keeps up with a lot of
+room: with the whole clip delivered at once it takes 0.66 s to run the tower and prefill 20 s of audio (30x real time).
+The transcript is word for word what transformers (bf16, unquantized QAT weights) gives for it. The first utterance
+builds the graphs (every entry once); the numbers are for the ones after it. Smaller conformer chunks (4 tokens
+instead of 12) would cut the 27 ms but the decoder pass dominates and has a floor of about 44 ms for 8 positions, so
+60 ms looked like the best that was worth the extra graphs.
+
 ## The kernel cache
 
 Tree kernels are compiled by Scheme on first use. `tensorlisp::kernel_cache` stores the compiler's output (SPIR-V,

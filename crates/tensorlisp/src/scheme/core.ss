@@ -326,6 +326,8 @@
 (define tl_host_tensor_set (foreign-procedure "tl_host_tensor_set" (integer-64 integer-64 double) integer-64))
 (define tl_host_tensor_len (foreign-procedure "tl_host_tensor_len" (integer-64) integer-64))
 (define tl_host_tensor_get (foreign-procedure "tl_host_tensor_get" (integer-64 integer-64) double))
+(define tl_host_tensor_zeros (foreign-procedure "tl_host_tensor_zeros" (integer-64 integer-64 integer-64 integer-64) integer-64))
+(define tl_host_tensor_concat (foreign-procedure "tl_host_tensor_concat" (integer-64 integer-64 integer-64) integer-64))
 (define tl_host_tensor_slice
   (foreign-procedure "tl_host_tensor_slice" (integer-64 integer-64 integer-64 integer-64) integer-64))
 (define tl_host_tensor_transpose (foreign-procedure "tl_host_tensor_transpose" (integer-64) integer-64))
@@ -353,6 +355,10 @@
 (define tl_host_run_error (foreign-procedure "tl_host_run_error" (integer-64) string))
 (define tl_host_run_output_name (foreign-procedure "tl_host_run_output_name" (integer-64 integer-64) string))
 (define tl_host_run_output (foreign-procedure "tl_host_run_output" (integer-64 integer-64) integer-64))
+(define tl_host_mel_new (foreign-procedure "tl_host_mel_new" () integer-64))
+(define tl_host_mel_push (foreign-procedure "tl_host_mel_push" (integer-64 integer-64) integer-64))
+(define tl_host_mel_frames (foreign-procedure "tl_host_mel_frames" (integer-64) integer-64))
+(define tl_host_mel_window (foreign-procedure "tl_host_mel_window" (integer-64 integer-64 integer-64) integer-64))
 (define tl_host_cb_call (foreign-procedure "tl_host_cb_call" (string) integer-64))
 (define tl_host_cb_sample (foreign-procedure "tl_host_cb_sample" (integer-64 integer-64 integer-64 int) integer-64))
 (define tl_host_cb_arg (foreign-procedure "tl_host_cb_arg" (integer-64 integer-64) integer-64))
@@ -633,6 +639,18 @@
       (tl_host_tensor_reshape (%host-id 'array-reshape 'array x) (car d) (cadr d) (caddr d) (cadddr d)))))
 
 ;; Array access and manipulation
+
+;; A zero array of 1-4 dimensions (numpy order).
+(define (array-zeros . dims)
+  (unless (<= 1 (length dims) 4) (error 'array-zeros "1 to 4 dimensions" dims))
+  (let ([d (append (map (lambda (v) (%int 'array-zeros 'dimension v)) dims) '(0 0 0))])
+    (%host 'array-zeros 'array (tl_host_tensor_zeros (car d) (cadr d) (caddr d) (cadddr d)))))
+
+;; Two arrays joined along an axis (default 0, numpy order).
+(define (array-concat a b . opts)
+  (let ([o (%options 'array-concat opts '((axis . 0)))])
+    (%host 'array-concat 'array
+      (tl_host_tensor_concat (%host-id 'array-concat 'array a) (%host-id 'array-concat 'array b) (%int 'array-concat 'axis (%opt o 'axis))))))
 
 (define (array-length x) (tl_host_tensor_len (%host-id 'array-length 'array x)))
 
@@ -1000,6 +1018,21 @@
           [(3) (%host 'stream-recv 'image (tl_host_stream_item id))]
           [(4) (tl_host_stream_text id)]
           [else (error 'stream-recv (tl_host_error))])))))
+
+;; Gemma 4's audio front end (16 kHz mono log-mel, 128 bins, as the model's feature extractor computes it),
+;; fed as audio arrives. (usm-mel-push! ms audio) returns how many frames exist so far;
+;; (usm-mel-window ms from n) is frames from .. from + n as an [n, 128] array, zero where there are none.
+(define (usm-mel-new) (%host 'usm-mel-new 'melstream (tl_host_mel_new)))
+(define (usm-mel-push! ms audio)
+  (let ([n (tl_host_mel_push (%host-id 'usm-mel-push! 'melstream ms) (%host-id 'usm-mel-push! 'audio audio))])
+    (when (eqv? n 0) (error 'usm-mel-push! (tl_host_error)))
+    (- n 1)))
+(define (usm-mel-frames ms)
+  (let ([n (tl_host_mel_frames (%host-id 'usm-mel-frames 'melstream ms))])
+    (when (eqv? n 0) (error 'usm-mel-frames (tl_host_error)))
+    (- n 1)))
+(define (usm-mel-window ms from n)
+  (%host 'usm-mel-window 'array (tl_host_mel_window (%host-id 'usm-mel-window 'melstream ms) from n)))
 
 ;; Calling the client. The pipeline waits (yielding the Scheme thread) while the client answers.
 ;;
