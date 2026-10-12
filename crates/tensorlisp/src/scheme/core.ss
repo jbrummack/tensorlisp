@@ -349,9 +349,25 @@
 (define tl_host_dbscan (foreign-procedure "tl_host_dbscan" (integer-64 double integer-64 int) integer-64))
 (define tl_host_run_begin (foreign-procedure "tl_host_run_begin" (integer-64 string) integer-64))
 (define tl_host_run_input (foreign-procedure "tl_host_run_input" (integer-64 string integer-64) integer-64))
-(define tl_host_run_exec (foreign-procedure "tl_host_run_exec" (integer-64) integer-64))
+(define tl_host_run_status (foreign-procedure "tl_host_run_status" (integer-64) integer-64))
+(define tl_host_run_error (foreign-procedure "tl_host_run_error" (integer-64) string))
 (define tl_host_run_output_name (foreign-procedure "tl_host_run_output_name" (integer-64 integer-64) string))
 (define tl_host_run_output (foreign-procedure "tl_host_run_output" (integer-64 integer-64) integer-64))
+(define tl_host_cb_call (foreign-procedure "tl_host_cb_call" (string) integer-64))
+(define tl_host_cb_sample (foreign-procedure "tl_host_cb_sample" (integer-64 integer-64 integer-64 int) integer-64))
+(define tl_host_cb_arg (foreign-procedure "tl_host_cb_arg" (integer-64 integer-64) integer-64))
+(define tl_host_cb_arg_text (foreign-procedure "tl_host_cb_arg_text" (integer-64 string) integer-64))
+(define tl_host_cb_arg_number (foreign-procedure "tl_host_cb_arg_number" (integer-64 double) integer-64))
+(define tl_host_cb_status (foreign-procedure "tl_host_cb_status" (integer-64) integer-64))
+(define tl_host_cb_item (foreign-procedure "tl_host_cb_item" (integer-64) integer-64))
+(define tl_host_cb_token (foreign-procedure "tl_host_cb_token" (integer-64) integer-64))
+(define tl_host_cb_text (foreign-procedure "tl_host_cb_text" (integer-64) string))
+(define tl_host_cb_error (foreign-procedure "tl_host_cb_error" (integer-64) string))
+(define tl_host_stream_poll (foreign-procedure "tl_host_stream_poll" (integer-64) integer-64))
+(define tl_host_stream_item (foreign-procedure "tl_host_stream_item" (integer-64) integer-64))
+(define tl_host_stream_text (foreign-procedure "tl_host_stream_text" (integer-64) string))
+(define tl_host_emit (foreign-procedure "tl_host_emit" (integer-64 string integer-64) integer-64))
+(define tl_host_emit_text (foreign-procedure "tl_host_emit_text" (integer-64 string string) integer-64))
 (define tl_host_detokenize (foreign-procedure "tl_host_detokenize" (integer-64 integer-64 int) string))
 (define tl_host_token_id (foreign-procedure "tl_host_token_id" (integer-64 string) integer-64))
 (define tl_host_cluster_centroids (foreign-procedure "tl_host_cluster_centroids" (integer-64 integer-64) integer-64))
@@ -811,6 +827,8 @@
     (unless slot (error 'preprocess "preprocess can only be used while a program is loaded"))
     (when (vector-ref slot 1) (error 'preprocess "a program can define only one preprocess"))
     (%check-raw-spec 'preprocess spec)
+    (when (exists (lambda (x) (eq? (cadr x) 'stream)) spec)
+      (error 'preprocess "a stream is an input of a pipeline, not of preprocess" spec))
     (vector-set! slot 1 (cons spec proc))))
 
 ;; (postprocess (name ...) body ... (results [name value] ...))
@@ -927,12 +945,124 @@
 
 (define (%check-raw-spec who spec)
   (for-each (lambda (s)
-              (unless (and (symbol? (car s)) (memq (cadr s) '(string image audio array)))
-                (error who "raw inputs look like [name kind], kind: string, image, audio or array" s)))
+              (unless (and (symbol? (car s)) (memq (cadr s) '(string image audio array stream)))
+                (error who "raw inputs look like [name kind], kind: string, image, audio, array or stream" s)))
             spec))
 
 ;; The program a pipeline runs in (its id), while it runs.
 (define %current-program (make-parameter #f))
+
+;; Pipelines are coroutines. The host drives one: $tl-pipeline-start runs it until it finishes
+;; ((done results) or (failed message)) or has to wait ((yield (wait stream)) for input, (yield
+;; (run call)) for an entry the host runs itself), then returns; $tl-pipeline-resume continues it
+;; from where it left. So the Scheme thread is free while a pipeline waits. The continuation is
+;; captured inside one host call and re-entered from another; that works because the computation
+;; always leaves through the escape continuation of the current call, never by returning.
+(define-record-type coroutine
+  (fields id (mutable escape) (mutable saved))
+  (nongenerative tensorlisp-coroutine)
+  (sealed #t))
+
+(define %coroutines (make-eqv-hashtable))
+(define %current-coroutine (make-parameter #f))
+
+;; Leaves the pipeline with `request` for the host; returns when it resumes.
+(define (%yield request)
+  (let ([co (%current-coroutine)])
+    (unless co (error 'yield "only a pipeline can wait"))
+    (call/cc
+      (lambda (k)
+        (coroutine-saved-set! co k)
+        ((coroutine-escape co) (list 'yield request))))))
+
+;; Where (emit ...) goes while a pipeline runs: a host emitter id, or #f.
+(define %current-emit (make-parameter #f))
+
+;; Streaming. A pipeline argument of kind `stream` is an input stream the caller feeds while the
+;; pipeline runs; (stream-recv s) waits (yielding the Scheme thread) for the next chunk and returns an array, audio, image
+;; or string, or #f once the caller has closed the stream. (emit 'name value) sends an array,
+;; audio, image or string to the caller's output stream `name`.
+;;
+;;   (pipeline transcribe ([audio stream])
+;;     (let loop ([n 0])
+;;       (let ([chunk (stream-recv audio)])
+;;         (cond [chunk (emit 'features (run encode [x (audio->array chunk)])) (loop (+ n 1))]
+;;               [else (results [chunks n])]))))
+(define (stream-recv s)
+  (let ([id (%host-id 'stream-recv 'stream s)])
+    (let loop ()
+      (let ([kind (tl_host_stream_poll id)])
+        (case kind
+          [(-2) (%yield (list 'wait id)) (loop)]
+          [(0) #f]
+          [(1) (%host 'stream-recv 'array (tl_host_stream_item id))]
+          [(2) (%host 'stream-recv 'audio (tl_host_stream_item id))]
+          [(3) (%host 'stream-recv 'image (tl_host_stream_item id))]
+          [(4) (tl_host_stream_text id)]
+          [else (error 'stream-recv (tl_host_error))])))))
+
+;; Calling the client. The pipeline waits (yielding the Scheme thread) while the client answers.
+;;
+;; (client-call "name" arg ...) calls the client's handler `name`; args are strings, numbers (sent
+;; as 0-d arrays) or arrays/audio/images; the result is a string, an array, audio, an image or void.
+;; (client-sample logits [history [k [full?]]]) asks the client which token to pick: it is sent the
+;; k (default 40) highest logits with their token ids, the ids generated so far (a list or array of
+;; numbers), and with full? the whole logits array too. Returns the token id. Together with masks
+;; computed in the pipeline this covers custom samplers; a sampler that needs no client logic can
+;; just be written in the pipeline.
+(define (%callback-result who c)
+  (case (tl_host_cb_status c)
+    [(0) (error who (tl_host_cb_error c))]
+    [(1) (%host who 'array (tl_host_cb_item c))]
+    [(2) (%host who 'audio (tl_host_cb_item c))]
+    [(3) (%host who 'image (tl_host_cb_item c))]
+    [(4) (tl_host_cb_text c)]
+    [(5) (void)]
+    [(6) (tl_host_cb_token c)]
+    [else (error who "bad callback result")]))
+
+(define (client-call name . args)
+  (unless (string? name) (error 'client-call "the handler name must be a string" name))
+  (let ([c (tl_host_cb_call name)])
+    (when (eqv? c 0) (error 'client-call (tl_host_error)))
+    (for-each
+      (lambda (a)
+        (when (eqv? 0 (cond
+                        [(string? a) (tl_host_cb_arg_text c a)]
+                        [(real? a) (tl_host_cb_arg_number c (inexact a))]
+                        [(host? a) (tl_host_cb_arg c (host-id a))]
+                        [else (error 'client-call "arguments are strings, numbers, arrays, audio or images" a)]))
+          (error 'client-call (tl_host_error))))
+      args)
+    (%yield (list 'callback c))
+    (%callback-result 'client-call c)))
+
+(define client-sample
+  (case-lambda
+    [(logits) (client-sample logits '() 40 #f)]
+    [(logits history) (client-sample logits history 40 #f)]
+    [(logits history k) (client-sample logits history k #f)]
+    [(logits history k full?)
+     (let ([c (tl_host_cb_sample (%host-id 'client-sample 'array logits)
+                                 (%host-id 'client-sample 'array (if (list? history) (list->array history) history))
+                                 k
+                                 (if full? 1 0))])
+       (when (eqv? c 0) (error 'client-sample (tl_host_error)))
+       (%yield (list 'callback c))
+       (%callback-result 'client-sample c))]))
+
+(define (emit name value)
+  (let ([e (%current-emit)])
+    (unless e (error 'emit "emit can only be used in a pipeline that was started with output streams"))
+    (let ([name (cond [(symbol? name) (symbol->string name)]
+                      [(string? name) name]
+                      [else (error 'emit "the output name must be a symbol or string" name)])])
+      (when (eqv? (cond
+                    [(string? value) (tl_host_emit_text e name value)]
+                    [(host? value) (tl_host_emit e name (host-id value))]
+                    [else (error 'emit "expected an array, audio, image or string" value)])
+                  0)
+        (error 'emit (tl_host_error))))))
 
 (define-syntax run
   (syntax-rules ()
@@ -949,8 +1079,10 @@
                   (when (eqv? (tl_host_run_input r (symbol->string (car i)) (%host-id 'run 'array (cdr i))) 0)
                     (error 'run (tl_host_error))))
                 inputs)
-      (let ([n (- (tl_host_run_exec r) 1)])
-        (when (< n 0) (error (string->symbol (format "run ~a" entry)) (tl_host_error)))
+      ;; The driver runs the entry off the Scheme thread and resumes us with the result.
+      (%yield (list 'run r))
+      (let ([n (- (tl_host_run_status r) 1)])
+        (when (< n 0) (error (string->symbol (format "run ~a" entry)) (tl_host_run_error r)))
         (map (lambda (i)
                (cons (string->symbol (tl_host_run_output_name r i))
                      (%host 'run 'array (tl_host_run_output r i))))
@@ -1574,14 +1706,42 @@
       (parameterize ([%assets (%model-assets m)])
         (apply (cdr post) (map %host-arg args))))))
 
-;; Runs pipeline name on raw inputs (in its declared order, like preprocess).
-(define ($tl-pipeline id name raws)
+;; The text of a raised condition, as the host reports Scheme errors.
+(define (%condition-text e)
+  (if (condition? e)
+      (call-with-string-output-port (lambda (p) (display-condition e p)))
+      (format "non-condition raised: ~s" e)))
+
+;; Starts pipeline `name` as run number `run` on raw inputs (in its declared order, like preprocess).
+(define ($tl-pipeline-start run id name raws emit)
   (let* ([m (hashtable-ref %models id #f)]
          [p (and m (assq (string->symbol name) (%model-pipelines m)))])
     (unless p (error 'pipeline "the program has no pipeline with this name" name))
-    (%export-results 'pipeline
-      (parameterize ([%assets (%model-assets m)] [%current-program id])
-        (apply (caddr p) (map %host-arg raws))))))
+    (let ([co (make-coroutine run #f #f)])
+      (hashtable-set! %coroutines run co)
+      (call/cc
+        (lambda (r)
+          (coroutine-escape-set! co r)
+          (let ([result
+                 (guard (e [#t (list 'failed (%condition-text e))])
+                   (list 'done
+                         (parameterize ([%assets (%model-assets m)] [%current-program id]
+                                        [%current-emit (and (> emit 0) emit)] [%current-coroutine co])
+                           (%export-results 'pipeline (apply (caddr p) (map %host-arg raws))))))])
+            (hashtable-delete! %coroutines run)
+            ((coroutine-escape co) result)))))))
+
+(define ($tl-pipeline-resume run)
+  (let ([co (hashtable-ref %coroutines run #f)])
+    (unless co (error 'pipeline "this run is not waiting" run))
+    (call/cc
+      (lambda (r)
+        (coroutine-escape-set! co r)
+        ((coroutine-saved co) #f)))))
+
+;; Forgets an unfinished run.
+(define ($tl-pipeline-drop run)
+  (hashtable-delete! %coroutines run))
 
 ;; Creates an input tensor for spec (name dtype ...) with ggml dims ne (1-4 sizes).
 (define (%new-input ctx spec ne)

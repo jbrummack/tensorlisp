@@ -1,0 +1,35 @@
+[package]
+name = "tensorlisp-serve"
+version.workspace = true
+edition.workspace = true
+description = "Cap'n Proto RPC server for tensorlisp models (`tl-serve`)."
+
+[[bin]]
+name = "tl-serve"
+path = "src/main.rs"
+
+[features]
+cuda = ["tensorlisp/cuda"]
+vulkan = ["tensorlisp/vulkan"]
+native-cuda = ["tensorlisp/native-cuda"]
+native-vulkan = ["tensorlisp/native-vulkan"]
+native-cuda-tree = ["tensorlisp/native-cuda-tree"]
+native-metal-tree = ["tensorlisp/native-metal-tree"]
+
+[dependencies]
+tensorlisp = { path = "../tensorlisp" }
+anyhow.workspace = true
+capnp = "0.27"
+capnp-rpc = "0.27"
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3"
+half = "2.7.1"
+image = "0.25.10"
+ndarray = "0.17.2"
+serde_json = "1.0.151"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "net", "macros", "fs", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[build-dependencies]
+capnpc = "0.27"

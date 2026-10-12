@@ -24,6 +24,9 @@ use crate::{
     native_ir::{backend_err, lower_graph, read_results, Lowered, Results},
 };
 
+/// One session's state tensors, laid out like `Native::state`.
+pub(crate) type StateBlock = Arc<Buffer>;
+
 /// Weights, states and the compiled executor of one model.
 pub(crate) struct Native {
     pub exec: Executor,
@@ -98,6 +101,26 @@ impl Native {
         self.state.zero();
     }
 
+    /// A zeroed block of state for another session.
+    pub fn new_state_block(&self) -> Result<StateBlock> {
+        let buf = self.exec.dev.alloc(self.state.len().max(1)).map_err(backend_err)?;
+        buf.zero();
+        Ok(Arc::new(buf))
+    }
+
+    /// A copy of a session's state.
+    pub fn fork_block(&self, block: &StateBlock) -> Result<StateBlock> {
+        let copy = self.new_state_block()?;
+        let n = block.len().min(copy.len());
+        copy.write(&block.read::<u8>(n));
+        Ok(copy)
+    }
+
+    pub fn reset_block(&self, block: &mut StateBlock) -> Result<()> {
+        block.zero();
+        Ok(())
+    }
+
     pub fn device_name(&self) -> String {
         format!("native {}", self.exec.dev.name())
     }
@@ -130,8 +153,9 @@ impl NativeProgram {
         self.program.set_input(i, data).map_err(backend_err)
     }
 
-    pub fn run(&self, native: &Native) -> Result<()> {
-        self.program.run(&Shared { weights: &native.weights, state: &native.state }).map_err(backend_err)
+    pub fn run(&self, native: &Native, state: Option<&StateBlock>) -> Result<()> {
+        let state = state.map_or(&native.state, |b| &**b);
+        self.program.run(&Shared { weights: &native.weights, state }).map_err(backend_err)
     }
 
     pub fn outputs(&self) -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {

@@ -24,7 +24,7 @@ const NATIVE: &str = include_str!("native.ss");
 /// The stdlib libraries, `(tl name)` (`name` possibly multi-segment, e.g.
 /// `aot mil shadow` for `(tl aot mil shadow)`), in dependency order (see
 /// docs/stdlib.md).
-const STDLIB: &[(&str, &str)] = &[
+pub(crate) const STDLIB: &[(&str, &str)] = &[
     ("tensor", include_str!("stdlib/tensor.ss")),
     ("util", include_str!("stdlib/util.ss")),
     ("nn", include_str!("stdlib/nn.ss")),
@@ -51,14 +51,14 @@ const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? mod
     image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array image-tile \
     audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
     array-shape array-affine array-reshape \
-    postprocess results pipeline run output detokenize token-id define-state define-param lora-config! lora-attach! lora-delta state effect paged-attention paged-cache-write device array-length array->list list->array array-slice array-transpose array-take array-argmax \
+    postprocess results pipeline run output stream-recv emit client-call client-sample detokenize token-id define-state define-param lora-config! lora-attach! lora-delta state effect paged-attention paged-cache-write device array-length array->list list->array array-slice array-transpose array-take array-argmax \
     image-letterbox boxes-convert nms detect boxes-scale boxes-clip boxes-unletterbox dbscan cluster-centroids \
     text-boxes text-boxes-order image-crop-text ctc-greedy vocabulary vocabulary-size vocabulary-text \
     mil-trace:add mil-trace:silu mil-trace:sigmoid mil-trace:reshape-2d mil-trace:reshape-3d mil-trace:reshape-4d \
     mil-trace:ggml-concat mil-trace:tensor-slice mil-trace:tensor-concat mil-trace:conv2d mil-trace:conv2d-depthwise \
     mil-trace:max-pool mil-trace:upsample-nearest %mil-trace-reset! %mil-render %mil-render! %mil-declare-input!";
 /// Host entry points, only visible from Rust.
-const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline $tl-compile-generic-to-ggml $tl-compile-generic-to-mil $tl-mil-last-render $tl-native-lower-mul-mat";
+const HOST: &str = "%options %opt %int %real $tl-load-program $tl-build $tl-unload $tl-abort-handler $tl-preprocess $tl-postprocess $tl-pipeline-start $tl-pipeline-resume $tl-pipeline-drop $tl-compile-generic-to-ggml $tl-compile-generic-to-mil $tl-mil-last-render $tl-native-lower-mul-mat";
 
 extern "C" fn tl_tensor_ne(t: *const ggml_tensor, i: i32) -> i64 {
     unsafe { (*t).ne[i as usize] }
@@ -201,7 +201,9 @@ pub(crate) fn tree_compile_src(expr: &str, compile: &str) -> String {
 #[cfg(feature = "native-cuda-tree")]
 pub(crate) fn tree_compile_ptx(expr: &str) -> Result<Value> {
     let src = tree_compile_src(expr, "compile-kernel-ptx");
-    with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+    crate::kernel_cache::cached("ptx", &src.clone(), move || {
+        with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+    })
 }
 
 /// Compiles a Tree kernel expression to MSL on the Scheme thread: `(msl-text entry accesses push-bytes
@@ -209,7 +211,9 @@ pub(crate) fn tree_compile_ptx(expr: &str) -> Result<Value> {
 #[cfg(feature = "native-metal-tree")]
 pub(crate) fn tree_compile_msl(expr: &str) -> Result<Value> {
     let src = tree_compile_src(expr, "compile-kernel-msl");
-    with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+    crate::kernel_cache::cached("msl", &src.clone(), move || {
+        with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+    })
 }
 
 #[cfg(feature = "native-vulkan")]
@@ -223,7 +227,10 @@ pub(crate) fn tree_compile(expr: &str) -> Result<Vec<u8>> {
     } else {
         format!("(eval '(compile-kernel (optimize {expr} '({}))) $tl-tree-env)", list.join(" "))
     };
-    match with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))? {
+    let compiled = crate::kernel_cache::cached("spirv", &src.clone(), move || {
+        with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+    })?;
+    match compiled {
         Value::Bytevector(b) => Ok(b),
         other => Err(Error::Program(format!("tree kernel compiler returned {other:?}"))),
     }
@@ -279,6 +286,8 @@ pub enum RawKind {
     Image,
     Audio,
     Array,
+    /// An input stream the caller feeds while the pipeline runs (`stream-recv`).
+    Stream,
 }
 
 /// A raw input declared by `(preprocess ([name kind] ...) ...)`.
@@ -295,6 +304,7 @@ pub enum RawValue {
     Image(image::RgbImage),
     Audio(autopro::audio::Audio),
     Array(ndarray::ArrayD<f32>),
+    Stream(crate::stream::StreamReader),
 }
 
 /// A model entry: `(model name (inputs ...) ...)`; an unnamed model is `main`.
@@ -394,6 +404,7 @@ fn raw_argument(raw: RawValue) -> Value {
         RawValue::Image(i) => ("image", HostValue::Image(i)),
         RawValue::Audio(a) => ("audio", HostValue::Audio(a)),
         RawValue::Array(t) => ("tensor", HostValue::Tensor(t)),
+        RawValue::Stream(s) => ("stream", HostValue::Stream(s)),
     };
     Value::Pair(Box::new(Value::Symbol(kind.into())), Box::new(Value::Int(insert(value))))
 }
@@ -520,6 +531,7 @@ impl LoadedProgram {
                             "string" => RawKind::Text,
                             "image" => RawKind::Image,
                             "audio" => RawKind::Audio,
+                            "stream" => RawKind::Stream,
                             _ => RawKind::Array,
                         },
                     }),
@@ -576,10 +588,11 @@ impl LoadedProgram {
     /// Runs `(preprocess ...)` on one example (values in raw-input order).
     /// Returns one array per model input, in input order.
     pub fn preprocess(&self, raws: Vec<RawValue>) -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
-        use crate::host::{Scope, clear_calls, in_scope, take_tensor};
+        use crate::host::{clear_scope, in_scope, new_call_scope, take_tensor};
         let id = self.id;
+        let scope = new_call_scope();
         with_scheme(move |s| {
-            let result = in_scope(Scope::Call, || -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
+            let result = in_scope(scope, || -> Result<Vec<(String, ndarray::ArrayD<f32>)>> {
                 let args: Vec<Value> = raws.into_iter().map(raw_argument).collect();
                 let reply = s.call("$tl-preprocess", &[Value::Int(id), Value::List(args)])?;
                 let bad = || bad_reply("preprocess", &reply);
@@ -596,7 +609,7 @@ impl LoadedProgram {
                     })
                     .collect()
             });
-            clear_calls();
+            clear_scope(scope);
             result
         })?
     }
@@ -608,10 +621,11 @@ impl LoadedProgram {
     /// Runs `(postprocess ...)` on one example (values in argument order).
     /// Returns the named results in the order the program lists them.
     pub fn postprocess(&self, args: Vec<PostValue>) -> Result<Vec<(String, ResultValue)>> {
-        use crate::host::{HostValue, Scope, clear_calls, in_scope, insert};
+        use crate::host::{HostValue, clear_scope, in_scope, insert, new_call_scope};
         let id = self.id;
+        let scope = new_call_scope();
         with_scheme(move |s| {
-            let result = in_scope(Scope::Call, || {
+            let result = in_scope(scope, || {
                 let args: Vec<Value> = args
                     .into_iter()
                     .map(|arg| match arg {
@@ -625,26 +639,79 @@ impl LoadedProgram {
                 let reply = s.call("$tl-postprocess", &[Value::Int(id), Value::List(args)])?;
                 parse_results("postprocess", &reply)
             });
-            clear_calls();
+            clear_scope(scope);
             result
         })?
     }
 
-    /// Runs pipeline `name` of program `id` on its raw inputs (in declared
-    /// order). Called without holding the model's lock: the pipeline runs
-    /// entries, which take it.
-    pub fn run_pipeline(id: i64, name: &str, raws: Vec<RawValue>) -> Result<Vec<(String, ResultValue)>> {
-        use crate::host::{Scope, clear_calls, in_scope};
+    /// Runs pipeline `name` of program `id` on its raw inputs (in declared order).
+    ///
+    /// The pipeline is a coroutine on the Scheme thread that leaves it whenever it has to wait:
+    /// for a chunk of an input stream, or for an entry it started with `(run ...)`, which runs
+    /// here, on the caller's thread. The Scheme thread is only occupied while pipeline code
+    /// actually executes, so other pipelines, loads and graph builds go on in between. Called
+    /// without holding the model's lock, since the pipeline runs entries, which take it.
+    pub fn run_pipeline(
+        id: i64,
+        name: &str,
+        raws: Vec<RawValue>,
+        emit: Option<crate::stream::Emit>,
+        state: Option<crate::model::ModelState>,
+        callbacks: Option<std::sync::Arc<dyn crate::stream::Callbacks>>,
+    ) -> Result<Vec<(String, ResultValue)>> {
+        use crate::host::{HostValue, clear_scope, exec_callback, exec_run, in_scope, insert, new_call_scope, stream_reader};
+        let scope = new_call_scope();
+        let crate::host::Scope::Call(run) = scope else { unreachable!() };
+        let run = run as i64;
         let name = name.to_string();
-        with_scheme(move |s| {
-            let result = in_scope(Scope::Call, || {
-                let args: Vec<Value> = raws.into_iter().map(raw_argument).collect();
-                let reply = s.call("$tl-pipeline", &[Value::Int(id), Value::String(name), Value::List(args)])?;
-                parse_results("pipeline", &reply)
-            });
-            clear_calls();
-            result
-        })?
+        let step = move |resume: bool, raws: Vec<RawValue>, emit: Option<crate::stream::Emit>, name: String| {
+            with_scheme(move |s| {
+                in_scope(scope, || {
+                    if resume {
+                        return s.call("$tl-pipeline-resume", &[Value::Int(run)]);
+                    }
+                    let args: Vec<Value> = raws.into_iter().map(raw_argument).collect();
+                    let emitter = emit.map_or(0, |e| insert(HostValue::Emitter(e)));
+                    s.call(
+                        "$tl-pipeline-start",
+                        &[Value::Int(run), Value::Int(id), Value::String(name), Value::List(args), Value::Int(emitter)],
+                    )
+                })
+            })
+        };
+        let drive = || -> Result<Vec<(String, ResultValue)>> {
+            let mut sampled = 0u32;
+            let mut reply = step(false, raws, emit, name)??;
+            loop {
+                let bad = || bad_reply("pipeline", &reply);
+                match as_list(&reply).ok_or_else(bad)? {
+                    [Value::Symbol(tag), results] if tag == "done" => return parse_results("pipeline", results),
+                    [Value::Symbol(tag), Value::String(message)] if tag == "failed" => {
+                        return Err(Error::Scheme(chez::Error::Scheme(message.clone())));
+                    }
+                    [Value::Symbol(tag), request] if tag == "yield" => match as_list(request).ok_or_else(bad)? {
+                        [Value::Symbol(what), Value::Int(stream)] if what == "wait" => {
+                            // Not on the Scheme thread: it serves others meanwhile.
+                            stream_reader(*stream).ok_or_else(bad)?.inner.wait();
+                        }
+                        [Value::Symbol(what), Value::Int(call)] if what == "run" => exec_run(*call, scope, state.clone()),
+                        [Value::Symbol(what), Value::Int(call)] if what == "callback" => {
+                            exec_callback(*call, scope, callbacks.as_deref(), &mut sampled)
+                        }
+                        _ => return Err(bad()),
+                    },
+                    _ => return Err(bad()),
+                }
+                reply = step(true, Vec::new(), None, String::new())??;
+            }
+        };
+        let result = drive();
+        // Unfinished pipelines (an error on this side) give up their continuation too.
+        let _ = with_scheme(move |s| {
+            let _ = s.call("$tl-pipeline-drop", &[Value::Int(run)]);
+            clear_scope(scope);
+        });
+        result
     }
 
     /// Runs the model body in `ctx`, with inputs of the given ggml dims.

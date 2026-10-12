@@ -137,6 +137,20 @@ impl<B: Backend> Engine<B> {
         Ok(Session { blocks })
     }
 
+    /// A new session holding a copy of `from`'s state. The caller must have waited for any ticket
+    /// that writes `from`.
+    pub fn fork_session(&self, from: &Session<B>) -> Result<Session<B>> {
+        let sizes: Vec<u64> = from.blocks.iter().map(|b| self.backend.buffer_len(b.buffer())).collect();
+        let to = self.new_session(&sizes)?;
+        for (src, dst) in from.blocks.iter().zip(&to.blocks) {
+            let len = self.backend.buffer_len(src.buffer()).min(self.backend.buffer_len(dst.buffer())) as usize;
+            let mut bytes = vec![0u8; len];
+            self.backend.read(src.buffer(), 0, &mut bytes)?;
+            self.backend.write(dst.buffer(), 0, &bytes)?;
+        }
+        Ok(to)
+    }
+
     /// Copies `len` bytes at `off` out of the session's block `i`. The caller
     /// must have waited for any ticket that writes the session.
     pub fn read_session(&self, session: &Session<B>, i: usize, off: u64, len: usize) -> Result<Vec<u8>> {

@@ -94,6 +94,35 @@ pub(super) struct FaSplit {
     pub bytes: u64,
 }
 
+/// Shared memory a `k:flash-attn-cm` workgroup of `nsg` subgroups uses with `bkv`-key blocks.
+fn fa_cm_shared(hsk: u32, hsv: u32, bkv: u32, nsg: u32) -> u32 {
+    let (hk, hv) = (hsk.next_multiple_of(16), hsv.next_multiple_of(16));
+    let (ldk, ldv, lds) = (hk + 8, hv + 8, bkv + 8);
+    2 * bkv * ldk + 2 * bkv * ldv + 4 * nsg * 16 * lds + 2 * nsg * 16 * lds + 4 * nsg * 64
+}
+
+/// Whether flash attention takes the tensor-core kernel, and its (keys per block, subgroups): cooperative
+/// matrices (Apple GPUs for now: the other targets have not run it), at least 16 queries to fill a
+/// fragment, head sizes up to 256, and as many subgroups as fit in 32 KB of shared memory.
+/// `TL_TREE_NOFACM=1` keeps the scalar kernel, `TL_TREE_FACM=1` allows any device with cooperative matrices.
+pub(super) fn fa_cm_plan(caps: &Caps, nq: u32, kv: u32, hsk: u32, hsv: u32) -> Option<(u32, u32)> {
+    let device_ok = caps.vendor_id == 0x106b || std::env::var_os("TL_TREE_FACM").is_some();
+    if !caps.coopmat || caps.subgroup_size != 32 || !device_ok || std::env::var_os("TL_TREE_NOFACM").is_some() {
+        return None;
+    }
+    if nq < 16 || kv == 0 || hsk == 0 || hsv == 0 || hsk > 256 || hsv > 256 {
+        return None;
+    }
+    if let Some(v) = std::env::var("TL_TREE_FACM_SHAPE").ok() {
+        // "bkv nsg" forces a shape (diagnostics)
+        let n: Vec<u32> = v.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        if let [bkv, nsg] = n[..] {
+            return (fa_cm_shared(hsk, hsv, bkv, nsg) <= 32768).then_some((bkv, nsg));
+        }
+    }
+    [(16, 8), (16, 4), (16, 2), (16, 1)].into_iter().find(|&(bkv, nsg)| fa_cm_shared(hsk, hsv, bkv, nsg) <= 32768 - 64)
+}
+
 pub(super) fn fa_split_plan(graph: &Graph, id: TensorId) -> Option<FaSplit> {
     let t = &graph.tensors[id];
     if t.op != "FLASH_ATTN_EXT" || std::env::var_os("TL_TREE_NOSPLIT").is_some() {
@@ -971,6 +1000,7 @@ impl<'a> Ctx<'a> {
         if td.ne != [hsv, nh, nq, nb] {
             return Ok(None);
         }
+        let cm = fa_cm_plan(&self.caps, nq, kv, hsk, hsv);
         let maxkv = match kv {
             0..=2048 => 2048,
             2049..=4096 => 4096,
@@ -1036,6 +1066,11 @@ impl<'a> Ctx<'a> {
         {
             let expr = format!("(k:flash-attn-mma {mk} {sc} {hsk} {hsv})");
             return self.tree_launch(tree, &expr, bindings, &push, [ceil_div(nq, 16), nh, nb]);
+        }
+        if let Some((bkv, nsg)) = cm {
+            // Tensor cores: sixteen queries per subgroup, the keys in blocks shared by the workgroup.
+            let expr = format!("(k:flash-attn-cm '{kt} '{vt} {mk} {sc} {hsk} {hsv} {bkv} {nsg})");
+            return self.tree_launch(tree, &expr, bindings, &push, [ceil_div(nq, 16 * nsg), nh, nb]);
         }
         if maxkv == 0 {
             return Ok(None);

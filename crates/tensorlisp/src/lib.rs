@@ -32,17 +32,20 @@ mod native;
 #[cfg(all(feature = "native-vulkan", not(feature = "native-cuda"), not(target_os = "macos")))]
 #[path = "native_vulkan.rs"]
 mod native;
+pub mod kernel_cache;
 pub mod log;
 pub mod model;
 pub mod program;
+pub mod stream;
 mod scheme;
 
 pub use dtype::DType;
 pub use error::{Error, Result};
 pub use model::{
-    AdapterFormat, Device, GraphInfo, Inference, LoadOptions, Model, NodeInfo, RawInput, RunOptions, RunOutput, StepStats, TrainOptions, Trainer, Value,
+    AdapterFormat, Device, GraphInfo, Inference, LoadOptions, Model, ModelState, NodeInfo, PipelineOptions, RawInput, RunOptions, RunOutput, StepStats, TrainOptions, Trainer, Value,
 };
 pub use program::Program;
+pub use stream::{Callbacks, Chunk, Emit, SampleRequest, StreamReader, StreamSender, input_stream};
 pub use scheme::{EntrySpec, InputSpec, PipelineSpec, RawKind, RawSpec, StateSpec, Taps};
 
 /// Evaluates `program` without weights and returns its entries (default

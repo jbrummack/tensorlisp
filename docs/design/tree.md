@@ -634,3 +634,33 @@ contiguous 8x8 blocks the way ggml lays them out (identical time), every tile an
 128 x 128, 16-simdgroup threadgroups, a second shared buffer so one barrier per k step suffices. Occupancy is already
 ggml's (31 %). What differs must be in how the compiler schedules the generated loop, which the PC samples of the
 trace (`gpu-shader-profiler-sample`) could show per instruction; that has not been looked at.
+
+
+## Flash attention on tensor cores (`k:flash-attn-cm`)
+
+`k:flash-attn` (one thread group per query, scalar, scores in shared memory) is fine for decode and short
+sequences but takes 2.1 s per layer at 4096 queries x 4096 keys, 16 heads of 72 (T5Gemma 2's vision tower: 57 s of the
+58 s first caption). `k:flash-attn-cm` is the many-query form on cooperative matrices (Apple GPUs; other devices with
+cooperative matrices can try it with `TL_TREE_FACM=1`, it has not been run there; `TL_TREE_NOFACM=1` keeps the scalar
+kernel), used when there are at least 16 queries and head sizes are at most 256:
+
+- A workgroup is `nsg` subgroups (8 for head size 72), each owning 16 queries of one head; its Q fragments stay in
+  registers, K and V come in blocks of 16 keys staged once in shared memory for the whole workgroup.
+- Fragments cannot be scaled elementwise, so instead of the usual online rescaling of the output the kernel makes two
+  passes over the keys. Pass one computes, per query row, the maximum and the sum of exponentials (online, in
+  registers) from Q K^T tiles written to shared memory; pass two recomputes the scores, writes the final probabilities
+  exp(s - max) / sum as f16 and accumulates P V into f32 fragments with no rescaling. That is one more Q K^T product
+  than a one-pass kernel (1.5x the multiplies) for no accumulator rescale.
+- Head sizes are compile-time and padded to 16 with zeros; edges (queries past the count, keys past `kv`, masked keys,
+  fully masked rows) are handled in the staging, so any `nq`, `kv` (the scalar kernel stops at 4096) and grouped K/V
+  heads work. The mask and soft cap are applied to the scores in f32.
+
+Measured on the M1 Pro, 4096 queries x 4096 keys x 16 heads x 72: 129 ms per layer, 16x the scalar kernel
+(vision tower 57.8 s -> 5.1 s, 3.5 s of it attention). Tried and not kept: more or fewer subgroups per workgroup
+(8 is best: 4 gives 155 ms, 2 gives 299 ms, 1 gives 578 ms: the kernel is latency bound and wants occupancy),
+32-key blocks (slower: more registers and shared memory), K stored transposed in shared memory so its fragments
+load without a transpose (137 ms), and one lane per row for the softmax statistics with no exchange between lanes
+(175 ms: the elementwise work is a real part of the time, so it is better spread over all 32 lanes).
+Tests: `many_query_attention` and `attention_with_large_head_sizes` in `tests/native.rs` (head sizes 64 to 256,
+including ones that are not multiples of 16, query counts around the tile sizes, 5000 keys, masks that leave
+rows and blocks empty, soft cap) against the CPU backend; errors are at the f16 rounding level (< 1e-3).

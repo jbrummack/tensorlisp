@@ -36,6 +36,8 @@ pub enum RawInput {
     Image(image::DynamicImage),
     Audio(autopro::audio::Audio),
     Array(ArrayD<f32>),
+    /// An input stream, see [`crate::stream`].
+    Stream(crate::stream::StreamReader),
 }
 
 impl RawInput {
@@ -45,6 +47,7 @@ impl RawInput {
             RawInput::Image(_) => RawKind::Image,
             RawInput::Audio(_) => RawKind::Audio,
             RawInput::Array(_) => RawKind::Array,
+            RawInput::Stream(_) => RawKind::Stream,
         }
     }
 }
@@ -88,6 +91,7 @@ pub struct Shared {
     /// Default entry first.
     entries: Vec<EntrySpec>,
     pipelines: Vec<PipelineSpec>,
+    states: Vec<StateSpec>,
     program_id: i64,
     inner: Mutex<Inner>,
 }
@@ -114,6 +118,7 @@ pub(crate) fn run_program_entry(
     program: i64,
     entry: &str,
     inputs: Vec<(String, ArrayD<f32>)>,
+    state: Option<ModelState>,
 ) -> Result<Vec<(String, ArrayD<f32>)>> {
     let shared = MODELS
         .lock()
@@ -136,7 +141,19 @@ pub(crate) fn run_program_entry(
         })
         .collect();
     let views: Vec<(&str, ArrayViewD<f32>)> = inputs.iter().map(|(n, a)| (n.as_str(), a.view())).collect();
-    Ok(model.run_entry(entry, &views, &RunOptions::default())?.outputs)
+    let options = RunOptions { state, ..RunOptions::default() };
+    Ok(model.run_entry(entry, &views, &options)?.outputs)
+}
+
+/// Optional parts of [`Model::pipeline_with`].
+#[derive(Default)]
+pub struct PipelineOptions {
+    /// The session the pipeline's entries run in.
+    pub state: Option<ModelState>,
+    /// Where `(emit 'name value)` goes.
+    pub emit: Option<crate::stream::Emit>,
+    /// What `(client-call ...)` and `(client-sample ...)` talk to.
+    pub callbacks: Option<std::sync::Arc<dyn crate::stream::Callbacks>>,
 }
 
 /// Options for [`Model::run_with`].
@@ -144,6 +161,8 @@ pub(crate) fn run_program_entry(
 pub struct RunOptions {
     /// Intermediate tensors marked with `(tap name t)` to read back.
     pub taps: Taps,
+    /// The session to run in (default: the model's own state).
+    pub state: Option<ModelState>,
 }
 
 /// Results of a postprocess or pipeline: arrays, or text (e.g. generated).
@@ -255,6 +274,97 @@ struct EntryGraph {
     graph: Option<(GraphKey, Graph)>,
 }
 
+/// Separately allocated `(define-state ...)` tensors (the ggml path).
+struct StateSet {
+    ctx: *mut ggml_context,
+    buffer: ggml_backend_buffer_t,
+    tensors: Vec<*mut ggml_tensor>,
+}
+
+impl StateSet {
+    fn clear(&self) {
+        unsafe { ggml_backend_buffer_clear(self.buffer, 0) };
+    }
+
+    fn free(self) {
+        unsafe {
+            ggml_backend_buffer_free(self.buffer);
+            ggml_free(self.ctx);
+        }
+    }
+
+    /// Copies every tensor of `from` over the matching one of `to`.
+    fn copy(from: &[*mut ggml_tensor], to: &[*mut ggml_tensor]) {
+        for (&src, &dst) in from.iter().zip(to) {
+            unsafe { ggml_backend_tensor_copy(src, dst) };
+        }
+    }
+}
+
+enum SessionData {
+    Ggml(StateSet),
+    #[cfg(native_device)]
+    Native(crate::native::StateBlock),
+}
+
+/// A session: its own copy of the model's `(define-state ...)` tensors (KV caches and the like),
+/// made with [`Model::new_state`] and used by passing it in [`RunOptions::state`] or to
+/// [`Model::pipeline_in`]. Runs without one use the model's own (default) state, which
+/// [`Model::reset_state`] resets. Dropping the last clone frees the session's memory.
+///
+/// On the native device each session is its own block and switching is free. On ggml's backends
+/// the graphs are bound to one set of state tensors, so running a different session than the last
+/// one copies the previous session's state out and this one's in (state-sized, on the device).
+/// Runs of one model are serialized either way.
+#[derive(Clone)]
+pub struct ModelState {
+    handle: Arc<StateHandle>,
+}
+
+struct StateHandle {
+    id: u64,
+    model: Weak<Shared>,
+    program_id: i64,
+}
+
+impl Drop for StateHandle {
+    fn drop(&mut self) {
+        if let Some(shared) = self.model.upgrade()
+            && let Ok(mut inner) = shared.inner.lock()
+        {
+            inner.drop_session(self.id);
+        }
+    }
+}
+
+impl std::fmt::Debug for ModelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ModelState(#{})", self.handle.id)
+    }
+}
+
+impl ModelState {
+    /// Zeroes this session's state.
+    pub fn reset(&self) -> Result<()> {
+        let shared = self.handle.model.upgrade().ok_or_else(|| Error::Input("the model of this state is gone".into()))?;
+        shared.inner.lock().unwrap().reset_session(self.handle.id)
+    }
+
+    /// A new session that starts with a copy of this one's state (prefix caching, branching).
+    pub fn fork(&self) -> Result<ModelState> {
+        let shared = self.handle.model.upgrade().ok_or_else(|| Error::Input("the model of this state is gone".into()))?;
+        let id = shared.inner.lock().unwrap().fork_session(self.handle.id)?;
+        Ok(ModelState { handle: Arc::new(StateHandle { id, model: self.handle.model.clone(), program_id: self.handle.program_id }) })
+    }
+
+    fn check(&self, model: &Shared) -> Result<u64> {
+        if self.handle.program_id != model.program_id {
+            return Err(Error::Input("this state belongs to another model".into()));
+        }
+        Ok(self.handle.id)
+    }
+}
+
 struct Inner {
     program: LoadedProgram,
     /// Holds the weight tensors' metadata; ManuallyDrop so a poisoned model can leak it.
@@ -267,6 +377,15 @@ struct Inner {
     state_buffer: ggml_backend_buffer_t,
     /// Per entry, created on first use.
     graphs: HashMap<String, EntryGraph>,
+    /// Other sessions' state ([`ModelState`]), by id.
+    sessions: HashMap<u64, SessionData>,
+    next_session: u64,
+    /// Whose data is in the live state tensors on the ggml path: `None` is the default session,
+    /// else a session id. The graphs only ever see the live tensors, so running another session
+    /// first copies the resident one out and the wanted one in.
+    resident: Option<u64>,
+    /// The default session's data while a [`ModelState`] is resident.
+    default_backing: Option<StateSet>,
     /// The native device (Metal or CUDA) and its compiled graphs, per entry (`Device::Native`).
     #[cfg(native_device)]
     native: Option<crate::native::Native>,
@@ -279,6 +398,19 @@ struct Inner {
 
 // ggml objects aren't tied to a thread; the Mutex serializes all use.
 unsafe impl Send for Inner {}
+
+fn tensors_of(ctx: *mut ggml_context) -> Vec<*mut ggml_tensor> {
+    let mut out = Vec::new();
+    if ctx.is_null() {
+        return out;
+    }
+    let mut t = unsafe { ggml_get_first_tensor(ctx) };
+    while !t.is_null() {
+        out.push(t);
+        t = unsafe { ggml_get_next_tensor(ctx, t) };
+    }
+    out
+}
 
 fn init_gpu() -> Option<ggml_backend_t> {
     [ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_GPU, ggml_backend_dev_type::GGML_BACKEND_DEVICE_TYPE_IGPU]
@@ -348,6 +480,10 @@ impl Model {
             states: null_mut(),
             state_buffer: null_mut(),
             graphs: HashMap::new(),
+            sessions: HashMap::new(),
+            next_session: 1,
+            resident: None,
+            default_backing: None,
             #[cfg(native_device)]
             native: None,
             #[cfg(native_device)]
@@ -373,6 +509,7 @@ impl Model {
         let shared = Arc::new(Shared {
             entries: inner.program.entries.clone(),
             pipelines: inner.program.pipelines.clone(),
+            states: inner.program.states.clone(),
             program_id: inner.program.id(),
             inner: Mutex::new(inner),
         });
@@ -395,6 +532,11 @@ impl Model {
         &self.pipelines
     }
 
+    /// The program's `(define-state ...)` tensors (each session has its own copy).
+    pub fn states(&self) -> &[StateSpec] {
+        &self.states
+    }
+
     /// Zeroes every `(define-state ...)` tensor, as after loading.
     pub fn reset_state(&self) {
         let inner = self.inner.lock().unwrap();
@@ -402,9 +544,19 @@ impl Model {
         if let Some(native) = &inner.native {
             native.reset_state();
         }
-        if !inner.state_buffer.is_null() {
-            unsafe { ggml_backend_buffer_clear(inner.state_buffer, 0) };
+        // While another session is resident the default's data is in its backing.
+        match (&inner.default_backing, inner.resident) {
+            (Some(backing), Some(_)) => backing.clear(),
+            _ if !inner.state_buffer.is_null() => unsafe { ggml_backend_buffer_clear(inner.state_buffer, 0) },
+            _ => {}
         }
+    }
+
+    /// A new session: its own zeroed copy of the `(define-state ...)` tensors. Pass it as
+    /// [`RunOptions::state`] or to [`Model::pipeline_in`].
+    pub fn new_state(&self) -> Result<ModelState> {
+        let id = self.inner.lock().unwrap().new_session()?;
+        Ok(ModelState { handle: Arc::new(StateHandle { id, model: Arc::downgrade(&self.shared), program_id: self.program_id }) })
     }
 
     /// An entry by name, or the default one.
@@ -420,13 +572,61 @@ impl Model {
 
     /// Runs pipeline `name` on one example of its raw inputs.
     pub fn pipeline(&self, name: &str, example: Vec<(String, RawInput)>) -> Result<Vec<(String, Value)>> {
+        self.pipeline_streaming(name, example, None)
+    }
+
+    /// Like [`Model::pipeline`], with a way for the pipeline to `(emit 'name value)` while it runs.
+    /// Input streams are passed as [`RawInput::Stream`]. The pipeline occupies the Scheme thread
+    /// until it returns, including while it waits for a chunk.
+    pub fn pipeline_streaming(
+        &self,
+        name: &str,
+        example: Vec<(String, RawInput)>,
+        emit: Option<crate::stream::Emit>,
+    ) -> Result<Vec<(String, Value)>> {
+        self.pipeline_in(None, name, example, emit)
+    }
+
+    /// Runs pipeline `name` with everything optional in `options`.
+    pub fn pipeline_with(
+        &self,
+        name: &str,
+        example: Vec<(String, RawInput)>,
+        options: PipelineOptions,
+    ) -> Result<Vec<(String, Value)>> {
+        self.pipeline_run(options.state.as_ref(), name, example, options.emit, options.callbacks)
+    }
+
+    /// Like [`Model::pipeline_streaming`], with every entry the pipeline runs using `state`
+    /// (a session from [`Model::new_state`]) instead of the model's own state.
+    pub fn pipeline_in(
+        &self,
+        state: Option<&ModelState>,
+        name: &str,
+        example: Vec<(String, RawInput)>,
+        emit: Option<crate::stream::Emit>,
+    ) -> Result<Vec<(String, Value)>> {
+        self.pipeline_run(state, name, example, emit, None)
+    }
+
+    fn pipeline_run(
+        &self,
+        state: Option<&ModelState>,
+        name: &str,
+        example: Vec<(String, RawInput)>,
+        emit: Option<crate::stream::Emit>,
+        callbacks: Option<std::sync::Arc<dyn crate::stream::Callbacks>>,
+    ) -> Result<Vec<(String, Value)>> {
+        if let Some(state) = state {
+            state.check(self)?;
+        }
         let spec = self.pipelines.iter().find(|p| p.name == name).ok_or_else(|| {
             let names: Vec<&str> = self.pipelines.iter().map(|p| p.name.as_str()).collect();
             Error::Input(format!("no pipeline {name:?}; pipelines: {}", names.join(", ")))
         })?;
         let values = raw_values(&spec.raw_inputs, example)?;
         // Not under the lock: the pipeline runs entries, which take it.
-        let results = LoadedProgram::run_pipeline(self.program_id, name, values.into_iter().map(|(_, v)| v).collect())?;
+        let results = LoadedProgram::run_pipeline(self.program_id, name, values.into_iter().map(|(_, v)| v).collect(), emit, state.cloned(), callbacks)?;
         Ok(results.into_iter().map(|(n, v)| (n, v.into())).collect())
     }
 
@@ -598,6 +798,7 @@ impl Model {
         let ordered = order_inputs(spec, inputs, |a| a.shape())?;
         let key: GraphKey = (ordered.iter().map(|a| a.shape().to_vec()).collect(), options.taps.clone());
 
+        let state = options.state.as_ref().map(|s| s.check(self)).transpose()?;
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
         if let Some(reason) = &inner.poisoned {
@@ -607,8 +808,9 @@ impl Model {
         }
         #[cfg(native_device)]
         if inner.native.is_some() {
-            return inner.run_native(name, spec, &ordered, key);
+            return inner.run_native(name, spec, &ordered, key, state);
         }
+        inner.activate(state)?;
         if inner.graphs.get(name).and_then(|g| g.graph.as_ref()).is_none_or(|(k, _)| *k != key) {
             inner.rebuild_graph(name, key)?;
         }
@@ -712,6 +914,7 @@ fn raw_values(specs: &[RawSpec], example: Vec<(String, RawInput)>) -> Result<Vec
                 RawInput::Image(i) => RawValue::Image(i.to_rgb8()),
                 RawInput::Audio(a) => RawValue::Audio(a),
                 RawInput::Array(a) => RawValue::Array(a),
+                RawInput::Stream(r) => RawValue::Stream(r),
             };
             Ok((spec.name.clone(), value))
         })
@@ -835,7 +1038,14 @@ fn check_shape(spec: &InputSpec, shape: &[usize]) -> Result<()> {
 impl Inner {
     /// Runs entry `name` on the native device: compiles its graph for these shapes if needed, then replays it.
     #[cfg(native_device)]
-    fn run_native(&mut self, name: &str, spec: &EntrySpec, ordered: &[&ArrayViewD<f32>], key: GraphKey) -> Result<RunOutput> {
+    fn run_native(
+        &mut self,
+        name: &str,
+        spec: &EntrySpec,
+        ordered: &[&ArrayViewD<f32>],
+        key: GraphKey,
+        state: Option<u64>,
+    ) -> Result<RunOutput> {
         let cached = self.native_graphs.get(name).and_then(|v| v.iter().position(|(k, _)| *k == key));
         let slot = match cached {
             Some(slot) => slot,
@@ -871,27 +1081,40 @@ impl Inner {
                 program.set_input(i, bytes)?;
             }
         }
-        program.run(native)?;
+        let block = match state {
+            None => None,
+            Some(id) => match self.sessions.get(&id) {
+                Some(SessionData::Native(block)) => Some(block),
+                _ => return Err(Error::Input("this state no longer exists".into())),
+            },
+        };
+        program.run(native, block)?;
         Ok(RunOutput { outputs: program.outputs()?, taps: program.taps()? })
     }
 
-    /// Creates the program's state tensors on the primary device, zeroed.
-    fn alloc_states(&mut self) -> Result<()> {
+    /// A context holding the program's (unallocated) state tensors.
+    fn state_context(&self) -> Result<*mut ggml_context> {
         let specs: Vec<StateSpec> = self.program.states.clone();
-        if specs.is_empty() {
-            return Ok(());
-        }
-        let mem_size = unsafe { ggml_tensor_overhead() } * specs.len();
-        self.states = unsafe { ggml_init(ggml_init_params { mem_size, mem_buffer: null_mut(), no_alloc: true }) };
-        if self.states.is_null() {
+        let mem_size = unsafe { ggml_tensor_overhead() } * specs.len().max(1);
+        let ctx = unsafe { ggml_init(ggml_init_params { mem_size, mem_buffer: null_mut(), no_alloc: true }) };
+        if ctx.is_null() {
             return Err(Error::Backend("failed to create the state context".into()));
         }
         for spec in &specs {
             let ty = if spec.dtype == "f16" { ggml_type::GGML_TYPE_F16 } else { ggml_type::GGML_TYPE_F32 };
-            let t = unsafe { ggml_new_tensor(self.states, ty, spec.dims.len() as i32, spec.dims.as_ptr()) };
+            let t = unsafe { ggml_new_tensor(ctx, ty, spec.dims.len() as i32, spec.dims.as_ptr()) };
             let name = std::ffi::CString::new(spec.name.as_str()).map_err(|_| Error::Program("bad state name".into()))?;
             unsafe { ggml_set_name(t, name.as_ptr()) };
         }
+        Ok(ctx)
+    }
+
+    /// Creates the program's state tensors on the primary device, zeroed.
+    fn alloc_states(&mut self) -> Result<()> {
+        if self.program.states.is_empty() {
+            return Ok(());
+        }
+        self.states = self.state_context()?;
         #[cfg(native_device)]
         if let Some(native) = &mut self.native {
             return native.alloc_states(self.states);
@@ -902,6 +1125,156 @@ impl Inner {
         }
         unsafe { ggml_backend_buffer_clear(self.state_buffer, 0) };
         self.init_params(0)
+    }
+
+    fn live_tensors(&self) -> Vec<*mut ggml_tensor> {
+        tensors_of(self.states)
+    }
+
+    /// Another zeroed set of state tensors on the primary device (the ggml path).
+    fn new_state_set(&self) -> Result<StateSet> {
+        let ctx = self.state_context()?;
+        let buffer = match guard::alloc_ctx_tensors(ctx, self.backends[0]) {
+            Ok(b) if !b.is_null() => b,
+            other => {
+                unsafe { ggml_free(ctx) };
+                return Err(other.err().unwrap_or_else(|| Error::Backend("failed to allocate a state buffer".into())));
+            }
+        };
+        unsafe { ggml_backend_buffer_clear(buffer, 0) };
+        Ok(StateSet { ctx, buffer, tensors: tensors_of(ctx) })
+    }
+
+    fn new_session(&mut self) -> Result<u64> {
+        let data = if self.program.states.is_empty() {
+            SessionData::Ggml(StateSet { ctx: null_mut(), buffer: null_mut(), tensors: Vec::new() })
+        } else {
+            #[cfg(native_device)]
+            if let Some(native) = &self.native {
+                let block = native.new_state_block()?;
+                let id = self.next_session;
+                self.next_session += 1;
+                self.sessions.insert(id, SessionData::Native(block));
+                return Ok(id);
+            }
+            SessionData::Ggml(self.new_state_set()?)
+        };
+        let id = self.next_session;
+        self.next_session += 1;
+        self.sessions.insert(id, data);
+        Ok(id)
+    }
+
+    /// Makes `want` (a session id, or the default) the one the live state tensors hold.
+    fn activate(&mut self, want: Option<u64>) -> Result<()> {
+        if self.states.is_null() || self.resident == want {
+            return Ok(());
+        }
+        let live = self.live_tensors();
+        // Save the resident session's data.
+        match self.resident {
+            None => {
+                if self.default_backing.is_none() {
+                    self.default_backing = Some(self.new_state_set()?);
+                }
+                StateSet::copy(&live, &self.default_backing.as_ref().unwrap().tensors);
+            }
+            Some(id) => {
+                if let Some(SessionData::Ggml(set)) = self.sessions.get(&id) {
+                    StateSet::copy(&live, &set.tensors);
+                }
+            }
+        }
+        // Load the wanted one.
+        match want {
+            None => {
+                let backing = self.default_backing.as_ref().expect("the default session was saved when it was displaced");
+                StateSet::copy(&backing.tensors, &live);
+            }
+            Some(id) => match self.sessions.get(&id) {
+                Some(SessionData::Ggml(set)) => StateSet::copy(&set.tensors, &live),
+                _ => {
+                    // Keep the bookkeeping right: the default's data is still saved in its backing.
+                    self.resident = None;
+                    StateSet::copy(&self.default_backing.as_ref().unwrap().tensors, &live);
+                    return Err(Error::Input("this state no longer exists".into()));
+                }
+            },
+        }
+        self.resident = want;
+        Ok(())
+    }
+
+    fn reset_session(&mut self, id: u64) -> Result<()> {
+        if self.resident == Some(id) {
+            if !self.state_buffer.is_null() {
+                unsafe { ggml_backend_buffer_clear(self.state_buffer, 0) };
+            }
+            return Ok(());
+        }
+        #[cfg(native_device)]
+        if let Some(native) = &self.native {
+            if let Some(SessionData::Native(block)) = self.sessions.get_mut(&id) {
+                return native.reset_block(block);
+            }
+        }
+        match self.sessions.get(&id) {
+            Some(SessionData::Ggml(set)) => {
+                if !set.buffer.is_null() {
+                    set.clear();
+                }
+                Ok(())
+            }
+            _ => Err(Error::Input("this state no longer exists".into())),
+        }
+    }
+
+    fn fork_session(&mut self, from: u64) -> Result<u64> {
+        let data = match self.sessions.get(&from) {
+            #[cfg(native_device)]
+            Some(SessionData::Native(block)) => {
+                let native = self.native.as_ref().ok_or_else(|| Error::Input("no native device".into()))?;
+                SessionData::Native(native.fork_block(block)?)
+            }
+            Some(SessionData::Ggml(set)) if set.buffer.is_null() => {
+                SessionData::Ggml(StateSet { ctx: null_mut(), buffer: null_mut(), tensors: Vec::new() })
+            }
+            Some(SessionData::Ggml(set)) => {
+                let copy = self.new_state_set()?;
+                // The resident session's current data is in the live tensors.
+                let live;
+                let source = if self.resident == Some(from) {
+                    live = self.live_tensors();
+                    &live
+                } else {
+                    &set.tensors
+                };
+                StateSet::copy(source, &copy.tensors);
+                SessionData::Ggml(copy)
+            }
+            None => return Err(Error::Input("this state no longer exists".into())),
+        };
+        let id = self.next_session;
+        self.next_session += 1;
+        self.sessions.insert(id, data);
+        Ok(id)
+    }
+
+    fn drop_session(&mut self, id: u64) {
+        if self.resident == Some(id) {
+            // Its data dies with it; the default session takes the live tensors back.
+            if let Some(backing) = &self.default_backing {
+                let live = self.live_tensors();
+                StateSet::copy(&backing.tensors, &live);
+            }
+            self.resident = None;
+        }
+        if let Some(SessionData::Ggml(set)) = self.sessions.remove(&id)
+            && !set.buffer.is_null()
+            && self.poisoned.is_none()
+        {
+            set.free();
+        }
     }
 
     /// Replaces entry's current graph with a newly built and allocated one.
@@ -1008,6 +1381,16 @@ impl Drop for Inner {
             }
             if !self.weights.is_null() {
                 ggml_backend_buffer_free(self.weights);
+            }
+            if let Some(backing) = self.default_backing.take() {
+                backing.free();
+            }
+            for (_, data) in self.sessions.drain() {
+                if let SessionData::Ggml(set) = data
+                    && !set.buffer.is_null()
+                {
+                    set.free();
+                }
             }
             if !self.state_buffer.is_null() {
                 ggml_backend_buffer_free(self.state_buffer);

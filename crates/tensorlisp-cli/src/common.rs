@@ -113,6 +113,18 @@ pub fn read_raw_examples_for(specs: &[tensorlisp::RawSpec], args: &[String]) -> 
             (RawKind::Image, Some(p)) => RawInput::Image(tensorlisp::autopro::image::decode(&read(p)?)?),
             (RawKind::Audio, Some(p)) => RawInput::Audio(tensorlisp::autopro::audio::Audio::from_wav_bytes(&read(p)?)?),
             (RawKind::Array, Some(p)) => RawInput::Array(npy::read(p.as_ref())?),
+            // A stream gets the file as its only chunk, then ends.
+            (RawKind::Stream, Some(p)) => {
+                use tensorlisp::Chunk;
+                let chunk = match std::path::Path::new(p).extension().and_then(|e| e.to_str()) {
+                    Some("wav") => Chunk::Audio(tensorlisp::autopro::audio::Audio::from_wav_bytes(&read(p)?)?),
+                    Some("npy") => Chunk::Array(npy::read(p.as_ref())?),
+                    _ => Chunk::Text(String::from_utf8(read(p)?).context("stream file is not a .wav, a .npy or UTF-8 text")?),
+                };
+                let (tx, rx) = tensorlisp::input_stream(|| {});
+                tx.send(chunk).expect("the receiver is alive");
+                RawInput::Stream(rx)
+            }
             (kind, None) => bail!("raw input {name:?} is {kind:?}; pass a file as {name}=@path"),
         };
         columns.iter_mut().find(|(n, _)| n == name).unwrap().1.push(input);

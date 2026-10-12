@@ -7,7 +7,7 @@
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
   (export k:im2col k:pool2d k:conv-dw k:pad k:pad-reflect k:upscale k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
-          k:matmul k:matmul-cm k:matmul-q8mma k:matmul-q8mma-w k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-mma k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
+          k:matmul k:matmul-cm k:matmul-q8mma k:matmul-q8mma-w k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-mma k:flash-attn-cm k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
   (define wg 256)
@@ -1445,6 +1445,158 @@
                                     (range 0 8))
                              (barrier)))
                         js))))))))
+
+;; Flash attention for many queries on tensor cores (cooperative matrices; f16 inputs to the
+  ;; products, f32 accumulation). A workgroup is `nsg` subgroups, each owning 16 queries of one head, and
+  ;; the key/value blocks of `bkv` keys are staged once in shared memory for all of them.
+  ;; Cooperative matrices cannot be scaled elementwise, so instead of rescaling an output accumulator
+  ;; when the running maximum grows this makes two passes over the keys: the first computes each row's
+  ;; maximum and sum of exponentials (online, in registers), the second recomputes the scores,
+  ;; turns them into the final probabilities exp(s - max) / sum (f16, in shared memory) and
+  ;; accumulates P * V directly. That costs one more Q K^T product than the one-pass form and
+  ;; needs no accumulator rescaling.
+  ;; The head sizes are compile-time. Same buffers and push words as k:flash-attn; grid:
+  ;; x = query tile (16 * nsg queries), y = head, z = batch.
+  (define (k:flash-attn-cm ktype vtype mask? softcap? hsk-c hsv-c bkv nsg)
+    (let* ([hk (* 16 (div (+ hsk-c 15) 16))] [hv (* 16 (div (+ hsv-c 15) 16))]
+           [nt (* 32 nsg)] [ldk (+ hk 8)] [ldv (+ hv 8)] [lds (+ bkv 8)]
+           [nts (div bkv 16)] [ts (range 0 nts)] [kks (range 0 (div hk 16))] [js (range 0 (div hv 16))]
+           [half (div bkv 2)])
+      (define (sacc t) (name 'sacc_ t))
+      (define (oacc j) (name 'oacc_ j))
+      (define (qf kk) (name 'qf_ kk))
+      ;; the keys (or values) k0 .. k0 + bkv of a head into the shared tile, f16, zero past the sizes
+      (define (fill tile ld dim actual type buf base stride)
+        `(for (i 0 ,(div (* bkv dim) nt))
+           (let ([idx (+ tid (* i ,nt))])
+             (let ([key (/ idx ,dim)] [dd (rem idx ,dim)])
+               (store ,tile (+ (* key ,ld) dd)
+                      (f16 (guard (and (< (+ k0 key) kv) (< dd ,actual))
+                                  ,(load-f32 type buf `(+ ,base (* (+ k0 key) ,stride) dd))
+                                  0.0)))))))
+      ;; sacc_t = Q K^T for the keys of the staged block, stored to the score tile
+      (define (scores)
+        (append
+          (map (lambda (t)
+                 `(begin
+                    (cm-zero ,(sacc t))
+                    ,@(map (lambda (kk)
+                             `(begin
+                                (cm-load kf ks (+ ,(* t 16 ldk) ,(* kk 16)) ,ldk col)
+                                (cm-muladd ,(sacc t) ,(qf kk) kf ,(sacc t))))
+                           kks)
+                    (cm-store ,(sacc t) ss (+ sbase ,(* t 16)) ,lds row)))
+               ts)
+          '((barrier))))
+      ;; the scaled, capped, masked score of column j of this lane's row, into `sc`
+      (define (score-of j)
+        `((var sc f32 -inf.0)
+          (when (< (+ k0 ,j) kv)
+            (set! sc (* (load ss (+ srow ,j)) scale))
+            ,@(if softcap? '((set! sc (* cap (tanh (/ sc cap))))) '())
+            ,@(if mask?
+                  `((let ([mval (guard (< qrow nq) (half->f32 (load mk (+ mbase k0 ,j))) 0.0)])
+                      (set! sc (select (> mval -1.0e30) (+ sc mval) -inf.0))))
+                  '()))))
+      `(kernel ,(name 'flash_attn_cm_ ktype '_ vtype (if mask? 'm "") (if softcap? 'c "") '_ hsk-c 'x hsv-c 'x bkv 'x nsg)
+         (offsets prefix) (workgroup ,nt)
+         (buffers (q ro f32) (k ro ,(elem-ty ktype)) (v ro ,(elem-ty vtype)) ,@(if mask? '((mk ro u16)) '()) (d wo f32))
+         (push ,@(u32s 'nq 'nh 'hsk 'hsv 'kv 'gqa 'q1 'q2 'q3 'k1 'k2 'k3 'v1 'v2 'v3 'd1 'd2 'd3 'm1 'm2 'm3 'mne2 'mne3)
+               (scale f32) (cap f32))
+         (shared (ks f16 ,(* bkv ldk)) (vs f16 ,(* bkv ldv))
+                 (ss f32 ,(* nsg 16 lds)) (ps f16 ,(* nsg 16 lds)) (red f32 ,(* nsg 64)))
+         (let ([tid (local-id 0)] [sg (/ (local-id 0) 32)] [l (rem (local-id 0) 32)]
+               [h (group-id 1)] [bi (group-id 2)])
+           (let ([r (rem l 16)] [part (/ l 16)] [kvh (/ h gqa)]
+                 [q0 (* (+ (* (group-id 0) ,nsg) sg) 16)])
+             (let ([kbase (+ (* kvh k2) (* bi k3))]
+                   [vbase (+ (* kvh v2) (* bi v3))]
+                   [sbase (* sg ,(* 16 lds))]
+                   [srow (+ (* sg ,(* 16 lds)) (* r ,lds))]
+                   [rbase (* sg 64)]
+                   [qrow (+ q0 r)]
+                   [mbase (+ (* (+ q0 r) m1) (* (rem h mne2) m2) (* (rem bi mne3) m3))])
+               ,@(map (lambda (t) `(cmat ,(sacc t) c f32)) ts)
+               ,@(map (lambda (j) `(cmat ,(oacc j) c f32)) js)
+               ,@(map (lambda (kk) `(cmat ,(qf kk) a f16)) kks)
+               (cmat kf b f16) (cmat pf a f16) (cmat vf b f16)
+               ;; this subgroup's 16 queries as f16 fragments (kept in registers), 16 columns at a time
+               ;; through its score staging area; zero past the head size and the query count
+               ,@(map (lambda (kk)
+                        `(begin
+                           (for (e 0 8)
+                             (let ([idx (+ l (* e 32))])
+                               (let ([rr (/ idx 16)] [cc (rem idx 16)])
+                                 (store ps (+ sbase (* rr ,lds) cc)
+                                        (f16 (guard (and (< (+ q0 rr) nq) (< (+ ,(* kk 16) cc) ,hsk-c))
+                                                    (load q (+ (* (+ q0 rr) q1) (* h q2) (* bi q3) ,(* kk 16) cc))
+                                                    0.0))))))
+                           (barrier)
+                           (cm-load ,(qf kk) ps sbase ,lds row)
+                           (barrier)))
+                      kks)
+               ;; pass one: the maximum m and the sum of exp(s - m) of this lane's row
+               (var m f32 -inf.0)
+               (var lsum f32 0.0)
+               (for (k0 0 kv ,bkv)
+                 (barrier)
+                 ,(fill 'ks ldk hk hsk-c ktype 'k 'kbase 'k1)
+                 (barrier)
+                 ,@(scores)
+                 (var bm f32 -inf.0)
+                 (for (c 0 ,half)
+                   (let ([j (+ (* part ,half) c)])
+                     ,@(score-of 'j)
+                     (store ss (+ srow j) sc)
+                     (set! bm (max bm sc))))
+                 (store red (+ rbase (* part 16) r) bm)
+                 (barrier)
+                 (let ([mnew (max m (max bm (load red (+ rbase (* (- 1 part) 16) r))))])
+                   (let ([fac (select (> mnew -1.0e38) (exp (- m mnew)) 0.0)])
+                     (var psum f32 0.0)
+                     (for (c 0 ,half)
+                       (let ([j (+ (* part ,half) c)])
+                         (set! psum (+ psum (select (> mnew -1.0e38) (exp (- (load ss (+ srow j)) mnew)) 0.0)))))
+                     (store red (+ rbase 32 (* part 16) r) psum)
+                     (barrier)
+                     (set! lsum (+ (* lsum fac) psum (load red (+ rbase 32 (* (- 1 part) 16) r))))
+                     (set! m mnew))))
+               ;; pass two: probabilities exp(s - m) / sum, then O += P V
+               ,@(map (lambda (j) `(cm-zero ,(oacc j))) js)
+               (let ([linv (select (> lsum 0.0) (/ 1.0 lsum) 0.0)])
+                 (for (k0 0 kv ,bkv)
+                   (barrier)
+                   ,(fill 'ks ldk hk hsk-c ktype 'k 'kbase 'k1)
+                   ,(fill 'vs ldv hv hsv-c vtype 'v 'vbase 'v1)
+                   (barrier)
+                   ,@(scores)
+                   (for (c 0 ,half)
+                     (let ([j (+ (* part ,half) c)])
+                       ,@(score-of 'j)
+                       (store ps (+ srow j) (f16 (select (> m -1.0e38) (* (exp (- sc m)) linv) 0.0)))))
+                   (barrier)
+                   ,@(apply append
+                       (map (lambda (t)
+                              (map (lambda (j)
+                                     `(begin
+                                        (cm-load pf ps (+ sbase ,(* t 16)) ,lds row)
+                                        (cm-load vf vs (+ ,(* t 16 ldv) ,(* j 16)) ,ldv row)
+                                        (cm-muladd ,(oacc j) pf vf ,(oacc j))))
+                                   js))
+                            ts))))
+               ;; out: through shared memory, so edges and strides need no care
+               ,@(map (lambda (j)
+                        `(begin
+                           (barrier)
+                           (cm-store ,(oacc j) ss sbase ,lds row)
+                           (barrier)
+                           (for (e 0 8)
+                             (let ([idx (+ l (* e 32))])
+                               (let ([rr (/ idx 16)] [cc (rem idx 16)])
+                                 (let ([qi (+ q0 rr)] [dd (+ ,(* j 16) cc)])
+                                   (when (and (< qi nq) (< dd ,hsv-c))
+                                     (store d (+ (* h d1) (* qi d2) (* bi d3) dd) (load ss (+ sbase (* rr ,lds) cc))))))))))
+                      js)))))))
 
   ;; Split-KV flash attention for few queries (decode): one workgroup per (key chunk, head, query)
   ;; instead of one per (head, query), so that a long cache keeps the whole GPU busy. Pass one

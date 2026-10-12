@@ -35,6 +35,9 @@ use crate::{
 /// Weight buffers hold up to this many bytes (a tensor larger than that gets a buffer of its own).
 const WEIGHT_CHUNK: u64 = 1 << 30;
 
+/// One session's state tensors, laid out like the default session's.
+pub(crate) type StateBlock = Arc<Session<Vulkan>>;
+
 /// Weights, states and the executor of one model.
 pub(crate) struct Native {
     exec: Executor,
@@ -141,6 +144,21 @@ impl Native {
         }
     }
 
+    /// A zeroed block of state for another session.
+    pub fn new_state_block(&self) -> Result<StateBlock> {
+        self.exec.engine.new_session(&[self.state_bytes.max(4)]).map(Arc::new).map_err(backend_err)
+    }
+
+    /// A copy of a session's state.
+    pub fn fork_block(&self, block: &StateBlock) -> Result<StateBlock> {
+        self.exec.engine.fork_session(block).map(Arc::new).map_err(backend_err)
+    }
+
+    pub fn reset_block(&self, block: &mut StateBlock) -> Result<()> {
+        *block = self.new_state_block()?;
+        Ok(())
+    }
+
     pub fn device_name(&self) -> String {
         format!("native {}", self.exec.backend().name())
     }
@@ -166,6 +184,9 @@ impl NativeProgram {
             lower_graph(graph, inputs, outputs, taps, &native.weight_index, &native.state_index);
         let leaves = Leaves { weights: &native.weight_loc, states: &native.state_offsets };
         let program = native.exec.compile(ir, &leaves).map_err(backend_err)?;
+        if std::env::var_os("TL_NATIVE_TIME").is_some() {
+            eprintln!("kernel cache: {:?}", crate::kernel_cache::kernel_cache_stats());
+        }
         Ok(NativeProgram { program, outputs, taps })
     }
 
@@ -173,8 +194,8 @@ impl NativeProgram {
         self.program.set_input(i, data).map_err(backend_err)
     }
 
-    pub fn run(&self, native: &Native) -> Result<()> {
-        let session = native.session.lock().unwrap().clone();
+    pub fn run(&self, native: &Native, state: Option<&StateBlock>) -> Result<()> {
+        let session = state.cloned().or_else(|| native.session.lock().unwrap().clone());
         self.program.run(&native.model, session.as_ref()).map_err(backend_err)
     }
 

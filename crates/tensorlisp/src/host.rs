@@ -33,6 +33,31 @@ pub(crate) enum HostValue {
     Vocabulary(Arc<Vec<String>>),
     /// A `(run entry ...)` being assembled or finished.
     Run(Box<RunCall>),
+    /// An input stream of the running pipeline.
+    Stream(crate::stream::StreamReader),
+    /// Where the running pipeline's `emit` goes.
+    Emitter(crate::stream::Emit),
+    /// A `(client-call ...)` or `(client-sample ...)` being assembled or answered.
+    Callback(Box<CallbackCall>),
+}
+
+pub(crate) enum CallbackKind {
+    Call(String),
+    Sample { k: usize, full: bool },
+}
+
+pub(crate) struct CallbackCall {
+    kind: CallbackKind,
+    args: Vec<crate::stream::Chunk>,
+    logits: Option<ArrayD<f32>>,
+    history: Vec<i32>,
+    /// After the driver ran it: 0 failed (see `error`), 1 array, 2 audio, 3 image, 4 text, 5 nothing,
+    /// 6 token.
+    status: i64,
+    item: i64,
+    text: CString,
+    token: i64,
+    error: CString,
 }
 
 pub(crate) struct RunCall {
@@ -41,6 +66,10 @@ pub(crate) struct RunCall {
     inputs: Vec<(String, ArrayD<f32>)>,
     /// After exec: output names and their host ids.
     outputs: Vec<(CString, i64)>,
+    /// After exec: the error, if it failed.
+    error: CString,
+    /// Whether exec ran and succeeded.
+    ok: bool,
 }
 
 impl HostValue {
@@ -53,6 +82,9 @@ impl HostValue {
             HostValue::Tensor(_) => "tensor",
             HostValue::Vocabulary(_) => "vocabulary",
             HostValue::Run(_) => "run",
+            HostValue::Stream(_) => "stream",
+            HostValue::Emitter(_) => "emitter",
+            HostValue::Callback(_) => "callback",
         }
     }
 }
@@ -60,7 +92,15 @@ impl HostValue {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
     Model(i64),
-    Call,
+    /// Values of one preprocess, postprocess or pipeline call, by call id.
+    Call(u64),
+}
+
+/// A scope for a new call.
+pub(crate) fn new_call_scope() -> Scope {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    Scope::Call(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 struct Registry {
@@ -79,7 +119,7 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     let registry = guard.get_or_insert_with(|| Registry {
         next: 1,
         values: HashMap::new(),
-        scope: Scope::Call,
+        scope: Scope::Call(0),
         error: CString::default(),
         text: CString::default(),
     });
@@ -96,11 +136,16 @@ pub(crate) fn in_scope<R>(scope: Scope, f: impl FnOnce() -> R) -> R {
 
 pub(crate) fn insert(value: HostValue) -> i64 {
     with_registry(|r| {
-        let id = r.next;
-        r.next += 1;
-        r.values.insert(id, (r.scope, value));
-        id
+        let scope = r.scope;
+        insert_in(r, scope, value)
     })
+}
+
+fn insert_in(r: &mut Registry, scope: Scope, value: HostValue) -> i64 {
+    let id = r.next;
+    r.next += 1;
+    r.values.insert(id, (scope, value));
+    id
 }
 
 pub(crate) fn take_tensor(id: i64) -> Option<ArrayD<f32>> {
@@ -119,9 +164,9 @@ pub(crate) fn clone_tensor(id: i64) -> Option<ArrayD<f32>> {
     tensor(id).ok()
 }
 
-/// Frees every value created by preprocessing calls.
-pub(crate) fn clear_calls() {
-    with_registry(|r| r.values.retain(|_, (scope, _)| *scope != Scope::Call));
+/// Frees every value a call created.
+pub(crate) fn clear_scope(scope: Scope) {
+    with_registry(|r| r.values.retain(|_, (s, _)| *s != scope));
 }
 
 pub(crate) fn drop_model(model: i64) {
@@ -827,7 +872,14 @@ extern "C" fn tl_host_vocabulary_text(vocab: i64, ids: i64) -> *const c_char {
 extern "C" fn tl_host_run_begin(program: i64, entry: *const c_char) -> i64 {
     ffi(|| {
         let entry = text_arg(entry)?.to_string();
-        Ok(insert(HostValue::Run(Box::new(RunCall { program, entry, inputs: Vec::new(), outputs: Vec::new() }))))
+        Ok(insert(HostValue::Run(Box::new(RunCall {
+            program,
+            entry,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            error: CString::default(),
+            ok: false,
+        }))))
     })
 }
 
@@ -845,27 +897,53 @@ extern "C" fn tl_host_run_input(run: i64, name: *const c_char, array: i64) -> i6
     })
 }
 
-/// Runs the entry; returns the number of outputs + 1 (0 on error).
-extern "C" fn tl_host_run_exec(run: i64) -> i64 {
-    ffi(|| {
-        // Take the inputs out so the registry isn't locked while the model runs
-        // (which may build a graph through Scheme).
-        let (program, entry, inputs) = with_registry(|r| match r.values.get_mut(&run) {
-            Some((_, HostValue::Run(call))) => Ok((call.program, call.entry.clone(), std::mem::take(&mut call.inputs))),
-            _ => Err(format!("host value {run} is not a run")),
-        })?;
-        let outputs = crate::model::run_program_entry(program, &entry, inputs).map_err(|e| e.to_string())?;
-        let outputs: Vec<(CString, i64)> = outputs
-            .into_iter()
-            .map(|(name, array)| (CString::new(name).unwrap_or_default(), insert(HostValue::Tensor(array))))
-            .collect();
-        let n = outputs.len() as i64;
+/// Runs the entry of a `(run ...)` that the pipeline driver found the pipeline waiting for, on the
+/// driver's thread (not the Scheme thread), with the outputs created in `scope`. The result is
+/// read back by `tl_host_run_status`.
+pub(crate) fn exec_run(run: i64, scope: Scope, state: Option<crate::model::ModelState>) {
+    let finish = |outcome: Result<Vec<(CString, i64)>, String>| {
         with_registry(|r| {
             if let Some((_, HostValue::Run(call))) = r.values.get_mut(&run) {
-                call.outputs = outputs;
+                match outcome {
+                    Ok(outputs) => {
+                        call.outputs = outputs;
+                        call.ok = true;
+                    }
+                    Err(e) => call.error = CString::new(e.replace('\0', " ")).unwrap_or_default(),
+                }
             }
-        });
-        Ok(n + 1)
+        })
+    };
+    // Take the inputs out so the registry isn't locked while the model runs.
+    let taken = with_registry(|r| match r.values.get_mut(&run) {
+        Some((_, HostValue::Run(call))) => Ok((call.program, call.entry.clone(), std::mem::take(&mut call.inputs))),
+        _ => Err(format!("host value {run} is not a run")),
+    });
+    let outcome = taken.and_then(|(program, entry, inputs)| {
+        let outputs = crate::model::run_program_entry(program, &entry, inputs, state).map_err(|e| e.to_string())?;
+        Ok(with_registry(|r| {
+            outputs
+                .into_iter()
+                .map(|(name, array)| (CString::new(name).unwrap_or_default(), insert_in(r, scope, HostValue::Tensor(array))))
+                .collect()
+        }))
+    });
+    finish(outcome);
+}
+
+/// After the driver ran the entry: the number of outputs + 1, or 0 if it failed (see
+/// tl_host_run_error).
+extern "C" fn tl_host_run_status(run: i64) -> i64 {
+    with_registry(|r| match r.values.get(&run) {
+        Some((_, HostValue::Run(call))) if call.ok => call.outputs.len() as i64 + 1,
+        _ => 0,
+    })
+}
+
+extern "C" fn tl_host_run_error(run: i64) -> *const c_char {
+    with_registry(|r| match r.values.get(&run) {
+        Some((_, HostValue::Run(call))) => call.error.as_ptr(),
+        _ => c"the run is gone".as_ptr(),
     })
 }
 
@@ -883,6 +961,283 @@ extern "C" fn tl_host_run_output(run: i64, i: i64) -> i64 {
             _ => Err(format!("host value {run} is not a run")),
         })
     })
+}
+
+// --- Callbacks: `(client-call name arg ...)` and `(client-sample logits ...)` in pipelines.
+
+fn new_callback(kind: CallbackKind, logits: Option<ArrayD<f32>>, history: Vec<i32>) -> i64 {
+    insert(HostValue::Callback(Box::new(CallbackCall {
+        kind,
+        args: Vec::new(),
+        logits,
+        history,
+        status: 0,
+        item: 0,
+        text: CString::default(),
+        token: 0,
+        error: CString::default(),
+    })))
+}
+
+extern "C" fn tl_host_cb_call(name: *const c_char) -> i64 {
+    ffi(|| Ok(new_callback(CallbackKind::Call(text_arg(name)?.to_string()), None, Vec::new())))
+}
+
+/// Starts a sample request: logits (any shape, flattened), history (token ids), the number of
+/// candidates to send and whether to send the whole array too.
+extern "C" fn tl_host_cb_sample(logits: i64, history: i64, k: i64, full: i32) -> i64 {
+    ffi(|| {
+        let logits = tensor(logits)?;
+        let history: Vec<i32> = tensor(history)?.iter().map(|&v| v as i32).collect();
+        if k < 1 {
+            return Err("k must be at least 1".into());
+        }
+        Ok(new_callback(CallbackKind::Sample { k: k as usize, full: full != 0 }, Some(logits), history))
+    })
+}
+
+fn add_arg(cb: i64, chunk: crate::stream::Chunk) -> i64 {
+    ffi(|| {
+        with_registry(|r| match r.values.get_mut(&cb) {
+            Some((_, HostValue::Callback(call))) => {
+                call.args.push(chunk);
+                Ok(1)
+            }
+            _ => Err(format!("host value {cb} is not a callback")),
+        })
+    })
+}
+
+extern "C" fn tl_host_cb_arg(cb: i64, value: i64) -> i64 {
+    use crate::stream::Chunk;
+    let chunk = get(value, |v| match v {
+        HostValue::Tensor(t) => Ok(Chunk::Array(t.clone())),
+        HostValue::Audio(a) => Ok(Chunk::Audio(a.clone())),
+        HostValue::Image(i) => Ok(Chunk::Image(i.clone())),
+        other => Err(format!("can't send a {} to the client", other.kind())),
+    });
+    match chunk {
+        Ok(chunk) => add_arg(cb, chunk),
+        Err(e) => ffi(|| Err(e)),
+    }
+}
+
+extern "C" fn tl_host_cb_arg_text(cb: i64, text: *const c_char) -> i64 {
+    match text_arg(text) {
+        Ok(t) => add_arg(cb, crate::stream::Chunk::Text(t.to_string())),
+        Err(e) => ffi(|| Err(e)),
+    }
+}
+
+extern "C" fn tl_host_cb_arg_number(cb: i64, value: f64) -> i64 {
+    add_arg(cb, crate::stream::Chunk::Array(ndarray::arr0(value as f32).into_dyn()))
+}
+
+/// Answers the callback the pipeline is waiting for, on the driver's thread; `step` counts this run's
+/// sample requests. The result is read back by `tl_host_cb_status` and friends.
+pub(crate) fn exec_callback(
+    id: i64,
+    scope: Scope,
+    callbacks: Option<&dyn crate::stream::Callbacks>,
+    step: &mut u32,
+) {
+    use crate::stream::{Chunk, SampleRequest};
+    let taken = with_registry(|r| match r.values.get_mut(&id) {
+        Some((_, HostValue::Callback(call))) => {
+            let kind = match &call.kind {
+                CallbackKind::Call(n) => CallbackKind::Call(n.clone()),
+                CallbackKind::Sample { k, full } => CallbackKind::Sample { k: *k, full: *full },
+            };
+            Ok((kind, std::mem::take(&mut call.args), call.logits.take(), std::mem::take(&mut call.history)))
+        }
+        _ => Err(format!("host value {id} is not a callback")),
+    });
+    // (status, result chunk, text, token) or an error
+    let outcome: Result<(i64, Option<Chunk>, i64), String> = taken.and_then(|(kind, args, logits, history)| {
+        let callbacks = callbacks.ok_or_else(|| "this pipeline was started without callbacks".to_string())?;
+        match kind {
+            CallbackKind::Call(name) => match callbacks.call(&name, args)? {
+                None => Ok((5, None, 0)),
+                Some(chunk) => {
+                    let code = match &chunk {
+                        Chunk::Array(_) => 1,
+                        Chunk::Audio(_) => 2,
+                        Chunk::Image(_) => 3,
+                        Chunk::Text(_) => 4,
+                    };
+                    Ok((code, Some(chunk), 0))
+                }
+            },
+            CallbackKind::Sample { k, full } => {
+                let logits = logits.ok_or("no logits")?;
+                let flat: Vec<f32> = logits.iter().copied().collect();
+                let k = k.min(flat.len());
+                // Highest first, ties by index. Only the k best are sorted (the vocabulary can be 262k).
+                let order = |&a: &usize, &b: &usize| flat[b].partial_cmp(&flat[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b));
+                let mut ids: Vec<usize> = (0..flat.len()).collect();
+                if k < ids.len() {
+                    ids.select_nth_unstable_by(k - 1, order);
+                    ids.truncate(k);
+                }
+                ids.sort_by(order);
+                let candidates = ids.iter().map(|&i| (i as i32, flat[i])).collect();
+                let request = SampleRequest { step: *step, candidates, history, full: full.then_some(logits) };
+                *step += 1;
+                Ok((6, None, callbacks.sample(request)? as i64))
+            }
+        }
+    });
+    with_registry(|r| {
+        let outcome = outcome.map(|(status, chunk, token)| {
+            let (item, text) = match chunk {
+                Some(Chunk::Array(a)) => (insert_in(r, scope, HostValue::Tensor(a)), CString::default()),
+                Some(Chunk::Audio(a)) => (insert_in(r, scope, HostValue::Audio(a)), CString::default()),
+                Some(Chunk::Image(i)) => (insert_in(r, scope, HostValue::Image(i)), CString::default()),
+                Some(Chunk::Text(t)) => (0, CString::new(t.replace('\0', "")).unwrap_or_default()),
+                None => (0, CString::default()),
+            };
+            (status, item, text, token)
+        });
+        if let Some((_, HostValue::Callback(call))) = r.values.get_mut(&id) {
+            match outcome {
+                Ok((status, item, text, token)) => {
+                    call.status = status;
+                    call.item = item;
+                    call.text = text;
+                    call.token = token;
+                }
+                Err(e) => call.error = CString::new(e.replace('\0', " ")).unwrap_or_default(),
+            }
+        }
+    });
+}
+
+fn callback<R>(id: i64, f: impl FnOnce(&CallbackCall) -> R) -> Option<R> {
+    with_registry(|r| match r.values.get(&id) {
+        Some((_, HostValue::Callback(call))) => Some(f(call)),
+        _ => None,
+    })
+}
+
+extern "C" fn tl_host_cb_status(cb: i64) -> i64 {
+    callback(cb, |c| c.status).unwrap_or(0)
+}
+
+extern "C" fn tl_host_cb_item(cb: i64) -> i64 {
+    callback(cb, |c| c.item).unwrap_or(0)
+}
+
+extern "C" fn tl_host_cb_token(cb: i64) -> i64 {
+    callback(cb, |c| c.token).unwrap_or(0)
+}
+
+extern "C" fn tl_host_cb_text(cb: i64) -> *const c_char {
+    callback(cb, |c| c.text.as_ptr()).unwrap_or(c"".as_ptr())
+}
+
+extern "C" fn tl_host_cb_error(cb: i64) -> *const c_char {
+    callback(cb, |c| c.error.as_ptr()).unwrap_or(c"the callback is gone".as_ptr())
+}
+
+// --- Streams: `(stream-recv s)` and `(emit name value)` in pipelines.
+
+/// Takes the next chunk of an input stream if there is one: -2 if not yet (the pipeline then
+/// yields), 0 at the end, 1 array, 2 audio, 3 image, 4 text (read it with tl_host_stream_text), -1 on
+/// error. Array, audio and image chunks are then fetched with tl_host_stream_item.
+extern "C" fn tl_host_stream_poll(stream: i64) -> i64 {
+    use crate::stream::{Chunk, Poll};
+    let reader = get(stream, |v| match v {
+        HostValue::Stream(r) => Ok(r.clone()),
+        _ => Err(format!("host value {stream} is not a stream")),
+    });
+    let Ok(reader) = reader else {
+        with_registry(|r| r.error = CString::new("not a stream").unwrap());
+        return -1;
+    };
+    let chunk = match reader.inner.poll() {
+        Poll::Empty => return -2,
+        Poll::Closed => return 0,
+        Poll::Chunk(chunk) => chunk,
+    };
+    let (code, id) = match chunk {
+        Chunk::Array(a) => (1, insert(HostValue::Tensor(a))),
+        Chunk::Audio(a) => (2, insert(HostValue::Audio(a))),
+        Chunk::Image(i) => (3, insert(HostValue::Image(i))),
+        Chunk::Text(t) => {
+            *reader.inner.text.lock().unwrap() = CString::new(t.replace('\0', "")).unwrap_or_default();
+            (4, 0)
+        }
+    };
+    *reader.inner.last.lock().unwrap() = id;
+    code
+}
+
+/// The input stream behind a host id, for the driver to wait on.
+pub(crate) fn stream_reader(id: i64) -> Option<crate::stream::StreamReader> {
+    get(id, |v| match v {
+        HostValue::Stream(r) => Ok(r.clone()),
+        _ => Err(String::new()),
+    })
+    .ok()
+}
+
+extern "C" fn tl_host_stream_item(stream: i64) -> i64 {
+    ffi(|| {
+        get(stream, |v| match v {
+            HostValue::Stream(r) => Ok(*r.inner.last.lock().unwrap()),
+            _ => Err(format!("host value {stream} is not a stream")),
+        })
+    })
+}
+
+extern "C" fn tl_host_stream_text(stream: i64) -> *const c_char {
+    get(stream, |v| match v {
+        HostValue::Stream(r) => Ok(r.inner.text.lock().unwrap().as_ptr()),
+        _ => Err(String::new()),
+    })
+    .unwrap_or(c"".as_ptr())
+}
+
+fn emitter(id: i64) -> Result<crate::stream::Emit, String> {
+    get(id, |v| match v {
+        HostValue::Emitter(e) => Ok(e.clone()),
+        _ => Err(format!("host value {id} is not an emitter")),
+    })
+}
+
+fn send(emit: i64, name: *const c_char, chunk: crate::stream::Chunk) -> i64 {
+    ffi(|| {
+        let name = text_arg(name)?.to_string();
+        if emitter(emit)?(&name, chunk) { Ok(1) } else { Err(format!("nobody is listening to the output {name:?} any more")) }
+    })
+}
+
+/// Emits an array, audio or image host value (cloned: the pipeline may keep using it).
+extern "C" fn tl_host_emit(emit: i64, name: *const c_char, value: i64) -> i64 {
+    use crate::stream::Chunk;
+    let chunk = get(value, |v| match v {
+        HostValue::Tensor(t) => Ok(Chunk::Array(t.clone())),
+        HostValue::Audio(a) => Ok(Chunk::Audio(a.clone())),
+        HostValue::Image(i) => Ok(Chunk::Image(i.clone())),
+        other => Err(format!("can't emit a {}", other.kind())),
+    });
+    match chunk {
+        Ok(chunk) => send(emit, name, chunk),
+        Err(e) => {
+            with_registry(|r| r.error = CString::new(e.replace('\0', " ")).unwrap_or_default());
+            0
+        }
+    }
+}
+
+extern "C" fn tl_host_emit_text(emit: i64, name: *const c_char, text: *const c_char) -> i64 {
+    match text_arg(text) {
+        Ok(t) => send(emit, name, crate::stream::Chunk::Text(t.to_string())),
+        Err(e) => {
+            with_registry(|r| r.error = CString::new(e).unwrap_or_default());
+            0
+        }
+    }
 }
 
 fn tokenizer(id: i64) -> Result<Arc<Tokenizer>, String> {
@@ -952,9 +1307,25 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_cluster_centroids", tl_host_cluster_centroids as *const _),
         ("tl_host_run_begin", tl_host_run_begin as *const _),
         ("tl_host_run_input", tl_host_run_input as *const _),
-        ("tl_host_run_exec", tl_host_run_exec as *const _),
+        ("tl_host_run_status", tl_host_run_status as *const _),
+        ("tl_host_run_error", tl_host_run_error as *const _),
         ("tl_host_run_output_name", tl_host_run_output_name as *const _),
         ("tl_host_run_output", tl_host_run_output as *const _),
+        ("tl_host_cb_call", tl_host_cb_call as *const _),
+        ("tl_host_cb_sample", tl_host_cb_sample as *const _),
+        ("tl_host_cb_arg", tl_host_cb_arg as *const _),
+        ("tl_host_cb_arg_text", tl_host_cb_arg_text as *const _),
+        ("tl_host_cb_arg_number", tl_host_cb_arg_number as *const _),
+        ("tl_host_cb_status", tl_host_cb_status as *const _),
+        ("tl_host_cb_item", tl_host_cb_item as *const _),
+        ("tl_host_cb_token", tl_host_cb_token as *const _),
+        ("tl_host_cb_text", tl_host_cb_text as *const _),
+        ("tl_host_cb_error", tl_host_cb_error as *const _),
+        ("tl_host_stream_poll", tl_host_stream_poll as *const _),
+        ("tl_host_stream_item", tl_host_stream_item as *const _),
+        ("tl_host_stream_text", tl_host_stream_text as *const _),
+        ("tl_host_emit", tl_host_emit as *const _),
+        ("tl_host_emit_text", tl_host_emit_text as *const _),
         ("tl_host_detokenize", tl_host_detokenize as *const _),
         ("tl_host_token_id", tl_host_token_id as *const _),
         ("tl_host_text_boxes", tl_host_text_boxes as *const _),

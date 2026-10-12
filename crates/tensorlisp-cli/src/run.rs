@@ -148,7 +148,7 @@ pub fn run(args: &RunArgs, json: bool) -> Result<i32> {
         bail!("--raw goes through preprocess, which feeds the default entry {:?}", model.entries()[0].name);
     }
     let inputs = gather_inputs(&model, &args.inputs, &args.raw)?;
-    let options = RunOptions { taps: parse_taps(&args.taps) };
+    let options = RunOptions { taps: parse_taps(&args.taps), ..Default::default() };
 
     let mut times = Vec::new();
     let mut result = None;
@@ -505,7 +505,7 @@ pub fn compare(args: &CompareArgs, json: bool) -> Result<i32> {
     }
 
     let wanted_taps: Vec<String> = taps.iter().filter(|t| references.iter().any(|(n, _)| n == *t)).cloned().collect();
-    let result = model.run_entry(&entry, &views(&inputs), &RunOptions { taps: Taps::Names(wanted_taps) })?;
+    let result = model.run_entry(&entry, &views(&inputs), &RunOptions { taps: Taps::Names(wanted_taps), ..Default::default() })?;
 
     // Taps in definition order first: the first failing one is closest to where the port diverges.
     let mut comparisons = Vec::new();

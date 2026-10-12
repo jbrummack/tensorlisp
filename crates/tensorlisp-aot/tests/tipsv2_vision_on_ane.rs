@@ -107,7 +107,7 @@ fn assert_tap_matches_cpu(path: &Path, tap: &str) {
     let mil_out = loaded.predict(&[("image", ArrayRef::new(&[1, 3, SIZE, SIZE], &image_flat).unwrap())]).unwrap();
     let mil_tap = mil_out[&output_names[tap]].to_f32();
 
-    let cpu_out = tl_model.run_with(&[("image", input.view())], &tensorlisp::RunOptions { taps: Taps::Names(vec![tap.to_string()]) }).unwrap();
+    let cpu_out = tl_model.run_with(&[("image", input.view())], &tensorlisp::RunOptions { taps: Taps::Names(vec![tap.to_string()]), ..Default::default() }).unwrap();
     let cpu_tap: Vec<f32> = cpu_out.taps.iter().find(|(n, _)| n == tap).unwrap().1.iter().copied().collect();
 
     assert_close(tap, &mil_tap, &cpu_tap);

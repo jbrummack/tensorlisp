@@ -302,6 +302,50 @@ fn attention_with_large_head_sizes() {
     }
 }
 
+/// Many queries: the tensor-core flash attention kernel (cooperative matrices, on Apple GPUs; elsewhere the
+/// scalar one) on head sizes that are not multiples of 16, query counts around the 16-query tiles of a
+/// subgroup, key counts around the key blocks (and beyond the scalar kernel's 4096), grouped K/V heads,
+/// masks that leave whole rows and blocks empty, and a logit soft cap, against the CPU backend.
+#[test]
+fn many_query_attention() {
+    for (hs, nq, nk, softcap) in [
+        (72usize, 16usize, 1usize, 0.0f32),
+        (72, 17, 17, 0.0),
+        (72, 100, 300, 0.0),
+        (80, 33, 129, 0.0),
+        (64, 130, 70, 30.0),
+        (96, 20, 5000, 0.0),
+        (112, 50, 33, 0.0),
+        (128, 64, 256, 20.0),
+    ] {
+        let program = format!(
+            r#"
+          (import (tl attn))
+          (model sdpa (inputs [q f32 ({hs} {nq} 4 2)] [k f32 ({hs} {nk} 2 2)] [v f32 ({hs} {nk} 2 2)] [valid f32 ({nk} 2)])
+            (define mask (attn:padding-mask valid {nq}))
+            (define scale (/ 1.0 (sqrt {hs}.0)))
+            (outputs [flash (ggml-reshape-3d (ggml-flash-attn-ext q (ggml-cast k GGML_TYPE_F16) (ggml-cast v GGML_TYPE_F16) (ggml-cast mask GGML_TYPE_F16) scale 0.0 {softcap:.1}) (* {hs} 4) {nq} 2) 3]))
+        "#
+        );
+        let path = write(&format!("many-{hs}-{nq}-{nk}"), &program, &[]);
+        let (q, k, v) = (noise(&[2, 4, nq, hs], 11), noise(&[2, 2, nk, hs], 12), noise(&[2, 2, nk, hs], 13));
+        // batch 0: the first quarter of the keys masked, then all valid; batch 1: only a handful of keys valid
+        // (so most key blocks are empty); and a stretch in the middle masked in both.
+        let mut valid = ArrayD::<f32>::ones(IxDyn(&[2, nk]));
+        for j in 0..nk / 4 {
+            valid[[0, j]] = 0.0;
+        }
+        for j in 3..nk {
+            valid[[1, j]] = 0.0;
+        }
+        for j in nk / 2..(nk / 2 + 7).min(nk) {
+            valid[[0, j]] = 0.0;
+        }
+        same_as_cpu(&path, "sdpa", &[("q", &q), ("k", &k), ("v", &v), ("valid", &valid)], 8e-3);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 /// Paged attention (vLLM pool layouts, Tree kernels on Vulkan and PTX) against the dense flash attention
 /// on the same K/V: one pool filled through the cache write with shuffled blocks, sequences of unequal
 /// length, grouped K/V heads, the head sizes of real decoders.
