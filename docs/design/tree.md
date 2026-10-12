@@ -503,3 +503,123 @@ Measured on the RTX 3080 (GPU microseconds per launch, `tests/tree_matmul_cm.rs`
 TIPSv2 text encoder, whole model on Tree kernels: 9.98 ms to 4.78 ms per run (ggml's shaders 5.53 ms),
 cosine to the CPU backend 0.9999998 (the inputs of the products are rounded to f16). Gemma's decode
 step is unchanged (its products have one column). The PTX target has no equivalent yet (`mma.sync`).
+
+## MSL target and the Metal backend
+
+Tree's third target is Metal Shading Language: `(tl tree msl)` (`stdlib/tree_msl.ss`, `compile-kernel-msl`) emits
+C++-like source from the same typed kernel language, one assigned-once local per value (`t<N>`; `var`s are the
+mutable `v<N>`), so there is no register state to manage and the Metal compiler does the allocation. It is
+compiled without fast math (`Device::library_precise`): `exp`/`tanh`/... keep IEEE behaviour for masked `-inf`
+scores, which the PTX target gets from its corrected approximate instructions. Subgroups are SIMD-groups
+(32 lanes, `simd_sum`/`simd_max`/`simd_min`/`simd_shuffle_xor`); `dp4a` is emulated with `char4` products.
+A 16x16 cooperative matrix (`cmat`, `cm-*`) is a 2x2 grid of 8x8 `simdgroup_matrix` tiles, so `k:matmul-cm` runs
+on the matrix units (`TL_TREE_NOCM=1` for the scalar kernel); `mma-s8` (int8) is rejected by name.
+
+`crates/kernels/src/metal/backend.rs` is the Metal `sched::Backend` (`Code::Msl` blobs, shared-storage
+buffers so host copies are `memcpy`s, one command buffer with a concurrent compute encoder per submission and
+`memoryBarrierWithScope(buffers)` between hazard groups). It uses `OffsetMode::Prefix`: bindings are bound
+rounded down to 16 bytes and a `constant uint*` after the buffers carries each binding's residual byte offset
+followed by the kernel's push words. `metal/tree.rs` builds the `Caps` (no int dot; f16 matrix units) and
+the `Executor<Metal>`; `crates/tensorlisp/src/native_metal_tree.rs` is the model glue, selected by feature
+`native-metal-tree` in place of `native_metal.rs` (`cargo build --features native-metal-tree` on `tl`).
+
+Checked on an M1 Pro (`cargo test --release -p tensorlisp --features native-metal-tree`):
+`tests/tree_msl_library.rs` compiles every generator of `tests/tree_exprs.txt` (shared with `tree_library.rs`)
+to a Metal pipeline, with and without the passes; all 11 tests of `tests/native.rs` and all 5 of
+`native_tips.rs` (TIPSv2 text and vision, T5Gemma2 generation, YOLO11n, PP-OCRv6) match the CPU backend.
+
+Kernels added for this (they are target-independent and compile for SPIR-V too; PTX and Vulkan runs are
+untested): `k:im2col`, `k:pool2d`, `k:conv-dw`, `k:pad` (zero, circular), `k:pad-reflect`, `k:upscale`
+(nearest, bilinear, bicubic, antialiased bilinear), the unary functions elu, expm1, hardswish, hardsigmoid,
+gelu_erf (erf by Abramowitz-Stegun 7.1.26), round and trunc, and dequantization of q4_0, q4_1, q5_0, q5_1,
+q4_K and q6_K for the matmul tile loader, mat-vec (one element at a time, so correct but not fast) and
+get-rows. One thread per output element, with the host's parameter lists from the ggml lowering.
+
+Speed (warm, steady state; the first run of a process also compiles the MSL, about 0.3 s for YOLO11n):
+
+| | Tree on Metal | native executor (ggml .metal kernels) |
+|---|---|---|
+| TIPSv2 text encoder, f32 weights, 3 x 64 tokens | 18.2 ms | 15.9 ms |
+| YOLO11n 320x320 | 9.7 ms | 15.4 ms |
+| TIPSv2 text encoder, f16 weights | 18.9 ms | 14.9 ms |
+| T5Gemma2 f16 `generate` | 33.5 ms | 31.5 ms |
+| T5Gemma2 q8_0 `generate` | 27.3 ms | 30.3 ms |
+
+For the TIPSv2 encoder the scalar matmul took 53.6 ms; simdgroup matrices 38 ms; 64x64x16 tiles of eight
+simdgroups (what Apple devices get) 27.7 ms; 4-wide loads of the f32 activations and weights into the shared
+f16 tiles (`k:matmul-cm ... #t #t`, `TL_TREE_NOVEC=1` off) 22.3 ms; software-pipelining them (the next k tile is fetched into
+registers while the current one multiplies, `... #t #t #t`, `TL_TREE_NOPIPE=1` off) 19.5 ms. f16 weights are fetched the same way as 32-bit words (two halves each, the pipelined form only):
+27.0 ms to 20.1 ms on the f16 encoder. A direct `simdgroup_store` of the
+accumulators instead of staging through shared memory did not change the GPU time. Encoding a submission
+(283 launches) takes 0.12 ms, so there is nothing to gain from replaying command buffers. The first run of a
+process compiles the MSL (YOLO11n: 34 ms in the Tree compiler, 11 ms in Metal when the system's shader cache
+has the kernels, a few hundred ms when it does not); `TL_NATIVE_TIME=1` prints the split. `TL_METAL_PROFILE=1`
+prints per-kernel GPU time, `TL_METAL_GPU_TIME=1` the GPU and encode time of each submission,
+`TL_METAL_CORES` stands in for the core count Metal does not report. `tests/native_bench.rs` (ignored) times
+the T5Gemma2 pipeline over repeated runs.
+
+### Where Tree and ggml's kernels differ (M1 Pro)
+
+`TL_METAL_PROFILE=1` prints per-kernel GPU time on both executors (every launch gets its own command buffer, so
+the totals run high; the ratios are what to read). `tests/native_bench.rs::matmul_shapes` runs one `mul-mat`
+per shape on either executor (best of 30 runs, wall time):
+
+| matmul (weights m x k, n columns) | Tree ms | ggml ms | Tree / ggml |
+|---|---|---|---|
+| f32 768 x 768 x 192 | 0.548 | 0.461 | 1.19 |
+| f32 3072 x 768 x 192 | 0.591 | 0.525 | 1.13 |
+| f32 768 x 3072 x 192 | 0.678 | 0.532 | 1.27 |
+| f32 4096 x 4096 x 256 | 3.123 | 2.469 | 1.26 |
+| f16 768 x 3072 x 192 | 0.696 | 0.518 | 1.34 |
+| f16 4096 x 4096 x 256 | 3.242 | 2.404 | 1.35 |
+| f16 4096 x 4096 x 1 (mat-vec) | 0.437 | 0.426 | 1.03 |
+| f32 4096 x 4096 x 1 (mat-vec) | 0.832 | 0.608 | 1.37 |
+
+* Matrix-matrix: Tree is 1.1 to 1.35 times slower (2.7 against 3.5 TFLOPS on 4096^2), the gap growing with k. Tile
+  shape does not move it (all 4- and 8-simdgroup tiles from 32x32 to 128x128 within 10%), BK = 32 is slower than 16,
+  and none of these helped: reordering the multiply-accumulates, storing accumulators straight to the output,
+  double-buffering the shared tiles (one barrier per k step), a [k][n] B tile (the one change that did, 5%, is
+  kept). What is left is inside the kernel body and needs a GPU counter profiler to see.
+* Mat-vec with f16 weights is on par (bandwidth bound); f32 weights are 1.37x slower.
+* Elementwise work favours Tree: its fused regions and row chains replace ggml's separate ADD / MUL / CONT / NORM
+  launches (on the TIPSv2 encoder ggml spends about 3.4 ms of 16 in CONT copies and 1.4 ms in ADD; Tree has about
+  1 ms for its copies and fused adds), and q8_0 decode and the conv nets (YOLO11n, 9.7 against 15.4 ms) come out
+  ahead. The end-to-end gap on the transformer encoders is therefore the matmul.
+* A process's first run also pays the shader compile (see above); the numbers here are steady state.
+
+### GPU counters (Metal System Trace)
+
+`xcrun xctrace` records Apple's GPU counters from the command line (`scripts/metal-counters.py` averages them over
+the busy samples; its docstring has the recipe). f16 4096 x 4096 x 256 matmul, 400 runs each, M1 Pro:
+
+| counter (average while busy) | Tree, staged epilogue | Tree, direct store | ggml's mul_mm |
+|---|---|---|---|
+| ALU limiter / utilization | 84 / 78 % | 91 / 83 % | 97 / 93 % |
+| F32 utilization | 64 % | 68 % | 87 % |
+| compute occupancy | 25.5 % | 31.5 % | 30.9 % |
+| buffer load utilization | 7.7 % | 8.1 % | 21.4 % |
+| GPU read bandwidth | 29 GB/s | 35 GB/s | 74 GB/s |
+| matmul time | 3.26 ms | 3.09 ms | 2.40 ms |
+
+ggml's kernel is ALU-bound (its simdgroup multiplies show up as F32 utilization, F16 utilization is 0 for both) and
+reads about twice the memory; Tree's is not memory-bound either, but it keeps the ALU less busy with multiplies.
+Occupancy was part of it: the staging area `cs` of the epilogue was a third of each threadgroup's shared memory.
+Dropping it (`direct`, whole tiles stored straight to the result, `TL_TREE_NODIRECT=1` off) raised occupancy to ggml's.
+(An earlier "direct store changes nothing" measurement was wrong: it stored directly but still declared `cs`.)
+The rest is not store overhead, though that was the first guess. `TL_TREE_ABLATE=nocompute` (skip the fragment loads and
+multiplies) and `=nofill` (skip refilling the shared tiles) split the 4096 x 4096 x 256 f16 matmul as:
+
+| variant | ms |
+|---|---|
+| full kernel | 3.11 |
+| fill only (`nocompute`) | 0.86 |
+| compute only (`nofill`) | 2.62 |
+| ggml's whole kernel | 2.40 |
+
+so Tree's loop of fragment loads and multiplies alone costs more than ggml's entire kernel, and the fill (0.86 ms) is
+partly hidden behind it. Things that did not help, each tried against that table: packing two halves per shared store
+(`pack-half2`, A as packed words, B fetched as row pairs: no change for A alone, 16% slower with B), tiles stored as
+contiguous 8x8 blocks the way ggml lays them out (identical time), every tile and simdgroup shape from 32 x 32 to
+128 x 128, 16-simdgroup threadgroups, a second shared buffer so one barrier per k step suffices. Occupancy is already
+ggml's (31 %). What differs must be in how the compiler schedules the generated loop, which the PC samples of the
+trace (`gpu-shader-profiler-sample`) could show per instruction; that has not been looked at.

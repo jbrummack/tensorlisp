@@ -18,6 +18,10 @@ native-vulkan = ["dep:tensorlisp-kernels", "tensorlisp-kernels/vulkan"]
 # Tree compiler) instead of the hand-written NVRTC kernels. Takes the place of native-cuda's executor.
 native-cuda-tree = ["native-cuda", "tensorlisp-kernels/vulkan"]
 
+# The native Metal device running the Vulkan executor's Tree lowering (every node on MSL kernels from the
+# Tree compiler) instead of the native Metal executor over ggml's .metal kernels. macOS only.
+native-metal-tree = ["tensorlisp-kernels/metal-tree"]
+
 [dependencies]
 chez.workspace = true
 ggml-sys.workspace = true

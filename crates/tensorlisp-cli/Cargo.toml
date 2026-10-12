@@ -14,6 +14,7 @@ vulkan = ["tensorlisp/vulkan"]
 native-cuda = ["tensorlisp/native-cuda"]
 native-vulkan = ["tensorlisp/native-vulkan"]
 native-cuda-tree = ["tensorlisp/native-cuda-tree"]
+native-metal-tree = ["tensorlisp/native-metal-tree"]
 
 [dependencies]
 tensorlisp = { path = "../tensorlisp" }

@@ -100,6 +100,9 @@ pub struct Engine<B: Backend> {
     steps: BlockPool<B>,
 }
 
+/// Time spent creating pipelines (shader compilation), for `TL_NATIVE_TIME`.
+pub static PIPELINE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl<B: Backend> Engine<B> {
     pub fn new(backend: Arc<B>) -> Self {
         Engine {
@@ -148,7 +151,9 @@ impl<B: Backend> Engine<B> {
         if let Some(p) = self.pipelines.lock().unwrap().get(&id) {
             return Ok(p.clone());
         }
+        let t0 = std::time::Instant::now();
         let p = Arc::new(self.backend.pipeline(blob)?);
+        PIPELINE_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(self.pipelines.lock().unwrap().entry(id).or_insert(p).clone())
     }
 

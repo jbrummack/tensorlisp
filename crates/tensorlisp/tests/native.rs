@@ -80,8 +80,8 @@ fn matmul_kernels_by_type_and_batch() {
         .map(|n| format!("(model n{n} (inputs [x f32 ({k} {n})]) (outputs [y (ggml-mul-mat (weight \"w\") x) 2]))\n"))
         .collect();
     // ggml's Vulkan shaders have no f32-activation matrix-matrix kernel for bf16 weights.
-    let skip_bf16 = cfg!(all(feature = "native-vulkan", not(feature = "native-cuda"), not(target_os = "macos")));
-    for dtype in ["f32", "f16", "bf16", "q4_0", "q8_0", "q4_K", "q6_K"].into_iter().filter(|n| !(skip_bf16 && *n == "bf16")).map(|n| DType::parse(n).unwrap()) {
+    let skip_bf16 = cfg!(feature = "native-metal-tree") || cfg!(all(feature = "native-vulkan", not(feature = "native-cuda"), not(target_os = "macos")));
+    for dtype in ["f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q4_K", "q6_K"].into_iter().filter(|n| !(skip_bf16 && *n == "bf16")).map(|n| DType::parse(n).unwrap()) {
         let path = write(&format!("mm-{dtype}"), &entries, &[Weight { name: "w", dtype, data: &w }]);
         let model = Model::load(&path, Device::Native).unwrap();
         // The dequantized weights are the exact reference for this type.

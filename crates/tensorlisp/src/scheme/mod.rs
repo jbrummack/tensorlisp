@@ -36,6 +36,7 @@ const STDLIB: &[(&str, &str)] = &[
     ("tree opt", include_str!("stdlib/tree_opt.ss")),
     ("tree kernels", include_str!("stdlib/tree_kernels.ss")),
     ("tree ptx", include_str!("stdlib/tree_ptx.ss")),
+    ("tree msl", include_str!("stdlib/tree_msl.ss")),
     ("aot highlevel", include_str!("aot/highlevel.ss")),
     ("aot reference-compiler", include_str!("aot/reference_compiler.ss")),
     ("aot mil language", include_str!("aot/mil/language.ss")),
@@ -109,7 +110,7 @@ fn boot() -> Result<Scheme> {
     }
 
     // The environment Tree kernel expressions are compiled in (see `tree_compile`).
-    scheme.eval("(define-top-level-value '$tl-tree-env (environment '(rnrs) '(tl tree) '(tl tree opt) '(tl tree kernels) '(tl tree ptx)))")?;
+    scheme.eval("(define-top-level-value '$tl-tree-env (environment '(rnrs) '(tl tree) '(tl tree opt) '(tl tree kernels) '(tl tree ptx) '(tl tree msl)))")?;
 
     // ggml assertions on this thread raise Scheme errors (see core.ss).
     crate::guard::install();
@@ -182,7 +183,7 @@ fn with_scheme<R: Send + 'static>(f: impl FnOnce(&Scheme) -> R + Send + 'static)
 
 /// Compiles a Tree kernel expression, e.g. `(k:binary 'add)`, to SPIR-V bytes (little-endian
 /// words) on the Scheme thread. The generators are in `stdlib/tree_kernels.ss`.
-#[cfg(any(feature = "native-vulkan", feature = "native-cuda-tree"))]
+#[cfg(any(feature = "native-vulkan", feature = "native-cuda-tree", feature = "native-metal-tree"))]
 pub(crate) fn tree_compile_src(expr: &str, compile: &str) -> String {
     // TL_TREE_PASSES: the optimization passes run on the kernel first (default fold,licm,cse,dce;
     // "none" skips them), see stdlib/tree_opt.ss.
@@ -200,6 +201,14 @@ pub(crate) fn tree_compile_src(expr: &str, compile: &str) -> String {
 #[cfg(feature = "native-cuda-tree")]
 pub(crate) fn tree_compile_ptx(expr: &str) -> Result<Value> {
     let src = tree_compile_src(expr, "compile-kernel-ptx");
+    with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
+}
+
+/// Compiles a Tree kernel expression to MSL on the Scheme thread: `(msl-text entry accesses push-bytes
+/// workgroup)` as `compile-kernel-msl` returns it.
+#[cfg(feature = "native-metal-tree")]
+pub(crate) fn tree_compile_msl(expr: &str) -> Result<Value> {
+    let src = tree_compile_src(expr, "compile-kernel-msl");
     with_scheme(move |s| s.eval(&src))?.map_err(|e| Error::Program(format!("tree kernel: {e}")))
 }
 

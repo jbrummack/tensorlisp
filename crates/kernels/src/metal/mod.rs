@@ -20,11 +20,14 @@ use objc2_metal::{
 
 use crate::{Const, Dims, Error, Result};
 
+pub mod backend;
 pub mod exec;
 pub mod kargs;
 pub mod lower;
 pub mod paged_attn;
 pub mod shaders;
+#[cfg(feature = "metal-tree")]
+pub mod tree;
 #[cfg(feature = "ggml")]
 pub mod ggml;
 
@@ -274,6 +277,24 @@ impl Device {
         let lib = self
             .dev
             .newLibraryWithSource_options_error(&NSString::from_str(&text), options.as_deref())
+            .map_err(|e| Error::Compile { lib: key.to_string(), msg: e.localizedDescription().to_string() })?;
+        let key: Arc<str> = Arc::from(key);
+        libs.insert(key.clone(), lib);
+        Ok(key)
+    }
+
+    /// Like [`Device::library`], compiled without fast math (IEEE `exp`, `tanh`, infinities and NaNs).
+    pub fn library_precise(&self, key: &str, source: impl FnOnce() -> String) -> Result<Arc<str>> {
+        let mut libs = self.libraries.lock().unwrap();
+        if let Some((k, _)) = libs.get_key_value(key) {
+            return Ok(k.clone());
+        }
+        let options = MTLCompileOptions::new();
+        #[allow(deprecated)]
+        options.setFastMathEnabled(false);
+        let lib = self
+            .dev
+            .newLibraryWithSource_options_error(&NSString::from_str(&source()), Some(&options))
             .map_err(|e| Error::Compile { lib: key.to_string(), msg: e.localizedDescription().to_string() })?;
         let key: Arc<str> = Arc::from(key);
         libs.insert(key.clone(), lib);

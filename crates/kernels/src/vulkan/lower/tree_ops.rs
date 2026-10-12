@@ -20,7 +20,16 @@ fn tname(ty: Ty) -> Option<&'static str> {
 
 /// Weight types the matmul / mat-vec / gather generators dequantize.
 fn weight_name(ty: Ty) -> Option<&'static str> {
-    matches!(ty, Ty::F32 | Ty::F16 | Ty::Q8_0).then(|| tname(ty).unwrap())
+    match ty {
+        Ty::F32 | Ty::F16 | Ty::Q8_0 => tname(ty),
+        Ty::Q4_0 => Some("q4_0"),
+        Ty::Q4_1 => Some("q4_1"),
+        Ty::Q5_0 => Some("q5_0"),
+        Ty::Q5_1 => Some("q5_1"),
+        Ty::Q4_K => Some("q4_K"),
+        Ty::Q6_K => Some("q6_K"),
+        _ => None,
+    }
 }
 
 /// A q8_0 mat-vec that runs as "quantize the activations to int8, then dp4a" (what ggml-cuda's
@@ -222,6 +231,12 @@ impl<'a> Ctx<'a> {
             "FUSED_NR" => self.tree_fused_nr(tree, id),
             "FUSED_GU" => self.tree_fused_gu(tree, id),
             "CUSTOM" => self.paged_custom(tree, id).map(Some),
+            "IM2COL" => self.tree_im2col(tree, id),
+            "POOL_2D" => self.tree_pool_2d(tree, id),
+            "CONV_2D_DW" => self.tree_conv_2d_dw(tree, id),
+            "PAD" => self.tree_pad(tree, id),
+            "PAD_REFLECT_1D" => self.tree_pad_reflect(tree, id),
+            "UPSCALE" => self.tree_upscale(tree, id),
             _ => Ok(None),
         }
     }
@@ -419,14 +434,21 @@ impl<'a> Ctx<'a> {
                     2 => "neg",
                     3 => "step",
                     4 => "tanh",
+                    5 => "elu",
                     6 => "relu",
                     7 => "sigmoid",
                     8 => "gelu",
                     9 => "gelu_quick",
                     10 => "silu",
+                    11 => "hardswish",
+                    12 => "hardsigmoid",
                     13 => "exp",
+                    14 => "expm1",
+                    16 => "gelu_erf",
                     18 => "floor",
                     19 => "ceil",
+                    20 => "round",
+                    21 => "trunc",
                     p => {
                         *self.stats.fallbacks.borrow_mut().entry(format!("UNARY#{p}")).or_default() += 1;
                         return Ok(None);
@@ -655,7 +677,11 @@ impl<'a> Ctx<'a> {
             // 32x32 tiles with four subgroups (measured on TIPSv2's n = 192 products, docs/design/tree.md).
             let tiles64 = ceil_div(m, 64) * ceil_div(n, 64) * batch;
             let cores = self.caps.shader_cores;
-            let (mut cbm, mut cbn, mut cbk, mut wm, mut wn) = if n < 32 {
+            let apple = self.caps.vendor_id == 0x106b;
+            let (mut cbm, mut cbn, mut cbk, mut wm, mut wn) = if apple && n >= 64 && m >= 64 {
+                // Apple GPUs: eight simdgroups per 64x64 tile (measured on TIPSv2's text encoder).
+                (64, 64, 16, 4, 2)
+            } else if n < 32 {
                 (64, 16, 16, 2, 1)
             } else if tiles64 >= cores * 2 + cores / 4 {
                 (64, 64, 16, 2, 2)
@@ -669,10 +695,166 @@ impl<'a> Ctx<'a> {
                 }
             }
             let grid = [ceil_div(m, cbm), ceil_div(n, cbn), batch];
-            return self.tree_launch(tree, &format!("(k:matmul-cm '{atype} {cbm} {cbn} {cbk} {wm} {wn})"), vec![ta.range, tb.range, td.range], &push, grid);
+            // 4-wide tile loads on Apple GPUs when the operands allow (f32 A and B, 16-byte aligned, k and
+            // the strides multiples of 4); TL_TREE_NOVEC=1 keeps the scalar loads.
+            let vec_ok = |x: &Tn| x.off % 16 == 0 && x.nb[1] % 4 == 0 && x.nb[2] % 4 == 0 && x.nb[3] % 4 == 0 && k % 4 == 0;
+            let vectors = apple && std::env::var_os("TL_TREE_NOVEC").is_none();
+            let vb = vectors && vec_ok(&tb);
+            let pipe_ok = std::env::var_os("TL_TREE_NOPIPE").is_none();
+            // f16 weights are read as 32-bit words (two halves), so they need even offsets and the pipelined form.
+            let va = vectors && match atype {
+                "f32" => vec_ok(&ta),
+                "f16" => vb && pipe_ok && vec_ok(&ta) && ta.off % 8 == 0 && ta.nb[1] % 2 == 0 && ta.nb[2] % 2 == 0 && ta.nb[3] % 2 == 0,
+                _ => false,
+            };
+            let pipe = va && vb && pipe_ok;
+            let flags = if va || vb { format!(" #{} #{}{}", if va { "t" } else { "f" }, if vb { "t" } else { "f" }, if pipe { if std::env::var_os("TL_TREE_NOBT").is_some() { " #t 'plain" } else { " #t #t" } } else { "" }) } else { String::new() };
+            // Whole tiles go straight to the result (simdgroup_store to global memory) and the shared staging buffer
+            // goes away, which raises occupancy: Metal only; TL_TREE_NODIRECT=1 stages through shared memory.
+            let direct = pipe && apple && m % cbm == 0 && n % cbn == 0 && std::env::var_os("TL_TREE_NODIRECT").is_none() && std::env::var_os("TL_TREE_NOBT").is_none();
+            let flags = if direct { format!("{flags} #t") } else { flags };
+            // TL_TREE_ABLATE=nocompute|nofill: diagnostics, see k:matmul-cm.
+            let flags = match (std::env::var("TL_TREE_ABLATE").ok(), direct) {
+                (Some(a), true) => format!("{flags} '{a}"),
+                _ => flags,
+            };
+            return self.tree_launch(tree, &format!("(k:matmul-cm '{atype} {cbm} {cbn} {cbk} {wm} {wn}{flags})"), vec![ta.range, tb.range, td.range], &push, grid);
         }
         let grid = [ceil_div(m, bm), ceil_div(n, bn), batch];
         self.tree_launch(tree, &format!("(k:matmul '{atype} {bm} {bn} {bk} {tm} {tn})"), vec![ta.range, tb.range, td.range], &push, grid)
+    }
+
+    fn tree_im2col(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let (k, x) = (self.src(t, 0)?, self.src(t, 1)?);
+        let (tk, tx, td) = (self.tn(k), self.tn(x), self.tn(id));
+        if tx.ty != Ty::F32 || !matches!(td.ty, Ty::F32 | Ty::F16) || tx.nb[0] != 1 || tx.ne[0] == 0 {
+            return Ok(None);
+        }
+        let p = |i: usize| t.op_params[i];
+        let is_2d = p(6) == 1;
+        let (ic, ih, iw) = (tx.ne[if is_2d { 2 } else { 1 }], if is_2d { tx.ne[1] } else { 1 }, tx.ne[0]);
+        let (kh, kw) = (if is_2d { tk.ne[1] } else { 1 }, tk.ne[0]);
+        let (oh, ow) = (if is_2d { td.ne[2] } else { 1 }, td.ne[1]);
+        let batch = tx.ne[if is_2d { 3 } else { 2 }];
+        let chw = ic * kh * kw;
+        // Rows of the source are read as contiguous (the ggml shader assumes it too).
+        if is_2d && tx.nb[1] != iw {
+            return Ok(None);
+        }
+        let push = [
+            td.nelements(),
+            chw,
+            ow,
+            oh,
+            kh,
+            kw,
+            iw,
+            ih,
+            p(0) as u32,
+            p(1) as u32,
+            p(2) as u32,
+            p(3) as u32,
+            p(4) as u32,
+            p(5) as u32,
+            tx.nb[if is_2d { 2 } else { 1 }],
+            tx.nb[if is_2d { 3 } else { 2 }],
+        ];
+        let dty = if td.ty == Ty::F16 { "f16" } else { "f32" };
+        self.tree_launch(tree, &format!("(k:im2col '{dty})"), vec![tx.range, td.range], &push, self.tree_grid(ceil_div(td.nelements(), WG)))
+    }
+
+    fn tree_pool_2d(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let a = self.src(t, 0)?;
+        let (ta, td) = (self.tn(a), self.tn(id));
+        if ta.ty != Ty::F32 || td.ty != Ty::F32 || !self.t(a).is_contiguous() {
+            return Ok(None);
+        }
+        let p = |i: usize| t.op_params[i];
+        let (n, oc, oh, ow) = (td.ne[3], td.ne[2], td.ne[1], td.ne[0]);
+        let pelements = n * oc * oh * ow;
+        let push = [ta.ne[0], ta.ne[1], ow, oh, oc, pelements, p(0) as u32, p(2) as u32, p(1) as u32, p(4) as u32, p(3) as u32, p(6) as u32, p(5) as u32];
+        self.tree_launch(tree, "(k:pool2d)", vec![ta.range, td.range], &push, self.tree_grid(ceil_div(pelements, WG)))
+    }
+
+    fn tree_conv_2d_dw(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let (k, x) = (self.src(t, 0)?, self.src(t, 1)?);
+        let (tk, tx, td) = (self.tn(k), self.tn(x), self.tn(id));
+        if tx.ty != Ty::F32 || td.ty != Ty::F32 || !matches!(tk.ty, Ty::F32 | Ty::F16) || !self.t(x).is_contiguous() || !self.t(k).is_contiguous() {
+            return Ok(None);
+        }
+        let p = |i: usize| t.op_params[i] as u32;
+        let push = [td.nelements(), td.ne[3], td.ne[2], td.ne[0], td.ne[1], tx.ne[0], tx.ne[1], tk.ne[0], tk.ne[1], p(0), p(1), p(2), p(3), p(4), p(5)];
+        let kty = if tk.ty == Ty::F16 { "f16" } else { "f32" };
+        self.tree_launch(tree, &format!("(k:conv-dw '{kty})"), vec![tk.range, tx.range, td.range], &push, self.tree_grid(ceil_div(td.nelements(), WG)))
+    }
+
+    fn tree_pad(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let a = self.src(t, 0)?;
+        let (ta, td) = (self.tn(a), self.tn(id));
+        if ta.ty != Ty::F32 || td.ty != Ty::F32 {
+            return Ok(None);
+        }
+        let circular = t.op_params[8] != 0;
+        // left pads are op_params[0, 2, 4, 6] (lp0, rp0, lp1, rp1, ...)
+        let lp = [0, 2, 4, 6].map(|i| t.op_params[i] as u32);
+        if circular && (0..4).any(|k| lp[k] > ta.ne[k]) {
+            return Ok(None);
+        }
+        let mut push = vec![td.nelements(), td.ne[0], td.ne[1], td.ne[2]];
+        push.extend(ta.ne);
+        push.extend(lp);
+        push.extend(ta.nb);
+        push.extend(td.nb);
+        let c = if circular { "#t" } else { "#f" };
+        self.tree_launch(tree, &format!("(k:pad {c})"), vec![ta.range, td.range], &push, self.tree_grid(ceil_div(td.nelements(), WG)))
+    }
+
+    fn tree_pad_reflect(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let a = self.src(t, 0)?;
+        let (ta, td) = (self.tn(a), self.tn(id));
+        if ta.ty != Ty::F32 || td.ty != Ty::F32 || ta.ne[0] < 2 {
+            return Ok(None);
+        }
+        let mut push = vec![td.nelements(), td.ne[0], td.ne[1], td.ne[2], ta.ne[0], t.op_params[0] as u32];
+        push.extend(ta.nb);
+        push.extend(td.nb);
+        self.tree_launch(tree, "(k:pad-reflect)", vec![ta.range, td.range], &push, self.tree_grid(ceil_div(td.nelements(), WG)))
+    }
+
+    fn tree_upscale(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {
+        let t = self.t(id);
+        let a = self.src(t, 0)?;
+        let (ta, td) = (self.tn(a), self.tn(id));
+        if ta.ty != Ty::F32 || td.ty != Ty::F32 || !self.t(id).is_contiguous() {
+            return Ok(None);
+        }
+        let flags = t.op_params[0] as u32;
+        let mode = flags & 0xff;
+        let antialias = flags & 0x200 != 0;
+        if mode > 2 || (antialias && mode != 1) {
+            return Ok(None);
+        }
+        let mut sf = [0, 1, 2, 3].map(|i| td.ne[i] as f32 / ta.ne[i] as f32);
+        let mut pixel_offset = 0.5f32;
+        if flags & 0x100 != 0 {
+            for i in 0..2 {
+                if td.ne[i] > 1 && ta.ne[i] > 1 {
+                    sf[i] = (td.ne[i] - 1) as f32 / (ta.ne[i] - 1) as f32;
+                }
+            }
+            pixel_offset = 0.0;
+        }
+        let mut push = vec![td.nelements(), ta.ne[0], ta.ne[1], td.ne[0], td.ne[1], td.ne[2]];
+        push.extend(ta.nb);
+        push.extend(sf.map(f32::to_bits));
+        push.push(pixel_offset.to_bits());
+        let name = if antialias { "antialias" } else { ["nearest", "bilinear", "bicubic"][mode as usize] };
+        self.tree_launch(tree, &format!("(k:upscale '{name})"), vec![ta.range, td.range], &push, self.tree_grid(ceil_div(td.nelements(), WG)))
     }
 
     fn tree_rope(&self, tree: &TreeKernels, id: TensorId) -> Result<Option<Vec<LaunchDesc>>> {

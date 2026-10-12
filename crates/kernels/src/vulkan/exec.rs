@@ -131,6 +131,7 @@ impl<B: Backend> Executor<B> {
         let stats = TreeStats::default();
         let ctx = Ctx { shaders: &self.shaders, caps, graph: &graph, layout: &layout, arena_base, pos: &pos, tree: self.tree.as_ref(), paged: self.paged.as_ref(), stats: &stats };
 
+        let t_lower = std::time::Instant::now();
         let mut launches = Vec::new();
         let mut missing: Vec<(String, String)> = Vec::new();
         for &id in &graph.nodes {
@@ -154,7 +155,18 @@ impl<B: Backend> Executor<B> {
         if self.tree.is_some() && std::env::var_os("TL_NATIVE_TRACE").is_some() {
             eprintln!("native vulkan: {} nodes on Tree kernels, ggml shaders for {:?}", stats.tree_nodes.get(), stats.fallbacks.borrow());
         }
+        let t_pipes = std::time::Instant::now();
+        let before = crate::sched::engine::PIPELINE_NANOS.load(std::sync::atomic::Ordering::Relaxed);
         let plan = self.engine.compile(&launches, step_bytes)?;
+        if std::env::var_os("TL_NATIVE_TIME").is_some() {
+            let shaders = crate::sched::engine::PIPELINE_NANOS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            eprintln!(
+                "compile: lowering (with the Tree compiler) {:.1} ms, plan {:.1} ms of which shader compilation {:.1} ms",
+                (t_pipes - t_lower).as_secs_f64() * 1e3,
+                t_pipes.elapsed().as_secs_f64() * 1e3,
+                shaders as f64 / 1e6
+            );
+        }
         if std::env::var_os("TL_NATIVE_TRACE").is_some() {
             let sizes = plan.group_sizes();
             eprintln!("native vulkan: {} launches in {} groups (largest {}), arena {} bytes", plan.launch_count(), sizes.len(), sizes.iter().max().unwrap_or(&0), step_bytes);

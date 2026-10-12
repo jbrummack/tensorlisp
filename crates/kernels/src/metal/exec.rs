@@ -119,6 +119,9 @@ impl Program {
 
     /// Runs the graph and waits for it.
     pub fn run(&self, shared: &Shared) -> Result<()> {
+        if std::env::var_os("TL_METAL_PROFILE").is_some_and(|v| v != "0") {
+            return self.run_profiled(shared);
+        }
         let mut args: Vec<(u32, Arg)> = Vec::with_capacity(10);
         for d in &self.dispatches {
             args.clear();
@@ -137,6 +140,39 @@ impl Program {
             Error::Execution(m) => Error::Execution(format!("{m} (graph of {} dispatches)", self.dispatches.len())),
             e => e,
         })
+    }
+
+    /// `run` with every dispatch in its own command buffer, printing GPU time per kernel label
+    /// (`TL_METAL_PROFILE=1`, the counterpart of the Tree backend's table).
+    fn run_profiled(&self, shared: &Shared) -> Result<()> {
+        use objc2_metal::MTLCommandBuffer;
+        let mut args: Vec<(u32, Arg)> = Vec::with_capacity(10);
+        let mut table: std::collections::HashMap<String, (u64, f64)> = Default::default();
+        for d in &self.dispatches {
+            args.clear();
+            for (slot, a) in &d.args {
+                args.push((*slot, match a {
+                    DArg::Buf(p) => Arg::Buf(self.resolve(*p, shared)),
+                    DArg::Bytes(b) => Arg::Bytes(b),
+                }));
+            }
+            self.dev.launch_pipeline(&d.pipeline, &args, d.dims)?;
+            if let Some(p) = self.dev.flush() {
+                p.0.waitUntilCompleted();
+                let ms = (p.0.GPUEndTime() - p.0.GPUStartTime()) * 1e3;
+                let e = table.entry(d.label.split_whitespace().next().unwrap_or("").to_string()).or_default();
+                e.0 += 1;
+                e.1 += ms;
+            }
+        }
+        let mut rows: Vec<_> = table.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+        let total: f64 = rows.iter().map(|r| r.1 .1).sum();
+        eprintln!("metal (ggml kernels) profile: {total:.2} ms over {} kernels", rows.len());
+        for (label, (n, ms)) in rows.iter().take(30) {
+            eprintln!("  {ms:9.3} ms {n:6} x {:8.1} us  {label}", ms * 1e3 / *n as f64);
+        }
+        Ok(())
     }
 
     /// Copies out `bytes` of tensor `id` (after [`Program::run`]); only for tensors in the arena or io buffer.

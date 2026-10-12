@@ -6,7 +6,7 @@
 ;; by expression, e.g. "(k:binary 'add)", and packs the push constants in the order each
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
-  (export k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
+  (export k:im2col k:pool2d k:conv-dw k:pad k:pad-reflect k:upscale k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
           k:matmul k:matmul-cm k:matmul-q8mma k:matmul-q8mma-w k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
@@ -42,7 +42,7 @@
 
   ;; Buffer element types: f16 data is a u16 array (converted with half->f32 / f32->half), q8_0
   ;; data a u16 array of 17-word blocks (an f16 scale, 32 int8 quants).
-  (define (elem-ty ty) (case ty [(f32) 'f32] [(f16 q8_0) 'u16] [(i32) 'i32] [else (error 'tree-kernels "no such element type" ty)]))
+  (define (elem-ty ty) (case ty [(f32) 'f32] [(f16 q8_0 q4_0 q4_1 q5_0 q5_1 q4_K q6_K) 'u16] [(i32) 'i32] [else (error 'tree-kernels "no such element type" ty)]))
   (define (load-f32 ty buf idx)
     (case ty
       [(f32) `(load ,buf ,idx)]
@@ -56,6 +56,65 @@
       [(i32) `(store ,buf ,idx (i32 ,val))]
       [else (error 'tree-kernels "cannot store from f32" ty)]))
 
+
+  ;; ---- ggml block quantizations (u16 words of buffer `a`), dequantized one element at a time -------------
+  ;; Byte `b` (an integer or an expression) of the block starting at word `base`.
+  (define (qbyte base b)
+    (if (integer? b)
+        (if (even? b)
+            `(bit-and (u32 (load a (+ ,base ,(div b 2)))) 255)
+            `(shr (u32 (load a (+ ,base ,(div b 2)))) 8))
+        `(bit-and (shr (u32 (load a (+ ,base (/ ,b 2)))) (* (rem ,b 2) 8)) 255)))
+  (define (qword base w) `(u32 (load a (+ ,base ,w))))
+  (define (qhalf base w) `(half->f32 (load a (+ ,base ,w))))
+
+  (define (quant-words atype) (case atype [(q4_0) 9] [(q4_1) 10] [(q5_0) 11] [(q5_1) 12] [(q4_K) 72] [(q6_K) 105] [else #f]))
+  (define (quant-block atype) (case atype [(q4_K q6_K) 256] [else 32]))
+
+  ;; f32 expression for element k of the row at block index rb.
+  (define (quant-elem atype rb k)
+    (let ([bs (quant-block atype)] [words (quant-words atype)])
+      `(let ([qb (* (+ ,rb (/ ,k ,bs)) ,words)] [qj (rem ,k ,bs)])
+         ,(case atype
+            [(q4_0)
+             `(let ([by ,(qbyte 'qb '(+ 2 (rem qj 16)))])
+                (* ,(qhalf 'qb 0) (f32 (- (i32 (select (< qj 16) (bit-and by 15) (shr by 4))) 8))))]
+            [(q4_1)
+             `(let ([by ,(qbyte 'qb '(+ 4 (rem qj 16)))])
+                (+ (* ,(qhalf 'qb 0) (f32 (select (< qj 16) (bit-and by 15) (shr by 4)))) ,(qhalf 'qb 1)))]
+            [(q5_0 q5_1)
+             (let* ([q1 (eq? atype 'q5_1)] [qs (if q1 8 6)]
+                    [qh `(bit-or ,(qword 'qb 2) (shl ,(qword 'qb 3) 16))]
+                    [qh0 `(bit-or ,(qword 'qb 1) (shl ,(qword 'qb 2) 16))])
+               `(let ([by ,(qbyte 'qb `(+ ,qs (rem qj 16)))] [hb (bit-and (shr ,(if q1 qh qh0) qj) 1)])
+                  (let ([nib (bit-or (select (< qj 16) (bit-and by 15) (shr by 4)) (shl hb 4))])
+                    ,(if q1
+                         `(+ (* ,(qhalf 'qb 0) (f32 nib)) ,(qhalf 'qb 1))
+                         `(* ,(qhalf 'qb 0) (f32 (- (i32 nib) 16)))))))]
+            [(q4_K)
+             ;; 8 sub-blocks of 32: scale and min packed in 12 bytes (get_scale_min_k4)
+             `(let ([j (/ qj 64)] [l (rem qj 64)])
+                (let ([is (+ (* 2 j) (/ l 32))])
+                  (let ([by ,(qbyte 'qb '(+ 16 (* j 32) (rem l 32)))])
+                    (let ([nib (select (< l 32) (bit-and by 15) (shr by 4))]
+                          [sc (select (< is 4)
+                                      (bit-and ,(qbyte 'qb '(+ 4 is)) 63)
+                                      (bit-or (bit-and ,(qbyte 'qb '(+ 8 is)) 15) (shl (shr ,(qbyte 'qb 'is) 6) 4)))]
+                          [mn (select (< is 4)
+                                      (bit-and ,(qbyte 'qb '(+ 8 is)) 63)
+                                      (bit-or (shr ,(qbyte 'qb '(+ 8 is)) 4) (shl (shr ,(qbyte 'qb '(+ 4 is)) 6) 4)))])
+                      (- (* ,(qhalf 'qb 0) (f32 sc) (f32 nib)) (* ,(qhalf 'qb 1) (f32 mn)))))))]
+            [(q6_K)
+             `(let ([n (/ qj 128)] [r (rem qj 128)])
+                (let ([q (/ r 32)] [l (rem r 32)])
+                  (let ([qlb ,(qbyte 'qb '(+ (* n 64) (* (rem q 2) 32) l))]
+                        [qhb ,(qbyte 'qb '(+ 128 (* n 32) l))]
+                        [sc (sbits ,(qbyte 'qb '(+ 192 (* n 8) (/ l 16) (* 2 q))) 0 8)])
+                    (let ([nib (select (< q 2) (bit-and qlb 15) (shr qlb 4))]
+                          [hb (bit-and (shr qhb (* 2 q)) 3)])
+                      (* ,(qhalf 'qb 104) (f32 sc) (f32 (- (i32 (bit-or nib (shl hb 4))) 32)))))))]
+            [else (error 'tree-kernels "no such weight type" atype)]))))
+
   ;; f32 expression for element k of the row of A that starts at `rb` (an element index; for q8_0 a
   ;; block index), A being f32, f16 or q8_0 data in buffer `a`.
   (define (a-elem atype rb k)
@@ -65,6 +124,7 @@
        `(let ([qb (* (+ ,rb (/ ,k 32)) 17)] [qj (rem ,k 32)])
           (* (half->f32 (load a qb))
              (f32 (sbits (u32 (load a (+ qb 1 (/ qj 2)))) (* (rem qj 2) 8) 8))))]
+      [(q4_0 q4_1 q5_0 q5_1 q4_K q6_K) (quant-elem atype rb k)]
       [else (error 'tree-kernels "no such weight type" atype)]))
 
   ;; ---- elementwise ------------------------------------------------------------------------
@@ -101,6 +161,19 @@
       [(floor) `(floor ,x)]
       [(ceil) `(ceil ,x)]
       [(tanh) `(tanh ,x)]
+      [(elu) `(select (> ,x 0.0) ,x (- (exp ,x) 1.0))]
+      [(expm1) `(- (exp ,x) 1.0)]
+      [(hardswish) `(* ,x (min 1.0 (max 0.0 (/ (+ ,x 3.0) 6.0))))]
+      [(hardsigmoid) `(min 1.0 (max 0.0 (/ (+ ,x 3.0) 6.0)))]
+      [(round) `(select (< ,x 0.0) (- (floor (+ (- ,x) 0.5))) (floor (+ ,x 0.5)))]
+      [(trunc) `(select (< ,x 0.0) (- (floor (- ,x))) (floor ,x))]
+      ;; erf by Abramowitz and Stegun 7.1.26 (absolute error 1.5e-7)
+      [(gelu_erf)
+       `(let ([z (* ,x 0.70710678118654752440)])
+          (let ([az (abs z)])
+            (let ([t (/ 1.0 (+ 1.0 (* 0.3275911 az)))])
+              (let ([y (- 1.0 (* (+ (* (+ (* (+ (* (+ (* 1.061405429 t) -1.453152027) t) 1.421413741) t) -0.284496736) t) 0.254829592) t (exp (- (* az az)))))])
+                (* 0.5 ,x (+ 1.0 (select (< z 0.0) (- y) y)))))))]
       [(relu) `(max ,x 0.0)]
       [(sigmoid) `(/ 1.0 (+ 1.0 (exp (- ,x))))]
       [(silu) `(/ ,x (+ 1.0 (exp (- ,x))))]
@@ -417,6 +490,60 @@
                  `(when (< ,l ,total) ,(body l)))))
          (range 0 (div (+ total nt -1) nt))))
 
+  ;; Four consecutive k of one row of an f32 operand into a shared f16 tile with one vector load (rows
+  ;; or k past the end are zero; k % 4 = 0 so a vector is all in or all out). `l` indexes vectors.
+  (define (vtile-fill tile buf r0 rn off stride row l BK ld)
+    (let ([vs '(v0 v1 v2 v3)])
+      `(let ([,row (/ ,l ,(div BK 4))] [kk (* 4 (rem ,l ,(div BK 4)))])
+         (if (and (< (+ ,r0 ,row) ,rn) (< (+ k0 kk) k))
+             (begin
+               (vload ,vs ,buf (+ ,off (* (+ ,r0 ,row) ,stride) k0 kk))
+               ,@(map (lambda (v i) `(store ,tile (+ (* ,row ,ld) kk ,i) (f16 ,v))) vs (range 0 4)))
+             (begin
+               ,@(map (lambda (i) `(store ,tile (+ (* ,row ,ld) kk ,i) (f16 0.0))) (range 0 4)))))))
+
+  ;; Software-pipelined tile fill: `vfetch` loads the vectors this thread owns for k offset `kn` into
+  ;; registers p<tag>_<i>_<j> (zeros past the edges), `vstore` writes them to the shared tile later.
+  (define (vtile-regs tag total4 nt)
+    (apply append
+      (map (lambda (i) (map (lambda (j) `(var ,(name 'p tag '_ i '_ j) f32 0.0)) (range 0 4)))
+           (range 0 (div (+ total4 nt -1) nt)))))
+
+  (define (vtile-each total4 nt body)
+    (map (lambda (i)
+           (let ([l `(+ tid ,(* i nt))])
+             (if (<= (* (+ i 1) nt) total4) (body i l) `(when (< ,l ,total4) ,(body i l)))))
+         (range 0 (div (+ total4 nt -1) nt))))
+
+  (define (vfetch tag total4 nt buf r0 rn off stride row BK kn . half)
+    (vtile-each total4 nt
+      (lambda (i l)
+        (let ([ps (map (lambda (j) (name 'p tag '_ i '_ j)) (range 0 4))])
+          `(let ([,row (/ ,l ,(div BK 4))] [kk (* 4 (rem ,l ,(div BK 4)))] [kn ,kn])
+             (if (and (< (+ ,r0 ,row) ,rn) (< (+ kn kk) k))
+                 (begin
+                   ,@(if (and (pair? half) (car half))
+                         ;; f16 data read as u32 words: two halves each, so 2 words are 4 elements
+                         `((vload (w0 w1) ,buf (/ (+ ,off (* (+ ,r0 ,row) ,stride) kn kk) 2))
+                           (set! ,(car ps) (half->f32 (bit-and w0 65535)))
+                           (set! ,(cadr ps) (half->f32 (shr w0 16)))
+                           (set! ,(caddr ps) (half->f32 (bit-and w1 65535)))
+                           (set! ,(cadddr ps) (half->f32 (shr w1 16))))
+                         `((vload (v0 v1 v2 v3) ,buf (+ ,off (* (+ ,r0 ,row) ,stride) kn kk))
+                           ,@(map (lambda (p v) `(set! ,p ,v)) ps '(v0 v1 v2 v3)))))
+                 (begin ,@(map (lambda (p) `(set! ,p 0.0)) ps))))))))
+
+  ;; trans: the tile is stored [k][row] with row stride `ld` instead of [row][k], so that fragments are
+  ;; loaded without a transpose.
+  (define (vstore tag total4 nt tile row BK ld trans)
+    (vtile-each total4 nt
+      (lambda (i l)
+        `(let ([,row (/ ,l ,(div BK 4))] [kk (* 4 (rem ,l ,(div BK 4)))])
+           ,@(map (lambda (j)
+                    `(store ,tile ,(if trans `(+ (* (+ kk ,j) ,ld) ,row) `(+ (* ,row ,ld) kk ,j))
+                            (f16 ,(name 'p tag '_ i '_ j))))
+                  (range 0 4))))))
+
   ;; ---- matmul -----------------------------------------------------------------------------------
 
   ;; dst[n, m] = sum_k a[m, k] * b[n, k], batched over (i2, i3) = z of the grid with a broadcast by
@@ -481,18 +608,41 @@
   ;; shared tiles are f16, a workgroup is WM x WN subgroups of 32 lanes, each subgroup owns
   ;; (BM/WM/16) x (BN/WN/16) 16x16 accumulators.  Same buffers and push words as k:matmul.  The
   ;; accumulators go through shared memory to the destination, so edges and strides need no care.
-  (define (k:matmul-cm atype BM BN BK WM WN)
-    (let* ([nsg (* WM WN)] [nt (* 32 nsg)] [ld (+ BK 8)]
+  (define (k:matmul-cm atype BM BN BK WM WN . opt)
+    ;; opt = (vec-a vec-b): fill the shared tiles of A (f32 only) / B with 4-wide loads. Needs k % 4 = 0,
+    ;; 16-byte aligned operands and strides that are multiples of 4 (the lowering checks).
+    (let* ([vec-a (and (pair? opt) (car opt))] [vec-b (and (pair? opt) (pair? (cdr opt)) (cadr opt))]
+           ;; third opt: both tiles software-pipelined (the next k tile is in flight while this one multiplies)
+           [pipe (and vec-a vec-b (pair? (cdr opt)) (pair? (cddr opt)) (caddr opt))]
+           [ta4 (div (* BM BK) 4)] [tb4 (div (* BN BK) 4)]
+           [ahalf (and pipe (eq? atype 'f16))]
+           ;; B tile stored [k][n] (no transposed fragment loads) in the pipelined form
+           [bt (and pipe (not (and (pair? (cdddr opt)) (eq? (cadddr opt) 'plain))))]
+           [ldb (+ BN 8)]
+           ;; fifth opt: m and n are multiples of BM and BN, so the accumulators are stored straight to c and the
+           ;; staging area `cs` (a quarter of the shared memory, i.e. of the occupancy) is not allocated
+           [direct (and pipe (pair? (cdddr opt)) (pair? (cddddr opt)) (car (cddddr opt)))]
+           ;; 'nocompute / 'nofill (diagnostics): skip the fragment loads and multiplies, or the refills of the
+           ;; shared tiles, to see how the time splits between them
+           [ablate (cond [(memq 'nocompute opt) 'nocompute] [(memq 'nofill opt) 'nofill] [else #f])]
+           [nsg (* WM WN)] [nt (* 32 nsg)] [ld (+ BK 8)]
            [fm (div BM (* WM 16))] [fn (div BN (* WN 16))]
            [is (range 0 fm)] [js (range 0 fn)] [ks (range 0 (div BK 16))])
       (define (acc i j) (name 'acc_ i '_ j))
       (define (fa i) (name 'fa_ i))
       (define (fb j) (name 'fb_ j))
-      `(kernel ,(name 'matmulcm_ atype '_ BM 'x BN 'x BK '_ WM 'x WN)
+      (define (regs) (append (vtile-regs 'a ta4 nt) (vtile-regs 'b tb4 nt)))
+      (define (fetch kn)
+        (append (vfetch 'a ta4 nt 'a 'm0 'm 'aoff 'a1 'mm BK kn ahalf)
+                (vfetch 'b tb4 nt 'b 'n0 'n 'boff 'b1 'nn BK kn)))
+      (define (stores)
+        (append (vstore 'a ta4 nt 'as 'mm BK ld #f)
+                (vstore 'b tb4 nt 'bs 'nn BK (if bt ldb ld) bt)))
+      `(kernel ,(name 'matmulcm_ atype '_ BM 'x BN 'x BK '_ WM 'x WN (if vec-a 'va "") (if vec-b 'vb "") (if pipe 'p "") (if bt 'bt "") (if direct 'd "") (if ablate ablate ""))
          (offsets prefix) (workgroup ,nt)
-         (buffers (a ro ,(elem-ty atype)) (b ro f32) (c wo f32))
+         (buffers (a ro ,(if ahalf 'u32 (elem-ty atype))) (b ro f32) (c wo f32))
          (push ,@(u32s 'm 'n 'k 'a1 'b1 'd1 'a2 'a3 'b2 'b3 'd2 'd3 'ne12 'r2 'r3))
-         (shared (as f16 ,(* BM ld)) (bs f16 ,(* BN ld)) (cs f32 ,(* 256 nsg)))
+         (shared (as f16 ,(* BM ld)) (bs f16 ,(if bt (* BK ldb) (* BN ld))) ,@(if direct '() `((cs f32 ,(* 256 nsg)))))
          (let ([tid (local-id 0)]
                [m0 (* (group-id 0) ,BM)]
                [n0 (* (group-id 1) ,BN)]
@@ -507,38 +657,64 @@
                ,@(map (lambda (i) `(cmat ,(fa i) a f16)) is)
                ,@(map (lambda (j) `(cmat ,(fb j) b f16)) js)
                ,@(apply append (map (lambda (i) (map (lambda (j) `(cm-zero ,(acc i j))) js)) is))
+               ,@(if pipe
+                     `(,@(regs)
+                       (let ([k0 (u32 0)])
+                         ,@(fetch 'k0)
+                         ,@(stores))
+                       (barrier))
+                     '())
                (for (k0 0 k ,BK)
-                 ,@(tile-loads (* BM BK) nt
-                     (lambda (l2)
-                       `(let ([mm (/ ,l2 ,BK)] [kk (rem ,l2 ,BK)])
-                          (store as (+ (* mm ,ld) kk)
-                                 (f16 (guard (and (< (+ m0 mm) m) (< (+ k0 kk) k))
-                                             ,(a-elem atype '(+ aoff (* (+ m0 mm) a1)) '(+ k0 kk))
-                                             0.0))))))
-                 ,@(tile-loads (* BN BK) nt
-                     (lambda (l2)
-                       `(let ([nn (/ ,l2 ,BK)] [kk (rem ,l2 ,BK)])
-                          (store bs (+ (* nn ,ld) kk)
-                                 (f16 (guard (and (< (+ n0 nn) n) (< (+ k0 kk) k))
-                                             (load b (+ boff (* (+ n0 nn) b1) k0 kk))
-                                             0.0))))))
-                 (barrier)
+                 ,@(if (and pipe (not (eq? ablate 'nofill))) (fetch `(+ k0 ,BK)) '())
+                 ,@(if pipe '() (if vec-a
+                       (tile-loads (div (* BM BK) 4) nt (lambda (l2) (vtile-fill 'as 'a 'm0 'm 'aoff 'a1 'mm l2 BK ld)))
+                       (tile-loads (* BM BK) nt
+                         (lambda (l2)
+                           `(let ([mm (/ ,l2 ,BK)] [kk (rem ,l2 ,BK)])
+                              (store as (+ (* mm ,ld) kk)
+                                     (f16 (guard (and (< (+ m0 mm) m) (< (+ k0 kk) k))
+                                                 ,(a-elem atype '(+ aoff (* (+ m0 mm) a1)) '(+ k0 kk))
+                                                 0.0))))))))
+                 ,@(if pipe '() (if vec-b
+                       (tile-loads (div (* BN BK) 4) nt (lambda (l2) (vtile-fill 'bs 'b 'n0 'n 'boff 'b1 'nn l2 BK ld)))
+                       (tile-loads (* BN BK) nt
+                         (lambda (l2)
+                           `(let ([nn (/ ,l2 ,BK)] [kk (rem ,l2 ,BK)])
+                              (store bs (+ (* nn ,ld) kk)
+                                     (f16 (guard (and (< (+ n0 nn) n) (< (+ k0 kk) k))
+                                                 (load b (+ boff (* (+ n0 nn) b1) k0 kk))
+                                                 0.0))))))))
+                 ,@(if pipe '() '((barrier)))
                  ,@(apply append
                      (map (lambda (s)
-                            (append
+                            (if (eq? ablate 'nocompute) '() (append
                               (map (lambda (i)
                                      `(cm-load ,(fa i) as (+ (* (+ (* wm ,(* fm 16)) ,(* i 16)) ,ld) ,(* s 16)) ,ld row))
                                    is)
                               (map (lambda (j)
-                                     `(cm-load ,(fb j) bs (+ (* (+ (* wn ,(* fn 16)) ,(* j 16)) ,ld) ,(* s 16)) ,ld col))
+                                     (if bt
+                                         `(cm-load ,(fb j) bs (+ ,(* s 16 ldb) (* wn ,(* fn 16)) ,(* j 16)) ,ldb row)
+                                         `(cm-load ,(fb j) bs (+ (* (+ (* wn ,(* fn 16)) ,(* j 16)) ,ld) ,(* s 16)) ,ld col)))
                                    js)
                               (apply append
                                 (map (lambda (i)
                                        (map (lambda (j) `(cm-muladd ,(acc i j) ,(fa i) ,(fb j) ,(acc i j))) js))
-                                     is))))
+                                     is)))))
                           ks))
-                 (barrier))
-               ,@(apply append
+                 (barrier)
+                 ,@(if pipe
+                       `(,@(if (eq? ablate 'nofill) '() (stores)) (barrier))
+                       '()))
+               ,@(if direct
+                     (apply append
+                       (map (lambda (i)
+                              (map (lambda (j)
+                                     `(cm-store ,(acc i j) c
+                                                (+ doff (* (+ n0 (* wn ,(* fn 16)) ,(* j 16)) d1) m0 (* wm ,(* fm 16)) ,(* i 16))
+                                                d1 col))
+                                   js))
+                            is))
+                 (apply append
                    (map (lambda (i)
                           (apply append
                             (map (lambda (j)
@@ -553,7 +729,7 @@
                                             (range 0 8))
                                      (barrier)))
                                  js)))
-                        is))))))))
+                        is)))))))))
 
   ;; q8_0 weights x int8 activations (k:quantize-q8) on the int8 tensor cores (PTX only: mma.sync m16n8k32).
   ;; One k step is one q8_0 block: the integer product of a 32-wide weight block and activation block is
@@ -815,6 +991,8 @@
                                    `(var ,(w (* 2 i)) f32 (* qs (f32 (sbits ,(name 'q i) 0 8))))
                                    `(var ,(w (+ 1 (* 2 i))) f32 (* qs (f32 (sbits ,(name 'q i) 8 8))))))
                            (range 0 8))))]
+             [(q4_0 q4_1 q5_0 q5_1 q4_K q6_K)
+              (map (lambda (i) `(var ,(w i) f32 ,(quant-elem atype (rb r) `(+ k0 ,i)))) (range 0 16))]
              [else (error 'k:matvec "no such weight type" atype)]))
          `(kernel ,(name 'matvec_ atype '_ ncols 'x R)
             (offsets prefix) (workgroup 128)
@@ -1226,6 +1404,180 @@
                                        (set! acc (fma (load s jj) ,(load-f32 vtype 'v '(+ vbase (* (+ c0 jj) v1) dd)) acc)))
                                      (store part (+ pb 2 dd) acc))))
                               dds)))))))))))
+
+
+  ;; ---- convolution support: im2col, pooling, depthwise conv, padding, upscaling ----------------
+  ;; One thread per output element, like the ggml shaders (vulkan-shaders/{im2col,pool2d,conv2d_dw,
+  ;; pad,upscale}); the push words follow the host's parameter lists.
+
+  ;; dst[b, oh, ow, (ic, ky, kx)] = x[b, ic, oh * s1 + ky * d1 - p1, ow * s0 + kx * d0 - p0] or 0.
+  ;; push: n chw ow oh kh kw iw ih s0 s1 p0 p1 d0 d1 offset_delta batch_offset (strides in elements)
+  (define (k:im2col dty)
+    `(kernel ,(name 'im2col_ dty)
+       (offsets prefix) (workgroup ,wg)
+       (buffers (a ro f32) (d wo ,(elem-ty dty)))
+       (push ,@(u32s 'n 'chw 'ow 'oh 'kh 'kw 'iw 'ih 's0 's1 'p0 'p1 'd0 'd1 'od 'bo))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ([c (rem idx chw)] [r (/ idx chw)])
+             (let ([o_w (rem r ow)] [r2 (/ r ow)])
+               (let ([o_h (rem r2 oh)] [b (/ r2 oh)] [khw (* kh kw)])
+                 (let ([ic (/ c khw)] [rm (rem c khw)])
+                   (let ([ky (/ rm kw)] [kx (rem rm kw)])
+                     (let ([iiw (- (+ (* (i32 o_w) (i32 s0)) (* (i32 kx) (i32 d0))) (i32 p0))]
+                           [iih (- (+ (* (i32 o_h) (i32 s1)) (* (i32 ky) (i32 d1))) (i32 p1))])
+                       ,(store-f32 dty 'd 'idx
+                          `(guard (and (>= iih 0) (< iih (i32 ih)) (>= iiw 0) (< iiw (i32 iw)))
+                                  (load a (+ (* b bo) (* ic od) (* (u32 iih) iw) (u32 iiw)))
+                                  0.0))))))))))))
+
+  ;; max / average pooling of contiguous images (op 0 max, 1 average).
+  ;; push: iw ih ow oh oc n op k0 k1 s0 s1 p0 p1  (k0, s0, p0 along h as in ggml_pool_2d)
+  (define (k:pool2d)
+    `(kernel pool2d
+       (offsets prefix) (workgroup ,wg)
+       (buffers (a ro f32) (d wo f32))
+       (push ,@(u32s 'iw 'ih 'ow 'oh 'oc 'n 'op 'k0 'k1 's0 's1 'p0 'p1))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ([ohw (* ow oh)])
+             (let ([nc (/ idx ohw)] [cur_oh (/ (rem idx ohw) ow)] [cur_ow (rem (rem idx ohw) ow)])
+               (let ([sh (- (* (i32 cur_oh) (i32 s0)) (i32 p0))] [sw (- (* (i32 cur_ow) (i32 s1)) (i32 p1))])
+                 (let ([bh (u32 (max sh 0))] [eh (u32 (max 0 (min (+ sh (i32 k0)) (i32 ih))))]
+                       [bw (u32 (max sw 0))] [ew (u32 (max 0 (min (+ sw (i32 k1)) (i32 iw))))]
+                       [scale (/ 1.0 (f32 (* k0 k1)))])
+                   (var acc f32 (select (= op 1) 0.0 -3.4028234663852886e38))
+                   (for (i bh eh)
+                     (for (j bw ew)
+                       (let ([cur (load a (+ (* nc ih iw) (* i iw) j))])
+                         (set! acc (select (= op 1) (+ acc (* cur scale)) (max acc cur))))))
+                   (store d idx acc)))))))))
+
+  ;; Depthwise convolution of contiguous images (WHCN), kernel [kw, kh, channels].
+  ;; push: n batches channels dw dh sw sh kw kh sx sy px py dx dy
+  (define (k:conv-dw kty)
+    `(kernel ,(name 'convdw_ kty)
+       (offsets prefix) (workgroup ,wg)
+       (buffers (k ro ,(elem-ty kty)) (x ro f32) (d wo f32))
+       (push ,@(u32s 'n 'batches 'channels 'dw 'dh 'sw 'sh 'kw 'kh 'sx 'sy 'px 'py 'dx 'dy))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ([i0 (/ idx dw)])
+             (let ([dst_x (- idx (* i0 dw))] [i1 (/ i0 dh)])
+               (let ([dst_y (- i0 (* i1 dh))] [nb (/ i1 channels)])
+                 (let ([c (- i1 (* nb channels))])
+                   (let ([src_i (+ (* nb channels sh sw) (* c sh sw))] [knl_i (* c kh kw)])
+                     (var sum f32 0.0)
+                     (for (ky 0 kh)
+                       (let ([src_y (- (+ (* dst_y sy) (* ky dy)) py)])
+                         (when (< src_y sh)
+                           (for (kx 0 kw)
+                             (let ([src_x (- (+ (* dst_x sx) (* kx dx)) px)])
+                               (when (< src_x sw)
+                                 (set! sum (fma (load x (+ src_i (* src_y sw) src_x))
+                                                ,(load-f32 kty 'k '(+ knl_i (* ky kw) kx))
+                                                sum))))))))
+                     (store d idx sum))))))))))
+
+  ;; Padding with zeros (or wrapping around when circular): dst[i] = src[i - lp] inside the source.
+  ;; push: n ne0 ne1 ne2 sne0 sne1 sne2 sne3 lp0 lp1 lp2 lp3 a0 a1 a2 a3 d0 d1 d2 d3
+  (define (k:pad circular?)
+    `(kernel ,(name 'pad_ (if circular? 'circular 'zero))
+       (offsets prefix) (workgroup ,wg)
+       (buffers (a ro f32) (d wo f32))
+       (push ,@(apply u32s (append '(n ne0 ne1 ne2 sne0 sne1 sne2 sne3 lp0 lp1 lp2 lp3) (strides 'a) (strides 'd))))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ,dec-dst
+             (store d ,(dot dst-idx (strides 'd))
+               ,(if circular?
+                    `(load a ,(dot (map (lambda (i l s) `(rem (- (+ ,i ,s) ,l) ,s)) dst-idx '(lp0 lp1 lp2 lp3) '(sne0 sne1 sne2 sne3)) (strides 'a)))
+                    `(guard (and ,@(map (lambda (i l s) `(and (>= ,i ,l) (< (- ,i ,l) ,s))) dst-idx '(lp0 lp1 lp2 lp3) '(sne0 sne1 sne2 sne3)))
+                            (load a ,(dot (map (lambda (i l) `(- ,i ,l)) dst-idx '(lp0 lp1 lp2 lp3)) (strides 'a)))
+                            0.0))))))))
+
+  ;; Reflection padding of the first dimension (left p0, the right amount is implied by the shapes).
+  ;; push: n ne0 ne1 ne2 sne0 p0 a0 a1 a2 a3 d0 d1 d2 d3
+  (define (k:pad-reflect)
+    `(kernel pad_reflect
+       (offsets prefix) (workgroup ,wg)
+       (buffers (a ro f32) (d wo f32))
+       (push ,@(apply u32s (append '(n ne0 ne1 ne2 sne0 p0) (strides 'a) (strides 'd))))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ,dec-dst
+             (let ([x (- (i32 i0) (i32 p0))] [n1 (i32 sne0)])
+               (let ([y (select (< x 0) (- x) (select (>= x n1) (- (* 2 (- n1 1)) x) x))])
+                 (store d ,(dot dst-idx (strides 'd))
+                        (load a (+ (* (u32 y) a0) (* i1 a1) (* i2 a2) (* i3 a3)))))))))))
+
+  ;; Upscaling of the first two dimensions (nearest, bilinear, bicubic with alpha -0.75), the other
+  ;; two are scaled by nearest. Destination contiguous.
+  ;; push: n sne0 sne1 ne0 ne1 ne2 a0 a1 a2 a3 sf0 sf1 sf2 sf3 po   (sf and po are f32)
+  (define (k:upscale mode)
+    (define (src-plane)
+      '(+ (* (u32 (/ (f32 i2) sf2)) a2) (* (u32 (/ (f32 i3) sf3)) a3)))
+    (define (poly c x) `(+ (* ,(car c) ,x ,x ,x) (* ,(cadr c) ,x ,x) (* ,(caddr c) ,x) ,(cadddr c)))
+    (define (w1 x) (poly '(1.25 -2.25 0.0 1.0) x))
+    (define (w2 x) (poly '(-0.75 3.75 -6.0 3.0) x))
+    (define (cubic p0 p1 p2 p3 x)
+      `(+ (* ,p0 ,(w2 `(+ ,x 1.0))) (* ,p1 ,(w1 x)) (* ,p2 ,(w1 `(- 1.0 ,x))) (* ,p3 ,(w2 `(- 2.0 ,x)))))
+    (define (fetch b a)
+      `(load a (+ base (* (u32 (max 0 (min (+ ix ,a) rx))) a0) (* (u32 (max 0 (min (+ iy ,b) ry))) a1))))
+    ;; bilinear with a triangle filter as wide as the shrink factor (what Pillow / torch antialias do)
+    (define antialias-stmt
+      `(let ([s0 (max 1.0 (/ 1.0 sf0))] [s1 (max 1.0 (/ 1.0 sf1))] [base ,(src-plane)])
+         (let ([iv0 (/ 1.0 s0)] [iv1 (/ 1.0 s1)]
+               [x (/ (+ (f32 i0) po) sf0)] [y (/ (+ (f32 i1) po) sf1)])
+           (let ([x_min (u32 (max (i32 (+ (- x s0) po)) 0))] [x_max (u32 (max (min (i32 (+ x s0 po)) (i32 sne0)) 0))]
+                 [y_min (u32 (max (i32 (+ (- y s1) po)) 0))] [y_max (u32 (max (min (i32 (+ y s1 po)) (i32 sne1)) 0))])
+             (var val f32 0.0)
+             (var total f32 0.0)
+             (for (sy y_min y_max)
+               (let ([wy (max (- 1.0 (abs (* (+ (- (f32 sy) y) po) iv1))) 0.0)])
+                 (for (sx x_min x_max)
+                   (let ([w (* (max (- 1.0 (abs (* (+ (- (f32 sx) x) po) iv0))) 0.0) wy)])
+                     (when (> w 0.0)
+                       (set! val (+ val (* (load a (+ base (* sy a1) (* sx a0))) w)))
+                       (set! total (+ total w)))))))
+             (store d idx (select (> total 0.0) (/ val total) val))))))
+    (define body
+      (case mode
+        [(nearest)
+         `(load a (+ (* (u32 (/ (f32 i0) sf0)) a0) (* (u32 (/ (f32 i1) sf1)) a1) ,(src-plane)))]
+        [(bilinear)
+         `(let ([cx (- (/ (+ (f32 i0) po) sf0) po)] [cy (- (/ (+ (f32 i1) po) sf1) po)] [base ,(src-plane)])
+            (let ([fx (floor cx)] [fy (floor cy)])
+              (let ([dx (- cx fx)] [dy (- cy fy)]
+                    [x0 (max (i32 fx) 0)] [x1 (min (+ (i32 fx) 1) (- (i32 sne0) 1))]
+                    [y0 (max (i32 fy) 0)] [y1 (min (+ (i32 fy) 1) (- (i32 sne1) 1))])
+                (let ([v00 (load a (+ base (* (u32 y0) a1) (* (u32 x0) a0)))]
+                      [v01 (load a (+ base (* (u32 y0) a1) (* (u32 x1) a0)))]
+                      [v10 (load a (+ base (* (u32 y1) a1) (* (u32 x0) a0)))]
+                      [v11 (load a (+ base (* (u32 y1) a1) (* (u32 x1) a0)))])
+                  (+ (* v00 (- 1.0 dx) (- 1.0 dy)) (* v01 dx (- 1.0 dy)) (* v10 (- 1.0 dx) dy) (* v11 dx dy))))))]
+        [(bicubic)
+         `(let ([cx (- (/ (+ (f32 i0) po) sf0) po)] [cy (- (/ (+ (f32 i1) po) sf1) po)] [base ,(src-plane)])
+            (let ([fx (floor cx)] [fy (floor cy)])
+              (let ([dx (- cx fx)] [dy (- cy fy)] [ix (i32 fx)] [iy (i32 fy)] [rx (- (i32 sne0) 1)] [ry (- (i32 sne1) 1)])
+                (let (,@(apply append
+                          (map (lambda (b)
+                                 (let ([row (name 'r (+ b 1))])
+                                   (list (list row
+                                               (cubic
+                                                 (fetch b -1) (fetch b 0) (fetch b 1) (fetch b 2) 'dx)))))
+                               '(-1 0 1 2))))
+                  ,(cubic 'r0 'r1 'r2 'r3 'dy)))))]
+        [(antialias) #f]
+        [else (error 'k:upscale "unknown mode" mode)]))
+    `(kernel ,(name 'upscale_ mode)
+       (offsets prefix) (workgroup ,wg)
+       (buffers (a ro f32) (d wo f32))
+       (push ,@(apply u32s (append '(n sne0 sne1 ne0 ne1 ne2) (strides 'a))) (sf0 f32) (sf1 f32) (sf2 f32) (sf3 f32) (po f32))
+       (let ([idx ,flat-index])
+         (when (< idx n)
+           (let ,dec-dst
+             ,(if (eq? mode 'antialias) antialias-stmt `(store d idx ,body)))))))
 
   ;; ---- paged attention (vLLM pool layouts, see docs/design/kernel-launcher.md) ---------------------
   ;; Key pool f16 [blocks, kv_heads, hs/8, bs, 8], value pool f16 [blocks, kv_heads, hs, bs]; kvb and

@@ -17,8 +17,11 @@ mod guard;
 mod host;
 #[cfg(native_device)]
 mod native_ir;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "native-metal-tree")))]
 #[path = "native_metal.rs"]
+mod native;
+#[cfg(all(target_os = "macos", feature = "native-metal-tree"))]
+#[path = "native_metal_tree.rs"]
 mod native;
 #[cfg(all(feature = "native-cuda-tree", not(target_os = "macos")))]
 #[path = "native_cuda_tree.rs"]
