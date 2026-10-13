@@ -82,6 +82,11 @@ The speech decoder's KV cache holds 1024 frames (82 s) and the language model's 
 longer than that must be restarted. The streamed waveform is 6 samples behind the codes (the codec's padding); the
 chunked `tts-decode` of the offline pipelines differs from `codec-step` by ~1% (correlation 0.993) at its chunk edges.
 
+On an RTX 3080 (10 GB, ggml CUDA, `--device gpu`, q4 with the TTS tables, 8.3 GiB of weights) the whole `listen` pipeline fits and runs
+faster than real time: once speech flows a frame takes 62-65 ms (encoder + language model ~33 ms, speech decoder + codec ~34 ms),
+the first audio comes 1.2 s in. The codec's depthwise convolution (kernel 7) needed `case 7` in ggml-cuda's `ssm-conv.cu`
+(vendored, patched). Short clip, not paced over RPC, no tool calling measured.
+
 ## Tool calling
 
 `listen-tools` ([audio stream] [system string] [tools string] [reply string]) is `listen` with a system prompt and tools.
