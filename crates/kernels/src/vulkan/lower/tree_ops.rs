@@ -199,8 +199,18 @@ impl<'a> Ctx<'a> {
             (64, 64, 2, 2)
         };
         let push = [m, n, k, ta.nb[1], k / 4, k / 32, td.nb[1]];
+        // Rows that start on 16 bytes (k % 256 == 0, aligned weights) take the kernel staging raw rows in
+        // 16-byte loads: 2.6x faster. Only 64x64 and 32x128 tiles fit its static shared memory.
+        let wide = k % 256 == 0 && ta.nb[1] % 8 == 0 && ta.off % 16 == 0 && std::env::var_os("TL_TREE_NOWIDE").is_none();
+        let (kernel, bm, bn, wm, wn) = if !wide {
+            ("k:matmul-q8mma", bm, bn, wm, wn)
+        } else if n >= 128 && m < 256 {
+            ("k:matmul-q8mma-w", 32, 128, 1, 4)
+        } else {
+            ("k:matmul-q8mma-w", 64, 64, 2, 2)
+        };
         let mm = self.launch(
-            tree.blob(&format!("(k:matmul-q8mma {bm} {bn} {wm} {wn})"))?,
+            tree.blob(&format!("({kernel} {bm} {bn} {wm} {wn})"))?,
             vec![ta.range, xq, xd, td.range],
             words(&push),
             [ceil_div(m, bm), ceil_div(n, bn), 1],

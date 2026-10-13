@@ -301,8 +301,10 @@ when the backend drops, `TL_CUDA_GRAPHS=0` and `TL_TREE_NOMMA=1` switch the firs
   per block into an f32 accumulator. 12288x406x1536: 0.65 ms against 1.59 ms for the f16 tile matmul (21 against 10 T-ops/s);
   the long-prompt sweep's GPU time went from 72.5 s to 46 s. Ablation of the kernel: without global loads it runs at ~70
   T-ops/s, without the mma the loads alone cost half the time, so the remaining cost is staging the 34-byte q8_0 blocks (two
-  16-bit loads per word). Next step there: 16-byte loads of raw row chunks (8 blocks, k % 256 == 0) with the realignment done
-  at fragment load. ncu is installed but the driver denies counter access (ERR_NVGPUCTRPERM) without admin rights.
+  16-bit loads per word). `k:matmul-q8mma-w` does that: 16-byte loads of raw row chunks (8 blocks, k % 256 == 0) with the
+  realignment done at fragment load; 1536x406x6144 0.47 -> 0.18 ms (42 T-ops/s), 2048x406x1536 0.11 -> 0.062 ms. The lowering
+  uses it when k % 256 == 0 and rows are 16-byte aligned (64x64 or 32x128 tiles, the 48 KB static shared memory limit;
+  `TL_TREE_NOWIDE=1` falls back). ncu is installed but the driver denies counter access (ERR_NVGPUCTRPERM) without admin rights.
 * Single-sequence decode is now 5.2 ms a step (190 tokens/s, 36 on the NVRTC executor). Left in the profile: ~270 launches
   of the mat-vec at ~60% of the weights' bandwidth bound, prefill flash attention (~20% of a long-prompt run).
 
