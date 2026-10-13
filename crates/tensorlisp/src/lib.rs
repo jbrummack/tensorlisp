@@ -15,6 +15,8 @@ pub mod error;
 pub mod gguf;
 mod guard;
 mod host;
+pub mod guide;
+pub mod nemo_mel;
 pub mod usm_mel;
 #[cfg(native_device)]
 mod native_ir;

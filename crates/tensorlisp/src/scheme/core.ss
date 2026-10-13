@@ -359,6 +359,20 @@
 (define tl_host_mel_push (foreign-procedure "tl_host_mel_push" (integer-64 integer-64) integer-64))
 (define tl_host_mel_frames (foreign-procedure "tl_host_mel_frames" (integer-64) integer-64))
 (define tl_host_mel_window (foreign-procedure "tl_host_mel_window" (integer-64 integer-64 integer-64) integer-64))
+(define tl_host_random_seed (foreign-procedure "tl_host_random_seed" (integer-64) integer-64))
+(define tl_host_random (foreign-procedure "tl_host_random" (integer-64 integer-64) integer-64))
+(define tl_host_nemo_mel_new (foreign-procedure "tl_host_nemo_mel_new" () integer-64))
+(define tl_host_tool_call_regex (foreign-procedure "tl_host_tool_call_regex" (string integer-64) string))
+(define tl_host_tools_prompt (foreign-procedure "tl_host_tools_prompt" (string) string))
+(define tl_host_guide_new (foreign-procedure "tl_host_guide_new" (integer-64 string integer-64) integer-64))
+(define tl_host_guide_mask (foreign-procedure "tl_host_guide_mask" (integer-64) integer-64))
+(define tl_host_guide_advance (foreign-procedure "tl_host_guide_advance" (integer-64 integer-64) integer-64))
+(define tl_host_guide_final (foreign-procedure "tl_host_guide_final" (integer-64) integer-64))
+(define tl_host_guide_reset (foreign-procedure "tl_host_guide_reset" (integer-64) integer-64))
+(define tl_host_nemo_mel_push (foreign-procedure "tl_host_nemo_mel_push" (integer-64 integer-64) integer-64))
+(define tl_host_nemo_mel_finish (foreign-procedure "tl_host_nemo_mel_finish" (integer-64) integer-64))
+(define tl_host_nemo_mel_frames (foreign-procedure "tl_host_nemo_mel_frames" (integer-64) integer-64))
+(define tl_host_nemo_mel_window (foreign-procedure "tl_host_nemo_mel_window" (integer-64 integer-64 integer-64) integer-64))
 (define tl_host_cb_call (foreign-procedure "tl_host_cb_call" (string) integer-64))
 (define tl_host_cb_sample (foreign-procedure "tl_host_cb_sample" (integer-64 integer-64 integer-64 int) integer-64))
 (define tl_host_cb_arg (foreign-procedure "tl_host_cb_arg" (integer-64 integer-64) integer-64))
@@ -1033,6 +1047,52 @@
     (- n 1)))
 (define (usm-mel-window ms from n)
   (%host 'usm-mel-window 'array (tl_host_mel_window (%host-id 'usm-mel-window 'melstream ms) from n)))
+
+;; Random numbers for samplers: (random-seed! n) makes the stream reproducible, (random-uniform n) is an array of n
+;; values in (0, 1), (random-normal n) standard normal ones.
+(define (random-seed! seed) (tl_host_random_seed (%integer 'random-seed! 'seed seed)) (void))
+(define (random-uniform n) (%host 'random-uniform 'array (tl_host_random 0 (%integer 'random-uniform 'n n))))
+(define (random-normal n) (%host 'random-normal 'array (tl_host_random 1 (%integer 'random-normal 'n n))))
+
+;; NemotronLabs VoiceChat's audio front end (NeMo's 128-band log-mel at 10 ms, see src/nemo_mel.rs), fed as audio
+;; arrives like Gemma 4's: (nemo-mel-push! ms audio) returns how many frames exist so far, (nemo-mel-finish! ms)
+;; ends the audio (the last frames use the reflect padding), (nemo-mel-window ms from n) is frames from .. from + n
+;; as an [n, 128] array, zero where there are none.
+(define (nemo-mel-new) (%host 'nemo-mel-new 'melstream (tl_host_nemo_mel_new)))
+(define (nemo-mel-push! ms audio)
+  (let ([n (tl_host_nemo_mel_push (%host-id 'nemo-mel-push! 'melstream ms) (%host-id 'nemo-mel-push! 'audio audio))])
+    (when (eqv? n 0) (error 'nemo-mel-push! (tl_host_error)))
+    (- n 1)))
+(define (nemo-mel-finish! ms)
+  (let ([n (tl_host_nemo_mel_finish (%host-id 'nemo-mel-finish! 'melstream ms))])
+    (when (eqv? n 0) (error 'nemo-mel-finish! (tl_host_error)))
+    (- n 1)))
+(define (nemo-mel-frames ms)
+  (let ([n (tl_host_nemo_mel_frames (%host-id 'nemo-mel-frames 'melstream ms))])
+    (when (eqv? n 0) (error 'nemo-mel-frames (tl_host_error)))
+    (- n 1)))
+(define (nemo-mel-window ms from n)
+  (%host 'nemo-mel-window 'array (tl_host_nemo_mel_window (%host-id 'nemo-mel-window 'melstream ms) from n)))
+
+;; Constrained decoding (outlines-core, src/guide.rs). (tools-prompt tools-json) renders tools the way the system prompt shows
+;; them (keys sorted like Jinja's tojson). (tool-call-regex tools-json max-calls) is the regular expression of
+;; <TOOLCALL>[{"name": ..., "arguments": {...}}, ...]</TOOLCALL> for tools given as a JSON array of {name, description,
+;; parameters (a JSON schema)}. (guide-new tokenizer-json regex eos-id) compiles it against the byte-level BPE
+;; vocabulary of a tokenizer.json (an asset); (guide-mask g) is an [1, vocab] array, 0 for the tokens that may come
+;; next (eos-id once the match is complete) and -1e30 for the rest, to add to logits; (guide-advance! g token) moves on
+;; (#f if the token is not allowed); (guide-final? g); (guide-reset! g).
+(define (tool-call-regex tools max-calls)
+  (unless (string? tools) (error 'tool-call-regex "expected a JSON string" tools))
+  (or (tl_host_tool_call_regex tools max-calls) (error 'tool-call-regex (tl_host_error))))
+(define (tools-prompt tools)
+  (or (tl_host_tools_prompt tools) (error 'tools-prompt (tl_host_error))))
+(define (guide-new source regex eos)
+  (%host 'guide-new 'guide (tl_host_guide_new (%host-id 'guide-new 'bytes source) regex eos)))
+(define (guide-mask g) (%host 'guide-mask 'array (tl_host_guide_mask (%host-id 'guide-mask 'guide g))))
+(define (%guide-flag who r) (when (eqv? r 0) (error who (tl_host_error))) (eqv? r 2))
+(define (guide-advance! g token) (%guide-flag 'guide-advance! (tl_host_guide_advance (%host-id 'guide-advance! 'guide g) token)))
+(define (guide-final? g) (%guide-flag 'guide-final? (tl_host_guide_final (%host-id 'guide-final? 'guide g))))
+(define (guide-reset! g) (tl_host_guide_reset (%host-id 'guide-reset! 'guide g)) (void))
 
 ;; Calling the client. The pipeline waits (yielding the Scheme thread) while the client answers.
 ;;

@@ -113,16 +113,28 @@ pub fn read_raw_examples_for(specs: &[tensorlisp::RawSpec], args: &[String]) -> 
             (RawKind::Image, Some(p)) => RawInput::Image(tensorlisp::autopro::image::decode(&read(p)?)?),
             (RawKind::Audio, Some(p)) => RawInput::Audio(tensorlisp::autopro::audio::Audio::from_wav_bytes(&read(p)?)?),
             (RawKind::Array, Some(p)) => RawInput::Array(npy::read(p.as_ref())?),
-            // A stream gets the file as its only chunk, then ends.
+            // A stream gets the file as its only chunk, then ends; `file.wav#80` cuts a wav into 80 ms chunks.
             (RawKind::Stream, Some(p)) => {
                 use tensorlisp::Chunk;
-                let chunk = match std::path::Path::new(p).extension().and_then(|e| e.to_str()) {
-                    Some("wav") => Chunk::Audio(tensorlisp::autopro::audio::Audio::from_wav_bytes(&read(p)?)?),
-                    Some("npy") => Chunk::Array(npy::read(p.as_ref())?),
-                    _ => Chunk::Text(String::from_utf8(read(p)?).context("stream file is not a .wav, a .npy or UTF-8 text")?),
+                let (p, chunk_ms) = match p.rsplit_once('#') {
+                    Some((p, ms)) => (p, Some(ms.parse::<usize>().with_context(|| format!("chunk size {ms:?} is not a number of ms"))?)),
+                    None => (p, None),
                 };
                 let (tx, rx) = tensorlisp::input_stream(|| {});
-                tx.send(chunk).expect("the receiver is alive");
+                match std::path::Path::new(p).extension().and_then(|e| e.to_str()) {
+                    Some("wav") => {
+                        let audio = tensorlisp::autopro::audio::Audio::from_wav_bytes(&read(p)?)?;
+                        let step = chunk_ms.map_or(audio.samples.len().max(1), |ms| (audio.sample_rate as usize * ms / 1000).max(1));
+                        for part in audio.samples.chunks(step) {
+                            tx.send(Chunk::Audio(tensorlisp::autopro::audio::Audio::new(part.to_vec(), audio.sample_rate)))
+                                .expect("the receiver is alive");
+                        }
+                    }
+                    Some("npy") => tx.send(Chunk::Array(npy::read(p.as_ref())?)).expect("the receiver is alive"),
+                    _ => tx
+                        .send(Chunk::Text(String::from_utf8(read(p)?).context("stream file is not a .wav, a .npy or UTF-8 text")?))
+                        .expect("the receiver is alive"),
+                }
                 RawInput::Stream(rx)
             }
             (kind, None) => bail!("raw input {name:?} is {kind:?}; pass a file as {name}=@path"),

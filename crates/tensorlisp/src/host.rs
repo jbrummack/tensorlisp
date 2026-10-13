@@ -41,6 +41,10 @@ pub(crate) enum HostValue {
     Callback(Box<CallbackCall>),
     /// Gemma 4's audio front end, fed audio as it arrives.
     Mel(Box<crate::usm_mel::UsmMel>),
+    /// NemotronLabs VoiceChat's (NeMo) audio front end, fed audio as it arrives.
+    NemoMel(Box<crate::nemo_mel::NemoMel>),
+    /// A constrained-decoding state (outlines-core).
+    Guide(Box<crate::guide::Guide>),
 }
 
 pub(crate) enum CallbackKind {
@@ -87,7 +91,8 @@ impl HostValue {
             HostValue::Stream(_) => "stream",
             HostValue::Emitter(_) => "emitter",
             HostValue::Callback(_) => "callback",
-            HostValue::Mel(_) => "melstream",
+            HostValue::Mel(_) | HostValue::NemoMel(_) => "melstream",
+            HostValue::Guide(_) => "guide",
         }
     }
 }
@@ -1034,6 +1039,167 @@ extern "C" fn tl_host_mel_window(mel: i64, from: i64, n: i64) -> i64 {
     })
 }
 
+// --- Random numbers for samplers in pipelines: `(random-seed! n)`, `(random-uniform n)`, `(random-normal n)` (arrays of n values).
+
+thread_local! {
+    static RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0x9E37_79B9_7F4A_7C15) };
+}
+
+/// splitmix64: a full-period generator that is good enough for sampling and needs no dependency.
+fn next_u64() -> u64 {
+    RNG_STATE.with(|s| {
+        let z = s.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+        s.set(z);
+        let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    })
+}
+
+/// Uniform in the open interval (0, 1).
+fn next_uniform() -> f64 {
+    ((next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+}
+
+extern "C" fn tl_host_random_seed(seed: i64) -> i64 {
+    ffi(|| {
+        RNG_STATE.with(|s| s.set(seed as u64));
+        Ok(1)
+    })
+}
+
+/// kind 0: uniform (0, 1); kind 1: standard normal (Box-Muller).
+extern "C" fn tl_host_random(kind: i64, n: i64) -> i64 {
+    ffi(|| {
+        if !(0..=1 << 24).contains(&n) {
+            return Err(format!("random array of {n} values"));
+        }
+        let values: Vec<f32> = (0..n)
+            .map(|_| match kind {
+                0 => next_uniform() as f32,
+                _ => ((-2.0 * next_uniform().ln()).sqrt() * (2.0 * std::f64::consts::PI * next_uniform()).cos()) as f32,
+            })
+            .collect();
+        Ok(insert(HostValue::Tensor(ArrayD::from_shape_vec(vec![n as usize], values).map_err(|e| e.to_string())?)))
+    })
+}
+
+// --- NeMo's log-mel front end (VoiceChat): `(nemo-mel-new)`, `(nemo-mel-push! ms audio)`, `(nemo-mel-finish! ms)`,
+// `(nemo-mel-window ms from n)`.
+
+extern "C" fn tl_host_nemo_mel_new() -> i64 {
+    ffi(|| Ok(insert(HostValue::NemoMel(Box::new(crate::nemo_mel::NemoMel::new())))))
+}
+
+fn with_nemo_mel<T>(mel: i64, f: impl FnOnce(&mut crate::nemo_mel::NemoMel) -> T) -> Result<T, String> {
+    with_registry(|r| match r.values.get_mut(&mel) {
+        Some((_, HostValue::NemoMel(m))) => Ok(f(m)),
+        _ => Err(format!("host value {mel} is not a NeMo audio front end")),
+    })
+}
+
+/// Feeds an audio chunk (16 kHz mono); returns the number of frames so far + 1.
+extern "C" fn tl_host_nemo_mel_push(mel: i64, audio: i64) -> i64 {
+    ffi(|| {
+        let samples = get(audio, |v| match v {
+            HostValue::Audio(a) if a.sample_rate == 16000 => Ok(a.samples.clone()),
+            HostValue::Audio(a) => Err(format!("the audio front end takes 16 kHz audio, this is {} Hz", a.sample_rate)),
+            other => Err(format!("expected audio, not a {}", other.kind())),
+        })?;
+        with_nemo_mel(mel, |m| {
+            m.push(&samples);
+            m.frames() as i64 + 1
+        })
+    })
+}
+
+/// Ends the audio; returns the number of frames + 1.
+extern "C" fn tl_host_nemo_mel_finish(mel: i64) -> i64 {
+    ffi(|| {
+        with_nemo_mel(mel, |m| {
+            m.finish();
+            m.frames() as i64 + 1
+        })
+    })
+}
+
+extern "C" fn tl_host_nemo_mel_frames(mel: i64) -> i64 {
+    ffi(|| with_nemo_mel(mel, |m| m.frames() as i64 + 1))
+}
+
+/// Frames `from .. from + n` as an [n, 128] array, zeros where there are none.
+extern "C" fn tl_host_nemo_mel_window(mel: i64, from: i64, n: i64) -> i64 {
+    ffi(|| {
+        let window = with_nemo_mel(mel, |m| m.window(from, n.max(0) as usize))?;
+        Ok(insert(HostValue::Tensor(window.into_dyn())))
+    })
+}
+
+// --- Constrained decoding: `(tool-call-regex tools-json)`, `(guide-new tokenizer-json regex eos-id)`, `(guide-mask g)`,
+// `(guide-advance! g token)`, `(guide-final? g)`, `(guide-reset! g)`.
+
+extern "C" fn tl_host_tool_call_regex(tools: *const c_char, max_calls: i64) -> *const c_char {
+    let ok = ffi(|| {
+        let re = crate::guide::tool_call_regex(text_arg(tools)?, max_calls.max(1) as usize)?;
+        with_registry(|r| r.text = CString::new(re.replace('\0', "")).unwrap_or_default());
+        Ok(1)
+    });
+    if ok == 0 { std::ptr::null() } else { with_registry(|r| r.text.as_ptr()) }
+}
+
+/// The tools as the system prompt shows them (see guide::tools_prompt_json).
+extern "C" fn tl_host_tools_prompt(tools: *const c_char) -> *const c_char {
+    let ok = ffi(|| {
+        let text = crate::guide::tools_prompt_json(text_arg(tools)?)?;
+        with_registry(|r| r.text = CString::new(text.replace('\0', "")).unwrap_or_default());
+        Ok(1)
+    });
+    if ok == 0 { std::ptr::null() } else { with_registry(|r| r.text.as_ptr()) }
+}
+
+extern "C" fn tl_host_guide_new(tokenizer_json: i64, regex: *const c_char, eos: i64) -> i64 {
+    ffi(|| {
+        let data = get(tokenizer_json, |v| match expect_kind(v, "bytes")? {
+            HostValue::Bytes(b) => Ok(b.clone()),
+            _ => unreachable!(),
+        })?;
+        let guide = crate::guide::Guide::new(&data, text_arg(regex)?, eos as u32)?;
+        Ok(insert(HostValue::Guide(Box::new(guide))))
+    })
+}
+
+fn with_guide<T>(g: i64, f: impl FnOnce(&mut crate::guide::Guide) -> T) -> Result<T, String> {
+    with_registry(|r| match r.values.get_mut(&g) {
+        Some((_, HostValue::Guide(x))) => Ok(f(x)),
+        _ => Err(format!("host value {g} is not a guide")),
+    })
+}
+
+/// The allowed-token mask, an [1, vocab] array of 0 / -1e30.
+extern "C" fn tl_host_guide_mask(g: i64) -> i64 {
+    ffi(|| {
+        let m = with_guide(g, |x| x.mask())?;
+        let n = m.len();
+        Ok(insert(HostValue::Tensor(ArrayD::from_shape_vec(vec![1, n], m).map_err(|e| e.to_string())?)))
+    })
+}
+
+/// 2 if the token was accepted, 1 if not.
+extern "C" fn tl_host_guide_advance(g: i64, token: i64) -> i64 {
+    ffi(|| with_guide(g, |x| if x.advance(token as u32) { 2 } else { 1 }))
+}
+
+extern "C" fn tl_host_guide_final(g: i64) -> i64 {
+    ffi(|| with_guide(g, |x| if x.is_final() { 2 } else { 1 }))
+}
+
+extern "C" fn tl_host_guide_reset(g: i64) -> i64 {
+    ffi(|| with_guide(g, |x| {
+        x.reset();
+        1
+    }))
+}
+
 // --- Callbacks: `(client-call name arg ...)` and `(client-sample logits ...)` in pipelines.
 
 fn new_callback(kind: CallbackKind, logits: Option<ArrayD<f32>>, history: Vec<i32>) -> i64 {
@@ -1388,6 +1554,20 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_mel_push", tl_host_mel_push as *const _),
         ("tl_host_mel_window", tl_host_mel_window as *const _),
         ("tl_host_mel_frames", tl_host_mel_frames as *const _),
+        ("tl_host_random_seed", tl_host_random_seed as *const _),
+        ("tl_host_random", tl_host_random as *const _),
+        ("tl_host_nemo_mel_new", tl_host_nemo_mel_new as *const _),
+        ("tl_host_tool_call_regex", tl_host_tool_call_regex as *const _),
+        ("tl_host_tools_prompt", tl_host_tools_prompt as *const _),
+        ("tl_host_guide_new", tl_host_guide_new as *const _),
+        ("tl_host_guide_mask", tl_host_guide_mask as *const _),
+        ("tl_host_guide_advance", tl_host_guide_advance as *const _),
+        ("tl_host_guide_final", tl_host_guide_final as *const _),
+        ("tl_host_guide_reset", tl_host_guide_reset as *const _),
+        ("tl_host_nemo_mel_push", tl_host_nemo_mel_push as *const _),
+        ("tl_host_nemo_mel_finish", tl_host_nemo_mel_finish as *const _),
+        ("tl_host_nemo_mel_frames", tl_host_nemo_mel_frames as *const _),
+        ("tl_host_nemo_mel_window", tl_host_nemo_mel_window as *const _),
         ("tl_host_cb_call", tl_host_cb_call as *const _),
         ("tl_host_cb_sample", tl_host_cb_sample as *const _),
         ("tl_host_cb_arg", tl_host_cb_arg as *const _),

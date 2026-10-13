@@ -45,6 +45,12 @@ pub struct ConvertArgs {
     /// RMSNorm scales by (1 + w): `--offset '*norm.weight=1'` stores 1 + w.
     #[arg(long)]
     pub offset: Vec<String>,
+    /// Mixed precision: store float tensors whose (original) name matches GLOB
+    /// as TYPE (f32, f16, bf16, q8_0, q6_K, ...), GLOB=TYPE (repeatable; the
+    /// first match wins and overrides --dtype and --no-quant). A type the
+    /// tensor's rows don't fit is an error, reported before any data is read.
+    #[arg(long = "type")]
+    pub types: Vec<String>,
     /// With a quantized --dtype, store tensors whose (original) name matches
     /// this glob as f16 instead, e.g. '*embed*' or 'lm_head*' (repeatable).
     #[arg(long)]
@@ -230,6 +236,18 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
             Ok((glob, value.parse::<f32>().with_context(|| format!("--offset {o}: not a number"))?))
         })
         .collect::<Result<_>>()?;
+    let type_rules: Vec<(&str, DType)> = args
+        .types
+        .iter()
+        .map(|r| {
+            let (glob, ty) = split_assignment(r)?;
+            let ty = DType::parse(ty).with_context(|| format!("--type {r}"))?;
+            if ty.is_quantized() && !ty.can_quantize_to() {
+                bail!("--type {r}: can't convert to {ty}");
+            }
+            Ok((glob, ty))
+        })
+        .collect::<Result<_>>()?;
     let program = args.program.as_ref().map(read_program).transpose()?;
     let assets = read_assets(&args.assets)?;
     if let Some(program) = &program {
@@ -273,8 +291,13 @@ pub fn run(args: &ConvertArgs, json: bool) -> Result<i32> {
                 }
                 _ => false,
             };
-            let stored = stored_type(dtype, shape.len(), &target, quant_ok)
+            let mut stored = stored_type(dtype, shape.len(), &target, quant_ok)
                 .with_context(|| format!("tensor {name}: unsupported safetensors dtype {dtype:?}"))?;
+            if is_float {
+                if let Some((_, ty)) = type_rules.iter().find(|(g, _)| glob_match(g, name)) {
+                    stored = *ty;
+                }
+            }
             if elem_size(dtype).is_some_and(|size| (t.end - t.start) as usize != shape.iter().product::<usize>() * size) {
                 bail!("tensor {name}: {} bytes of data do not match shape {}", t.end - t.start, shape_string(&shape));
             }
