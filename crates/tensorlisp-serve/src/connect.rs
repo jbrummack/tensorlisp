@@ -55,10 +55,13 @@ pub async fn connect_once(registry: Rc<Registry>, address: &Address, name: &str)
             stream.set_nodelay(true)?;
             run(registry, stream, name).await
         }
+        #[cfg(unix)]
         Address::Unix(p) => {
             let stream = tokio::net::UnixStream::connect(p).await.with_context(|| format!("connecting to {address}"))?;
             run(registry, stream, name).await
         }
+        #[cfg(not(unix))]
+        Address::Unix(_) => bail!("{address}: Unix sockets are not available on this platform"),
     }
 }
 

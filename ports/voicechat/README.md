@@ -87,6 +87,24 @@ faster than real time: once speech flows a frame takes 62-65 ms (encoder + langu
 the first audio comes 1.2 s in. The codec's depthwise convolution (kernel 7) needed `case 7` in ggml-cuda's `ssm-conv.cu`
 (vendored, patched). Short clip, not paced over RPC, no tool calling measured.
 
+## Live demo
+
+`crates/tensorlisp-serve/examples/voicechat_demo.rs` is a client for `tl-serve`: it streams the microphone to the `listen` pipeline
+over RPC and plays the speech that comes back (the agent's words are printed as they arrive). It needs the `capnp` tool to build
+(`pacman -S mingw-w64-ucrt-x86_64-capnproto` on MSYS2) and a GGUF with the program packed in (`tl pack`, see above).
+
+```sh
+tl-serve --listen tcp:127.0.0.1:7700 --store STORE --device gpu --features cuda    # cargo build --release -p tensorlisp-serve --features cuda
+cargo run --release -p tensorlisp-serve --features cuda --example voicechat_demo -- --model /path/live.gguf    # first start installs it (~1 min)
+... --wav user.wav --out reply.wav --no-play        # no microphone: stream a 16 kHz wav at real time, save the speech
+... --tools tools.json                              # listen-tools; the calls are printed and answered with --reply
+```
+
+It pushes a second of silence first (the first frames compile the graphs) and starts the microphone when those frames are back.
+Use headphones, or the agent hears itself. On the RTX 3080 the wav run above returns "The sky appears blue due to Rayleigh scattering..."
+in real time, and the saved speech transcribes back through the model's own ASR. (`tl-serve` builds on Windows now: Unix sockets are
+`cfg(unix)` and `USERPROFILE` stands in for `HOME`.) The microphone/speaker path was only compiled, not run, on the machine without an input device.
+
 ## Tool calling
 
 `listen-tools` ([audio stream] [system string] [tools string] [reply string]) is `listen` with a system prompt and tools.

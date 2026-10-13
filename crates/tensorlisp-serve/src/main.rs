@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let store_dir = match args.store {
         Some(dir) => dir,
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set; pass --store")?)
+        None => PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).context("HOME is not set; pass --store")?)
             .join(".cache/tensorlisp/models"),
     };
     let registry = Registry::new(Store::open(store_dir)?, device(&args.device)?);
@@ -75,13 +75,18 @@ async fn main() -> Result<()> {
             }
             let Some(listen) = listen else { return std::future::pending::<Result<()>>().await };
             if let Some(path) = listen.strip_prefix("unix:") {
-                let _ = std::fs::remove_file(path);
-                let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
-                eprintln!("tl-serve listening on unix:{path}");
-                loop {
-                    let (stream, _) = listener.accept().await?;
-                    serve_stream(registry.clone(), stream);
+                #[cfg(unix)]
+                {
+                    let _ = std::fs::remove_file(path);
+                    let listener = tokio::net::UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
+                    eprintln!("tl-serve listening on unix:{path}");
+                    loop {
+                        let (stream, _) = listener.accept().await?;
+                        serve_stream(registry.clone(), stream);
+                    }
                 }
+                #[cfg(not(unix))]
+                bail!("unix:{path}: Unix sockets are not available on this platform, use tcp:HOST:PORT")
             } else if let Some(addr) = listen.strip_prefix("tcp:") {
                 let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
                 eprintln!("tl-serve listening on tcp:{}", listener.local_addr()?);
