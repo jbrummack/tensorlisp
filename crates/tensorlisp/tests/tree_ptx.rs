@@ -815,3 +815,148 @@ fn q8_matmul_on_int8_tensor_cores() {
         }
     }
 }
+
+fn to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let a = x.abs();
+    if a == 0.0 {
+        return sign;
+    }
+    if a >= 65520.0 {
+        return sign | 0x7c00;
+    }
+    let exp = ((b >> 23) & 0xff) as i32 - 127;
+    if exp < -14 {
+        // subnormal: multiples of 2^-24
+        return sign | (a * 16777216.0).round() as u16;
+    }
+    let mant = (b & 0x7f_ffff) as u64;
+    let mut m = (mant + 0x0fff + ((mant >> 13) & 1)) >> 13; // round to nearest even
+    let mut e = (exp + 15) as u32;
+    if m == 0x400 {
+        m = 0;
+        e += 1;
+    }
+    sign | ((e as u16) << 10) | m as u16
+}
+
+fn from_f16(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    if e == 0 {
+        sign * m * 2f32.powi(-24)
+    } else if e == 31 {
+        if m == 0.0 { sign * f32::INFINITY } else { f32::NAN }
+    } else {
+        sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    }
+}
+
+fn f16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| to_f16(*x).to_ne_bytes()).collect()
+}
+
+/// Flash attention on tensor cores (`k:flash-attn-mma`) against a CPU reference over f16-rounded inputs: prefill
+/// shapes with a causal (optionally windowed) mask, query counts and cache lengths off the tile sizes, grouped heads.
+/// `TL_BENCH=1` times Gemma 4 E2B's two attention shapes against the scalar kernel.
+#[test]
+fn flash_attention_on_tensor_cores() {
+    let scheme = Scheme::new().unwrap();
+    for lib in [SPIRV_LIB, TREE_LIB, KERNELS_LIB, PTX_LIB] {
+        scheme.eval(lib).unwrap();
+    }
+    scheme.eval("(define-top-level-value '$env (environment '(rnrs) '(tl tree) '(tl tree kernels) '(tl tree ptx)))").unwrap();
+    let cuda = match Cuda::system_default() {
+        Ok(c) => c,
+        Err(tensorlisp_kernels::Error::NoDevice) if std::env::var_os("TL_ALLOW_NO_GPU").is_some() => return,
+        Err(e) => panic!("{e}"),
+    };
+    let e = Engine::new(Arc::new(cuda));
+    let compile = |expr: &str| {
+        let reply = scheme.eval(&format!("(eval '(compile-kernel-ptx {expr}) $env)")).unwrap_or_else(|err| panic!("{expr}: {err}"));
+        blob_from_reply(expr, reply)
+    };
+    let bench = std::env::var_os("TL_BENCH").is_some();
+    // (nq, kv, hsk, hsv, nh, nkv, window, masked)
+    let cases: &[(usize, usize, usize, usize, usize, usize, usize, bool)] = if bench {
+        &[(406, 406, 256, 256, 8, 1, 0, true), (406, 406, 512, 512, 8, 1, 0, true)]
+    } else {
+        &[
+            (64, 64, 64, 64, 2, 1, 0, true),
+            (37, 37, 64, 64, 4, 2, 0, true),
+            (100, 100, 128, 128, 4, 2, 0, true),
+            (41, 150, 256, 256, 8, 1, 0, true),
+            (33, 33, 256, 256, 8, 1, 16, true),
+            (70, 70, 512, 512, 8, 1, 0, true),
+            (20, 99, 64, 64, 2, 1, 0, false),
+        ]
+    };
+    for &(nq, kv, hsk, hsv, nh, nkv, window, masked) in cases {
+        let q = noise(nh * nq * hsk, 1);
+        let k: Vec<f32> = noise(nkv * kv * hsk, 2).iter().map(|x| from_f16(to_f16(x * 2.0))).collect();
+        let v: Vec<f32> = noise(nkv * kv * hsv, 3).iter().map(|x| from_f16(to_f16(*x))).collect();
+        let qr: Vec<f32> = q.iter().map(|x| from_f16(to_f16(*x))).collect();
+        let allowed = |i: usize, j: usize| !masked || (j + nq <= kv + i && (window == 0 || j + window + nq > kv + i));
+        let mask: Vec<u16> = (0..nq).flat_map(|i| (0..kv).map(move |j| (i, j))).map(|(i, j)| if allowed(i, j) { 0 } else { 0xfc00 }).collect();
+        let scale = 1.0 / (hsk as f32).sqrt();
+        let gqa = nh / nkv;
+        let mut want = vec![0f32; nq * nh * hsv];
+        for h in 0..nh {
+            for i in 0..nq {
+                let sc: Vec<f64> = (0..kv)
+                    .map(|j| {
+                        if !allowed(i, j) {
+                            return f64::NEG_INFINITY;
+                        }
+                        let kb = ((h / gqa) * kv + j) * hsk;
+                        (0..hsk).map(|c| qr[(h * nq + i) * hsk + c] as f64 * k[kb + c] as f64).sum::<f64>() * scale as f64
+                    })
+                    .collect();
+                let mx = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let ps: Vec<f64> = sc.iter().map(|s| (s - mx).exp()).collect();
+                let l: f64 = ps.iter().sum();
+                for c in 0..hsv {
+                    let o: f64 = (0..kv).map(|j| ps[j] * v[((h / gqa) * kv + j) * hsv + c] as f64).sum();
+                    want[(i * nh + h) * hsv + c] = (o / l) as f32;
+                }
+            }
+        }
+        let expr = format!("(k:flash-attn-mma {} #f {hsk} {hsv})", if masked { "#t" } else { "#f" });
+        let kern = compile(&expr);
+        let (lq, lk, lv, lm, ld) = (4 * q.len(), 2 * k.len(), 2 * v.len(), 2 * mask.len(), 4 * want.len());
+        let (ok, ov, om, od) = (align(lq), align(lq) + align(lk), align(lq) + align(lk) + align(lv), align(lq) + align(lk) + align(lv) + align(lm));
+        let push = [
+            nq as u32, nh as u32, hsk as u32, hsv as u32, kv as u32, gqa as u32,
+            hsk as u32, (nq * hsk) as u32, 0,
+            hsk as u32, (kv * hsk) as u32, 0,
+            hsv as u32, (kv * hsv) as u32, 0,
+            hsv as u32, (nh * hsv) as u32, 0,
+            kv as u32, 0, 0, 1, 1,
+            scale.to_bits(), 0,
+        ];
+        let mut bindings = vec![step(0, lq), step(ok, lk), step(ov, lv)];
+        if masked {
+            bindings.push(step(om, lm));
+        }
+        bindings.push(step(od, ld));
+        let l = launch(&kern, bindings, &push, [nq.div_ceil(16) as u32, nh as u32, 1]);
+        let mbytes: Vec<u8> = mask.iter().flat_map(|x| x.to_ne_bytes()).collect();
+        let inputs = [(0, bytes(&q)), (ok, f16_bytes(&k)), (ov, f16_bytes(&v)), (om, mbytes)];
+        let step_bytes = od + align(ld);
+        let got = run_one(&e, l.clone(), &inputs, step_bytes, (od, ld));
+        close(&format!("flash mma nq {nq} kv {kv} hs {hsk}/{hsv} nh {nh}/{nkv} window {window} masked {masked}"), &got, &want, 3e-3);
+        if bench {
+            let ms = time_launch(&e, &l, &inputs, step_bytes, 50);
+            let flops = 4.0 * (nh * nq * kv * hsk) as f64 / 2.0;
+            println!("flash mma nq {nq} hs {hsk}: {ms:.3} ms ({:.1} TFLOP/s causal-effective)", flops / ms / 1e9);
+            let scalar = compile("(k:flash-attn 'f16 'f16 #t #f 2048)");
+            let mut sl = l.clone();
+            sl.kernel = scalar;
+            sl.grid = [nq as u32, nh as u32, 1];
+            let sms = time_launch(&e, &sl, &inputs, step_bytes, 50);
+            println!("flash scalar nq {nq} hs {hsk}: {sms:.3} ms");
+        }
+    }
+}

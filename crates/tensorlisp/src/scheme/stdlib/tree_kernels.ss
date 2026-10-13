@@ -7,7 +7,7 @@
 ;; kernel declares them below. Strides are in elements, extents in elements, innermost first.
 (library (tl tree kernels)
   (export k:im2col k:pool2d k:conv-dw k:pad k:pad-reflect k:upscale k:ew k:ew-q8 k:rowchain k:binary k:unary k:concat k:arange k:get-rows k:norm k:rms-norm k:norm-rope k:soft-max k:sum-rows
-          k:matmul k:matmul-cm k:matmul-q8mma k:matmul-q8mma-w k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
+          k:matmul k:matmul-cm k:matmul-q8mma k:matmul-q8mma-w k:matvec k:rope k:set-rows k:argmax k:argmax-part k:argmax-final k:flash-attn k:flash-attn-mma k:flash-attn-part k:flash-attn-combine k:paged-attn-part k:paged-cache-write k:quantize-q8 k:matvec-q8 k:gateup-q8 k:repack-q8 k:matvec-q8r)
   (import (rnrs))
 
   (define wg 256)
@@ -1297,6 +1297,154 @@
                    (when (> p 0.0)
                      (set! acc (fma p ,(load-f32 vtype 'v '(+ vbase (* j v1) dd)) acc)))))
                (store d (+ (* h d1) (* qi d2) (* bi d3) dd) (/ acc gsum))))))))
+
+  ;; Flash attention for many queries on tensor cores (PTX only: mma.sync through the cooperative-matrix forms and
+  ;; cm-scale). A workgroup of four warps takes 16 queries of one head; keys are consumed 64 at a time (each warp
+  ;; computes the scores of 16 keys: S = Q K^T with Q in shared memory and K read from global memory, f16), the
+  ;; softmax runs on the scores in shared memory with the running maximum and sum kept in registers (online
+  ;; softmax: the output accumulators are rescaled by cm-scale), and P V is split over the head dimension, each warp
+  ;; owning hsv/4 columns of the output. K and V are f16. Key tiles outside the unmasked range of the 16 queries
+  ;; (a scan of their mask rows) are skipped; the 16-key group holding the cache end when kv % 16 != 0 is staged in
+  ;; shared memory with zero rows. Same buffers and push words as k:flash-attn; grid (ceil(nq / 16), nh, batch).
+  ;; Needs hsk % 16 = 0, hsv % 64 = 0, even strides k1 k2 k3 and kv >= 1.
+  (define (k:flash-attn-mma mask? softcap? hsk hsv)
+    (let* ([ldq (+ hsk 8)] [ldt (+ (max hsk hsv) 8)] [nj (div hsv 64)] [js (range 0 nj)]
+           [ldS 68] [ldP 72] [cols (range 0 8)])
+      (define (o j) (name 'o_ j))
+      (define (sv i) (name 's_ i))
+      (define (pv i) (name 'p_ i))
+      (define (fill-tail rowsrc width buf stride)
+        ;; rows pg.. of `buf` (k or v) into tl, zero past the cache end
+        (map (lambda (e)
+               `(let ([idx (+ tid ,(* e 128))])
+                  (let ([rr (/ idx ,width)] [c (rem idx ,width)])
+                    (store tl (+ (* rr ,ldt) c)
+                           (guard (< (+ pg rr) kv) (load ,buf (+ ,rowsrc (* (+ pg rr) ,stride) c)) (f16 0.0))))))
+             (range 0 (div (* 16 width) 128))))
+      `(kernel ,(name 'flash_attn_mma_ hsk '_ hsv (if mask? '_mask "") (if softcap? '_cap ""))
+         (offsets prefix) (workgroup 128)
+         (buffers (q ro f32) (k ro f16) (v ro f16) ,@(if mask? '((mk ro u16)) '()) (d wo f32))
+         (push ,@(u32s 'nq 'nh 'hsk 'hsv 'kv 'gqa 'q1 'q2 'q3 'k1 'k2 'k3 'v1 'v2 'v3 'd1 'd2 'd3 'm1 'm2 'm3 'mne2 'mne3)
+               (scale f32) (cap f32))
+         (shared (qs f16 ,(* 16 ldq)) (tl f16 ,(* 16 ldt)) (ss f32 ,(* 16 ldS)) (ps f16 ,(* 16 ldP))
+                 (al f32 16) (li f32 16) (red f32 8))
+         (let ([tid (local-id 0)] [q0 (* (group-id 0) 16)] [h (group-id 1)] [bi (group-id 2)])
+           (let ([sg (/ tid 32)] [l (rem tid 32)] [kvh (/ h gqa)] [r (/ tid 8)] [sub (rem tid 8)])
+             (let ([g (/ l 4)] [kbase (+ (* kvh k2) (* bi k3))] [vbase (+ (* kvh v2) (* bi v3))]
+                   [qrow (min (+ q0 r) (- nq 1))])
+               (let ([mbase (+ (* qrow m1) (* (rem h mne2) m2) (* (rem bi mne3) m3))]
+                     [pg (* (/ kv 16) 16)])
+                 (cmat sacc c f32) (cmat qa a f16) (cmat kb b f16) (cmat pa a f16) (cmat vb b f16)
+                 ,@(map (lambda (j) `(cmat ,(o j) c f32)) js)
+                 ,@(map (lambda (j) `(cm-zero ,(o j))) js)
+                 ,@(map (lambda (e)
+                          `(let ([idx (+ tid ,(* e 128))])
+                             (let ([qq (/ idx ,hsk)] [c (rem idx ,hsk)])
+                               (store qs (+ (* qq ,ldq) c)
+                                      (f16 (load q (+ (* (min (+ q0 qq) (- nq 1)) q1) (* h q2) (* bi q3) c)))))))
+                        (range 0 (div (* 16 hsk) 128)))
+                 ,@(if mask?
+                       `((var vm f32 0.0) (var vf f32 0.0)
+                         (for (j sub kv 8)
+                           (when (> (half->f32 (load mk (+ mbase j))) -1.0e30)
+                             (set! vm (max vm (f32 (+ j 1))))
+                             (set! vf (max vf (f32 (- kv j))))))
+                         ,@(apply append (map (lambda (m) `((set! vm (max vm (shuffle-xor vm ,m))) (set! vf (max vf (shuffle-xor vf ,m))))) '(1 2 4 8 16)))
+                         (when (= l 0) (store red sg vm) (store red (+ sg 4) vf))
+                         (barrier)
+                         (var kvl u32 (u32 (max (max (load red 0) (load red 1)) (max (load red 2) (load red 3)))))
+                         (var kvs u32 (- kv (u32 (max (max (load red 4) (load red 5)) (max (load red 6) (load red 7)))))))
+                       '((var kvl u32 kv) (var kvs u32 0)))
+                 (var mrun f32 -inf.0)
+                 (var lrun f32 0.0)
+                 (for (j0 (* (/ kvs 64) 64) kvl 64)
+                   (let ([part (and (> (rem kv 16) 0) (and (<= j0 pg) (< pg (+ j0 64))))])
+                     (when part
+                       ,@(fill-tail 'kbase hsk 'k 'k1)
+                       (barrier))
+                     (let ([jb (+ j0 (* sg 16))])
+                       (when (< jb kv)
+                         (cm-zero sacc)
+                         (if (<= (+ jb 16) kv)
+                             (for (st 0 ,(div hsk 16))
+                               (cm-load qa qs (* st 16) ,ldq row)
+                               (cm-load kb k (+ kbase (* jb k1) (* st 16)) k1 col)
+                               (cm-muladd sacc qa kb sacc))
+                             (for (st 0 ,(div hsk 16))
+                               (cm-load qa qs (* st 16) ,ldq row)
+                               (cm-load kb tl (* st 16) ,ldt col)
+                               (cm-muladd sacc qa kb sacc)))
+                         (cm-store sacc ss (* sg 16) ,ldS row)))
+                     (barrier)
+                     (var mx f32 -inf.0)
+                     ,@(apply append
+                         (map (lambda (i)
+                                `((var ,(sv i) f32 -inf.0)
+                                  (let ([key (+ j0 sub ,(* i 8))])
+                                    (when (< key kv)
+                                      (let ([sc (* (load ss (+ (* r ,ldS) sub ,(* i 8))) scale)])
+                                        ,@(if softcap? '((set! sc (* cap (tanh (/ sc cap))))) '())
+                                        ,@(if mask?
+                                              `((let ([mval (half->f32 (load mk (+ mbase key)))])
+                                                  (when (> mval -1.0e30) (set! ,(sv i) (+ sc mval)))))
+                                              `((set! ,(sv i) sc))))))))
+                              cols))
+                     ,@(map (lambda (i) `(set! mx (max mx ,(sv i)))) cols)
+                     ,@(map (lambda (m) `(set! mx (max mx (shuffle-xor mx ,m)))) '(1 2 4))
+                     (let ([mnew (max mrun mx)])
+                       (let ([mm (select (= mnew -inf.0) 0.0 mnew)])
+                         (let ([alpha (exp (- mrun mm))])
+                           (var psum f32 0.0)
+                           ,@(apply append
+                               (map (lambda (i)
+                                      `((var ,(pv i) f32 (exp (- ,(sv i) mm)))
+                                        (set! psum (+ psum ,(pv i)))
+                                        (store ps (+ (* r ,ldP) sub ,(* i 8)) (f16 ,(pv i)))))
+                                    cols))
+                           ,@(map (lambda (m) `(set! psum (+ psum (shuffle-xor psum ,m)))) '(1 2 4))
+                           (set! lrun (+ (* lrun alpha) psum))
+                           (set! mrun mnew)
+                           (when (= sub 0) (store al r alpha)))))
+                     (when part
+                       ,@(fill-tail 'vbase hsv 'v 'v1))
+                     (barrier)
+                     (let ([a0 (load al g)] [a1 (load al (+ g 8))])
+                       ,@(map (lambda (j) `(cm-scale ,(o j) a0 a1)) js))
+                     ,@(map (lambda (kg)
+                              `(let ([jb (+ j0 ,(* kg 16))])
+                                 (when (< jb kv)
+                                   (cm-load pa ps ,(* kg 16) ,ldP row)
+                                   (if (<= (+ jb 16) kv)
+                                       (begin
+                                         ,@(map (lambda (j)
+                                                  `(begin
+                                                     (cm-load vb v (+ vbase (* jb v1) (* (+ (* sg ,nj) ,j) 16)) v1 row)
+                                                     (cm-muladd ,(o j) pa vb ,(o j))))
+                                                js))
+                                       (begin
+                                         ,@(map (lambda (j)
+                                                  `(begin
+                                                     (cm-load vb tl (* (+ (* sg ,nj) ,j) 16) ,ldt row)
+                                                     (cm-muladd ,(o j) pa vb ,(o j))))
+                                                js))))))
+                            '(0 1 2 3))
+                     (barrier)))
+                 (when (= sub 0) (store li r (select (> lrun 0.0) (/ 1.0 lrun) 0.0)))
+                 (barrier)
+                 (let ([a0 (load li g)] [a1 (load li (+ g 8))])
+                   ,@(map (lambda (j) `(cm-scale ,(o j) a0 a1)) js))
+                 ,@(map (lambda (j)
+                          `(begin
+                             (cm-store ,(o j) ss (* sg 256) 16 row)
+                             (barrier)
+                             ,@(map (lambda (e)
+                                      `(let ([idx (+ l ,(* e 32))])
+                                         (let ([qi (+ q0 (/ idx 16))] [dd (+ (* (+ (* sg ,nj) ,j) 16) (rem idx 16))])
+                                           (when (< qi nq)
+                                             (store d (+ (* h d1) (* qi d2) (* bi d3) dd) (load ss (+ (* sg 256) idx)))))))
+                                    (range 0 8))
+                             (barrier)))
+                        js))))))))
 
   ;; Split-KV flash attention for few queries (decode): one workgroup per (key chunk, head, query)
   ;; instead of one per (head, query), so that a long cache keeps the whole GPU busy. Pass one

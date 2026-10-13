@@ -603,6 +603,17 @@
                        (join (part d) ", ") (join a ", ") (list-ref b (* 2 h)) (list-ref b (+ (* 2 h) 1)) (join (part c) ", "))))
              '(0 1))
            env)]
+        [(cm-scale)
+         ;; (cm-scale M s0 s1): the accumulator's rows g (s0) and g + 8 (s1) are multiplied by the f32 values
+         ;; s0 and s1, g = lane / 4 (the online softmax's rescaling of the running output). PTX only.
+         (let* ([b (cm-lookup s env (car args))] [regs (vector-ref b 1)]
+                [s0 (car (cx-as st (cadr args) env 'f32 s))] [s1 (car (cx-as st (caddr args) env 'f32 s))])
+           (unless (eq? (vector-ref b 2) 'c) (fail s "cm-scale scales accumulators"))
+           (let loop ([i 0] [regs regs])
+             (unless (null? regs)
+               (ins! st "mul.f32 ~a, ~a, ~a;" (car regs) (car regs) (if (< (mod i 4) 2) s0 s1))
+               (loop (+ i 1) (cdr regs))))
+           env)]
         [(mma-s8)
          ;; (mma-s8 (d0 d1 d2 d3) (a0 a1 a2 a3) (b0 b1)): d += a * b for one m16n8k32 int8 product, PTX only.
          ;; The d vars (i32) are the accumulators; a and b are the lane's u32 fragment words (four int8 each):

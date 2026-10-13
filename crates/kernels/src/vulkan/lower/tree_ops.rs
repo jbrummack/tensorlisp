@@ -974,7 +974,7 @@ impl<'a> Ctx<'a> {
         let maxkv = match kv {
             0..=2048 => 2048,
             2049..=4096 => 4096,
-            _ => return Ok(None),
+            _ => 0,
         };
         if let Some(m) = &mask {
             if m.ty != Ty::F16 || m.nb[0] != 1 || m.ne[0] < kv || m.ne[1] < nq || m.ne[2] == 0 || m.ne[3] == 0 {
@@ -1016,6 +1016,30 @@ impl<'a> Ctx<'a> {
         }
         bindings.push(td.range);
         let (kt, vt, mk, sc) = (tname(tk.ty).unwrap(), tname(tv.ty).unwrap(), if mask.is_some() { "#t" } else { "#f" }, if cap != 0.0 { "#t" } else { "#f" });
+        // Many queries over an f16 cache on tensor cores (PTX): 16 queries a workgroup, no limit on the cache length.
+        let even = |x: u32| x % 2 == 0;
+        if self.caps.int_mma
+            && nq >= 16
+            && kv >= 1
+            && tk.ty == Ty::F16
+            && tv.ty == Ty::F16
+            && hsk % 16 == 0
+            && hsv % 64 == 0
+            && hsk <= 512
+            && hsv <= 512
+            && even(tk.nb[1])
+            && even(tk.nb[2])
+            && even(tk.nb[3])
+            && tk.off % 4 == 0
+            && !self.graph.q8_out.contains(&id)
+            && std::env::var_os("TL_TREE_NOFAMMA").is_none()
+        {
+            let expr = format!("(k:flash-attn-mma {mk} {sc} {hsk} {hsv})");
+            return self.tree_launch(tree, &expr, bindings, &push, [ceil_div(nq, 16), nh, nb]);
+        }
+        if maxkv == 0 {
+            return Ok(None);
+        }
         if let Some(split) = fa_split_plan(self.graph, id) {
             let off = self.layout.scratch[self.pos[&id]].ok_or_else(|| Error::Invalid("flash attention scratch was not planned".into()))?;
             let part = Range::new(Space::Step, self.arena_base + off, split.bytes);

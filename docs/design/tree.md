@@ -305,6 +305,15 @@ when the backend drops, `TL_CUDA_GRAPHS=0` and `TL_TREE_NOMMA=1` switch the firs
   realignment done at fragment load; 1536x406x6144 0.47 -> 0.18 ms (42 T-ops/s), 2048x406x1536 0.11 -> 0.062 ms. The lowering
   uses it when k % 256 == 0 and rows are 16-byte aligned (64x64 or 32x128 tiles, the 48 KB static shared memory limit;
   `TL_TREE_NOWIDE=1` falls back). ncu is installed but the driver denies counter access (ERR_NVGPUCTRPERM) without admin rights.
+* **Prefill flash attention on tensor cores** (`k:flash-attn-mma`, `cm-scale`, PTX only, `Caps::int_mma`): 16 queries of a head a
+  workgroup of four warps; each warp computes the scores of 16 keys (`S = Q K^T`, Q in shared memory, K straight from global
+  memory through `cm-load`), the softmax runs on the scores in shared memory with the running max/sum in registers, the
+  output accumulators are rescaled by the new `cm-scale` form (rows g and g + 8 of the fragment) and `P V` is split over the
+  head dimension. Key tiles outside the unmasked range of the 16 queries are skipped (a scan of their mask rows), the 16-key
+  group holding the cache end is staged with zero rows. Used for f16 caches, nq >= 16, hsk % 16 = 0, hsv % 64 = 0, <= 512
+  (`TL_TREE_NOFAMMA=1` off). 406 queries x 8 heads: 0.093 ms against 0.81 ms (head size 256), 0.145 against 1.29 ms (512);
+  the long-prompt sweep's attention time 9.0 s to 2.3 s. What is left of the scalar kernel in that run is dense batched
+  decode (nq = 1, batch > 1).
 * Single-sequence decode is now 5.2 ms a step (190 tokens/s, 36 on the NVRTC executor). Left in the profile: ~270 launches
   of the mat-vec at ~60% of the weights' bandwidth bound, prefill flash attention (~20% of a long-prompt run).
 
