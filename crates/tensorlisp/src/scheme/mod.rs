@@ -112,6 +112,18 @@ fn boot() -> Result<Scheme> {
     // The environment Tree kernel expressions are compiled in (see `tree_compile`).
     scheme.eval("(define-top-level-value '$tl-tree-env (environment '(rnrs) '(tl tree) '(tl tree opt) '(tl tree kernels) '(tl tree ptx) '(tl tree msl)))")?;
 
+    // TL_TREE_PASS_FILE: Scheme source evaluated once after boot in a copy of the Tree environment, so it
+    // can `register-pass!` passes that TL_TREE_PASSES then names (crates/tensorlisp-evolve runs its
+    // model-level gates this way).
+    if let Ok(path) = std::env::var("TL_TREE_PASS_FILE") {
+        let src = std::fs::read_to_string(&path).map_err(|e| Error::Program(format!("TL_TREE_PASS_FILE {path}: {e}")))?;
+        scheme.eval(
+            "(define-top-level-value '$tl-load-pass-file (lambda (src) (let ([env (copy-environment $tl-tree-env #t)] [p (open-input-string src)]) \
+               (let loop () (let ([x (read p)]) (unless (eof-object? x) (eval x env) (loop)))))))",
+        )?;
+        scheme.call("$tl-load-pass-file", &[Value::String(src)]).map_err(|e| Error::Program(format!("TL_TREE_PASS_FILE {path}: {e}")))?;
+    }
+
     // ggml assertions on this thread raise Scheme errors (see core.ss).
     crate::guard::install();
     let Value::Int(handler) = scheme.call("$tl-abort-handler", &[])? else {

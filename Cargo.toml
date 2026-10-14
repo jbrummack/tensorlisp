@@ -10,6 +10,7 @@ members = [
     "crates/importers",
     "crates/kernels",
     "crates/tensorlisp-serve",
+    "crates/tensorlisp-evolve",
     "experiments/handrolled-lisp",
     "experiments/gguf-loader",
 ]

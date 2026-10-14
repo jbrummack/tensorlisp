@@ -24,7 +24,7 @@
 ;; Subgroup operations are not (they depend on which lanes reach them), nor are loads from
 ;; writable buffers or shared memory (stores and barriers change them).
 (library (tl tree opt)
-  (export optimize register-pass! pass-names run-pass default-passes
+  (export optimize register-pass! pass-names run-pass default-passes pass-registry restore-passes!
           map-stmt expr-map mentions assigned-vars binders pure? op-count
           pass-fold pass-licm pass-cse pass-dce)
   (import (rnrs) (rnrs hashtables) (only (chezscheme) format))
@@ -507,6 +507,11 @@
     (set! registry (cons (cons name proc) (filter (lambda (e) (not (eq? (car e) name))) registry))))
 
   (define (pass-names) (map car registry))
+
+  ;; A snapshot of the registry and its restoration: the evolve evaluator runs candidate code that
+  ;; registers passes and must leave the process as it found it.
+  (define (pass-registry) registry)
+  (define (restore-passes! r) (set! registry r))
 
   (define (run-pass name k)
     (let ([p (assq name registry)])

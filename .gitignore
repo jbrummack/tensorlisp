@@ -34,3 +34,7 @@ ports/*/*.jpeg
 
 # glslang release used to compile GLSL when the Vulkan SDK (glslc) is not installed
 /vendor/glslang
+
+# tl-evolve: per-agent workspaces, transcripts and derived search indexes (the forum itself, evolve/forum, is shared state)
+/evolve/work/
+/evolve/index/
