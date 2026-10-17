@@ -15,7 +15,8 @@
 ;;   (register-pass! 'my-pass (lambda (kernel) ... kernel))
 ;;   (optimize kernel '(fold my-pass dce))     ; default: (fold licm cse dce)
 ;;
-;; and can build them from the traversals exported here: `map-stmt` (rebuild a statement with a
+;; and can build them from the traversals exported here: `map-body` (apply a function to the body
+;; statements of a kernel, keeping its clauses: `(map-body (lambda (stmts) ...) kernel)`), `map-stmt` (rebuild a statement with a
 ;; function applied to its own expressions and to its nested statement lists), `expr-map`
 ;; (bottom-up rewrite of an expression), `mentions`, `assigned-vars`, `binders`, `pure?`.
 ;;
@@ -24,8 +25,8 @@
 ;; Subgroup operations are not (they depend on which lanes reach them), nor are loads from
 ;; writable buffers or shared memory (stores and barriers change them).
 (library (tl tree opt)
-  (export optimize register-pass! pass-names run-pass default-passes pass-registry restore-passes!
-          map-stmt expr-map mentions assigned-vars binders pure? op-count
+  (export optimize register-pass! pass-names run-pass default-passes pass-registry restore-passes! has-cmat?
+          map-body map-stmt expr-map mentions assigned-vars binders pure? op-count
           pass-fold pass-licm pass-cse pass-dce)
   (import (rnrs) (rnrs hashtables) (only (chezscheme) format))
 

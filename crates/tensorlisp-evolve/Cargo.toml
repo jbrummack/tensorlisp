@@ -12,6 +12,9 @@ path = "src/main.rs"
 # A Kv over any `object_store` (S3, GCS, Azure, local disk): the shared backend for agents on several machines.
 object-store = ["dep:object_store", "dep:tokio", "dep:futures"]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tensorlisp-kernels = { path = "../kernels" }
+
 [dependencies]
 chez.workspace = true
 anyhow.workspace = true
@@ -20,6 +23,7 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10"
+similar = "2"
 tantivy = "0.26"
 ureq = "3"
 object_store = { version = "0.14", optional = true }

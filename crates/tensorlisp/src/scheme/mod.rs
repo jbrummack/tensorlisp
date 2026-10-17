@@ -104,6 +104,17 @@ fn boot() -> Result<Scheme> {
     }
     scheme.eval(&library_source())?;
     for (name, source) in STDLIB {
+        // TL_TREE_KERNELS_FILE: a replacement for stdlib/tree_kernels.ss (the Tree kernel generators), so a
+        // candidate generator change runs in the real executors (crates/tensorlisp-evolve gates use it).
+        let replacement = (*name == "tree kernels").then(|| std::env::var("TL_TREE_KERNELS_FILE").ok()).flatten();
+        let text;
+        let source = match replacement {
+            Some(path) => {
+                text = std::fs::read_to_string(&path).map_err(|e| Error::Program(format!("TL_TREE_KERNELS_FILE {path}: {e}")))?;
+                text.as_str()
+            }
+            None => source,
+        };
         scheme
             .eval(source)
             .map_err(|e| Error::Program(format!("stdlib (tl {name}) failed to load: {e}")))?;

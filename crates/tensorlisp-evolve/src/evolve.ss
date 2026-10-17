@@ -5,16 +5,19 @@
 ;; the Tree libraries and a few Chez printing helpers. That keeps honest mistakes from touching the
 ;; disk or the process; it is not a security boundary.
 
-(define $evo-base-env
-  (environment
+(define ($evo-env-spec kernels)
+  (list
     '(except (rnrs) open-file-input-port open-file-output-port open-file-input/output-port
              open-input-file open-output-file call-with-input-file call-with-output-file
              with-input-from-file with-output-to-file file-exists? delete-file)
     '(only (chezscheme) pretty-print format printf iota list-head)
-    '(tl tree) '(tl tree opt) '(tl tree kernels) '(tl tree ptx) '(tl tree msl)))
+    '(tl tree) '(tl tree opt) kernels '(tl tree ptx) '(tl tree msl)))
+
+(define $evo-base-env (apply environment ($evo-env-spec '(tl tree kernels))))
 
 (define $evo-optimize (eval 'optimize $evo-base-env))
 (define $evo-default-passes (eval 'default-passes $evo-base-env))
+(define $evo-has-cmat? (eval 'has-cmat? $evo-base-env))
 (define $evo-compile-spirv (eval 'compile-kernel $evo-base-env))
 (define $evo-compile-ptx (eval 'compile-kernel-ptx $evo-base-env))
 (define $evo-compile-msl (eval 'compile-kernel-msl $evo-base-env))
@@ -35,8 +38,9 @@
         (list (cons 'only-in-a (filter (lambda (s) (not (member s sb))) sa))
               (cons 'only-in-b (filter (lambda (s) (not (member s sa))) sb)))))))
 
-(define ($evo-new-env)
-  (let ([env (copy-environment $evo-base-env #t)])
+;; A mutable copy of `base` (default: the original generators) with the helpers defined.
+(define ($evo-new-env . base)
+  (let ([env (copy-environment (if (null? base) $evo-base-env (car base)) #t)])
     (for-each (lambda (f) (eval f env)) $evo-helpers)
     env))
 
@@ -80,7 +84,14 @@
                  (lambda ()
                    (parameterize ([current-output-port port])
                      (let loop ([forms ($evo-read-all code)] [v (void)])
-                       (if (null? forms) v (loop (cdr forms) (eval (car forms) env))))))))])
+                       (cond
+                         [(null? forms) v]
+                         ;; the libraries are imported already; a model's habitual (import ...) is not an error
+                         [(and (pair? (car forms)) (eq? (caar forms) 'import))
+                          (display "(import ignored: rnrs, (tl tree), (tl tree opt), (tl tree kernels), (tl tree ptx) and (tl tree msl) are already imported)")
+                          (newline)
+                          (loop (cdr forms) v)]
+                         [else (loop (cdr forms) (eval (car forms) env))]))))))])
       (string-append
         (get)
         (cond [failure (string-append "error: " failure)]
@@ -136,36 +147,63 @@
              [(not (eq? (cdr a) (cdr b))) "barrier presence changed"]
              [else #f]))]))
 
-;; One row per generator expression: (expr status note base-size candidate-size bytes-or-#f base-bytes-or-#f).
+;; One row per generator expression: (expr status note base-size candidate-size bytes-or-#f base-bytes-or-#f cand-reply-or-#f base-reply-or-#f).
+;; The baseline is built by the original generators in `clean-env` and the default passes; the candidate by the
+;; generators visible in `env` (the candidate's, when it brought its own) and its pipeline.
 ;; `skip`: the baseline itself does not build for this target, so there is nothing to compare with.
-(define ($evo-row env src pipeline target ms)
+(define ($evo-row clean-env env src pipeline target ms)
   (let* ([k0 #f] [base #f] [bo #f]
          [setup (guard (e [#t ($tl-error-message e)])
-                  (set! k0 (eval (car ($evo-read-all src)) env))
+                  (set! k0 (eval (car ($evo-read-all src)) clean-env))
                   (set! base ($evo-optimize k0 $evo-default-passes))
                   (set! bo ($evo-compile target base))
                   #f)])
     (if setup
-        (list src 'skip setup 0 0 #f #f)
-        (guard (e [#t (list src 'error ($tl-error-message e) 0 0 #f #f)])
-          (let* ([cand ($evo-timed ms (lambda () ($evo-optimize k0 pipeline)))]
+        (list src 'skip setup 0 0 #f #f #f #f)
+        (guard (e [#t (list src 'error ($tl-error-message e) 0 0 #f #f #f #f)])
+          (let* ([kc ($evo-timed ms (lambda () (eval (car ($evo-read-all src)) env)))]
+                 [cand ($evo-timed ms (lambda () ($evo-optimize kc pipeline)))]
                  [problem ($evo-structure-problem base cand)])
             (if problem
-                (list src 'structure problem 0 0 #f #f)
+                (list src 'structure problem 0 0 #f #f #f #f)
                 (let ([co ($evo-timed ms (lambda () ($evo-compile target cand)))])
-                  (list src 'ok "" ($evo-size bo) ($evo-size co) (and (bytevector? co) co) (and (bytevector? bo) bo)))))))))
+                  ;; `cmat`: optimize leaves kernels with cooperative matrices alone, so no pass can change this one
+                  (list src 'ok (if ($evo-has-cmat? base) "cmat" "") ($evo-size bo) ($evo-size co) (and (bytevector? co) co) (and (bytevector? bo) bo)
+                        ;; PTX / MSL: the whole compile reply (text entry accesses push-bytes workgroup), for running it
+                        (and (pair? co) co) (and (pair? bo) bo)))))))))
 
-;; (load-error message) or (rows row ...). Candidate code is evaluated once in a fresh environment; the
-;; pass registry is restored afterwards so one candidate cannot leak into the next.
-(define ($evo-evaluate code pipeline target exprs ms)
+;; (load-error message) or (rows row ...). Candidate code is evaluated once in a fresh environment; the pass registry
+;; is restored afterwards so one candidate cannot leak into the next. `gensrc` is the text of a candidate
+;; `(library (tl tree kernels-candidate) ...)`, a modified copy of the generators ("" for none): the candidate's
+;; expressions are then built by it, the baseline's by the original.
+(define ($evo-evaluate code pipeline target exprs ms gensrc)
   (let ([saved (eval '(pass-registry) $evo-base-env)])
     (dynamic-wind
       void
       (lambda ()
-        (guard (e [#t (list 'load-error ($tl-error-message e))])
-          (let ([env ($evo-new-env)])
-            ($evo-timed ms (lambda () (for-each (lambda (f) (eval f env)) ($evo-read-all code))))
-            (let ([known (eval '(pass-names) $evo-base-env)])
-              (for-each (lambda (s) (unless (memq s known) (error 'evaluate "no pass named" s))) pipeline))
-            (cons 'rows (map (lambda (src) ($evo-row env src pipeline target ms)) exprs)))))
+        (let ([gen-error
+               (and (not (string=? gensrc ""))
+                    (guard (e [#t (string-append "[generators] " ($tl-error-message e))])
+                      ($evo-timed ms (lambda () (for-each eval ($evo-read-all gensrc))))
+                      #f))])
+          (if gen-error
+              (list 'load-error gen-error)
+              (guard (e [#t (list 'load-error ($tl-error-message e))])
+                (let* ([clean-env ($evo-new-env)]
+                       [cand-base (if (string=? gensrc "")
+                                      $evo-base-env
+                                      (apply environment ($evo-env-spec '(tl tree kernels-candidate))))]
+                       [env ($evo-new-env cand-base)])
+                  ($evo-timed ms (lambda () (for-each (lambda (f) (eval f env)) ($evo-read-all code))))
+                  (let ([known (eval '(pass-names) $evo-base-env)])
+                    (for-each (lambda (s) (unless (memq s known) (error 'evaluate "no pass named" s))) pipeline))
+                  (cons 'rows (map (lambda (src) ($evo-row clean-env env src pipeline target ms)) exprs)))))))
       (lambda () (eval (list 'restore-passes! (list 'quote saved)) $evo-base-env)))))
+
+;; Which of these generator expressions build kernels that passes cannot change (cooperative matrices)?
+(define ($evo-locked exprs)
+  (let ([env ($evo-new-env)])
+    (map (lambda (src)
+           (guard (e [#t #f])
+             ($evo-has-cmat? (eval (car ($evo-read-all src)) env))))
+         exprs)))

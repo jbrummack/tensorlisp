@@ -289,12 +289,14 @@ impl Forum {
         Ok(out)
     }
 
-    /// The best verified entry per (target, device): the highest score among entries whose gates all passed.
+    /// The best verified entry per (target, device): the highest score among entries whose gates all passed
+    /// and that beat the baseline (score above 1): a pass that is merely valid is not a winner.
     pub fn leaderboard(&self, per_group: usize) -> Result<Vec<(String, String, Vec<Entry>)>> {
         let mut groups: BTreeMap<(String, String), Vec<Entry>> = BTreeMap::new();
         for e in self.entries(None, 100_000)? {
             if let Some(v) = &e.verdict
                 && v.ok
+                && v.score > 1.0
             {
                 groups.entry((v.target.clone(), v.device.clone())).or_default().push(e);
             }
@@ -377,11 +379,12 @@ mod tests {
     #[test]
     fn leaderboard_keeps_only_verified_winners_per_target() {
         let f = forum();
-        for (ok, score, target) in [(true, 1.1, "spirv"), (true, 1.3, "spirv"), (false, 9.0, "spirv"), (true, 1.05, "ptx")] {
+        for (ok, score, target) in [(true, 1.1, "spirv"), (true, 1.3, "spirv"), (false, 9.0, "spirv"), (true, 1.05, "ptx"), (true, 0.999, "msl"), (true, 1.0, "msl")] {
             let id = eval(&f, ok, score, target);
             f.submit(NewEntry { kind: Some(Kind::Pass), author: "a".into(), headline: format!("{score}"), eval_id: Some(id), ..Default::default() }).unwrap();
         }
         let board = f.leaderboard(1).unwrap();
+        // valid but not better than the baseline (0.999, 1.0) does not make the board
         assert_eq!(board.len(), 2);
         let spirv = board.iter().find(|g| g.0 == "spirv").unwrap();
         assert_eq!(spirv.2[0].verdict.as_ref().unwrap().score, 1.3);

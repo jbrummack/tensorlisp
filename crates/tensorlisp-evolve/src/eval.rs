@@ -9,7 +9,8 @@
 //!                effects (the buffers it stores to, whether it synchronizes). This catches passes that
 //!                "win" by deleting work; it is a heuristic, not a proof of equivalence.
 //! * `spirv-val`  the SPIR-V validates (SPIR-V target, when `spirv-val` is installed)
-//! * external gates: shell commands run with `TL_TREE_PASS_FILE` and `TL_TREE_PASSES` set, so
+//! * external gates: shell commands run with `TL_TREE_PASS_FILE` and `TL_TREE_PASSES` set (and the kernel
+//!   cache off), so
 //!   `cargo test --test tree_gemma` and friends exercise the real models with the candidate. Exit status
 //!   is the verdict; lines `TL_EVOLVE_METRIC name=value` on stdout are recorded, and a `speedup` metric
 //!   replaces the static score.
@@ -61,6 +62,13 @@ pub struct EvalConfig {
     pub spirv_val: Option<PathBuf>,
     /// Candidate files and gate logs go here.
     pub work_dir: PathBuf,
+    /// Kernel expression -> weight from profiles (see `weights.rs`); empty weighs every kernel equally.
+    /// The profiled expressions are compiled in addition to `exprs`.
+    pub weights: BTreeMap<String, f64>,
+    /// Launches captured from real runs on the device (see `kbench.rs`); with them, a candidate that passed the
+    /// built-in gates is timed against the reference kernels on the GPU (MSL only for now).
+    pub launches: Vec<crate::weights::Launch>,
+    pub bench: crate::kbench::Options,
 }
 
 impl EvalConfig {
@@ -73,6 +81,9 @@ impl EvalConfig {
             gates: Vec::new(),
             spirv_val: find_spirv_val(),
             work_dir: work_dir.into(),
+            weights: BTreeMap::new(),
+            launches: Vec::new(),
+            bench: crate::kbench::Options::default(),
         }
     }
 }
@@ -106,15 +117,21 @@ struct GateRun {
     tail: String,
 }
 
-fn run_gate(gate: &GateCommand, cfg: &EvalConfig, file: &Path, pipeline: &[String]) -> Result<GateRun> {
+fn run_gate(gate: &GateCommand, cfg: &EvalConfig, file: &Path, kernels_file: Option<&Path>, pipeline: &[String]) -> Result<GateRun> {
     let log = cfg.work_dir.join(format!("gate-{}-{}.log", gate.name, std::process::id()));
     let out = std::fs::File::create(&log)?;
     let err = out.try_clone()?;
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&gate.command)
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(&gate.command);
+    match kernels_file {
+        Some(f) => command.env("TL_TREE_KERNELS_FILE", f),
+        None => command.env_remove("TL_TREE_KERNELS_FILE"),
+    };
+    let mut child = command
         .env("TL_TREE_PASS_FILE", file)
         .env("TL_TREE_PASSES", pipeline.join(","))
+        // the kernel cache is keyed by the pass names, not by what the passes do: a candidate must be compiled afresh
+        .env("TL_KERNEL_CACHE", "off")
         .env("TL_EVOLVE_TARGET", &cfg.target)
         .env("TL_EVOLVE_DEVICE", &cfg.device)
         .stdin(Stdio::null())
@@ -151,33 +168,111 @@ fn run_gate(gate: &GateCommand, cfg: &EvalConfig, file: &Path, pipeline: &[Strin
     Ok(GateRun { passed: status.is_some_and(|s| s.success()), metrics, tail: if status.is_none() { format!("timed out after {:?}\n{tail}", gate.timeout) } else { tail } })
 }
 
+/// The generator library as this binary has it: the baseline a candidate generator change is compared with.
+pub const ORIGINAL_GENERATORS: &str = include_str!("../../tensorlisp/src/scheme/stdlib/tree_kernels.ss");
+const LIBRARY_HEADER: &str = "(library (tl tree kernels)";
+
+/// A candidate edit of `tree_kernels.ss`: the unified diff against the original and the names of the
+/// top-level definitions the edit touches. `None` when the text is identical.
+pub fn generator_edit(candidate: &str) -> Option<(String, Vec<String>)> {
+    if candidate == ORIGINAL_GENERATORS {
+        return None;
+    }
+    let diff = similar::TextDiff::from_lines(ORIGINAL_GENERATORS, candidate);
+    let unified = diff.unified_diff().context_radius(2).header("tree_kernels.ss", "candidate").to_string();
+    let define = regex::Regex::new(r"^\s{0,3}\(define(?:-syntax|-record-type)?\s+\(?([^\s()]+)").unwrap();
+    let owner = |text: &str, line: usize| -> Option<String> { text.lines().take(line + 1).collect::<Vec<_>>().iter().rev().find_map(|l| define.captures(l).map(|c| c[1].to_string())) };
+    let mut names: Vec<String> = Vec::new();
+    for op in diff.ops() {
+        let (old, new) = (op.old_range(), op.new_range());
+        // inserted or replaced lines belong to the definition above them in the new text; a pure deletion, to the old
+        let name = if !new.is_empty() { owner(candidate, new.start) } else { owner(ORIGINAL_GENERATORS, old.start) };
+        if let Some(n) = name
+            && !matches!(op.tag(), similar::DiffTag::Equal)
+            && !names.contains(&n)
+        {
+            names.push(n);
+        }
+    }
+    Some((unified, names))
+}
+
+/// The candidate's generator text as a library the evaluator can load next to the original.
+fn renamed_library(candidate: &str) -> Result<String> {
+    if !candidate.contains(LIBRARY_HEADER) {
+        bail!("the generator file must keep its first form, `{LIBRARY_HEADER}`: copy it with generator_workspace and edit the copy");
+    }
+    Ok(candidate.replacen(LIBRARY_HEADER, "(library (tl tree kernels-candidate)", 1))
+}
+
 /// Runs every gate on a candidate and stores the result in the forum as an [`Eval`].
+///
+/// Compiles `cfg.exprs` plus every profiled expression. The score is the weighted geometric mean of
+/// baseline size / candidate size over the profiled kernels when the device has profiles, else the plain
+/// geometric mean over all kernels.
 pub fn evaluate(forum: &Forum, cfg: &EvalConfig, code: &str, pipeline: &[String]) -> Result<Eval> {
+    evaluate_with(forum, cfg, code, pipeline, None)
+}
+
+/// [`evaluate`], optionally with a candidate edit of the kernel generators (the full text of a modified
+/// `tree_kernels.ss`). The baseline is built by the original generators and the default passes; the candidate
+/// by the edited generators and `pipeline`. Everything else is the same: the interface of each kernel
+/// (buffers, push constants, workgroup) must be unchanged, because the Rust launch sites rely on it.
+pub fn evaluate_with(forum: &Forum, cfg: &EvalConfig, code: &str, pipeline: &[String], generators: Option<&str>) -> Result<Eval> {
     check_pipeline(pipeline)?;
     std::fs::create_dir_all(&cfg.work_dir)?;
-    let id = sha_hex(&[code, &pipeline.join(","), &cfg.target, &cfg.device, &cfg.gates.iter().map(|g| format!("{}={}", g.name, g.command)).collect::<Vec<_>>().join(";")])[..16].to_string();
+    let mut edit = generators.and_then(|g| generator_edit(g).map(|(d, n)| (g.to_string(), d, n)));
+    let gen_library = match &edit {
+        Some((text, _, _)) => renamed_library(text)?,
+        None => String::new(),
+    };
+    let gen_print = edit.as_ref().map(|e| sha_hex(&[&e.0])[..16].to_string()).unwrap_or_default();
+    let weights_print: String = cfg.weights.iter().map(|(k, v)| format!("{k}={v:.6}")).collect::<Vec<_>>().join(";");
+    let id = sha_hex(&[code, &pipeline.join(","), &cfg.target, &cfg.device, &cfg.gates.iter().map(|g| format!("{}={}", g.name, g.command)).collect::<Vec<_>>().join(";"), &weights_print, &gen_print])[..16].to_string();
 
-    let outcome = scheme::handle()?.evaluate(code, pipeline, &cfg.target, &cfg.exprs, cfg.timeout_ms)?;
+    let mut exprs = cfg.exprs.clone();
+    for e in cfg.weights.keys() {
+        if !exprs.contains(e) {
+            exprs.push(e.clone());
+        }
+    }
+    let outcome = scheme::handle()?.evaluate(code, pipeline, &cfg.target, &exprs, cfg.timeout_ms, &gen_library)?;
     let mut gates: BTreeMap<String, bool> = BTreeMap::new();
     let mut metrics: BTreeMap<String, f64> = BTreeMap::new();
     let mut notes: Vec<String> = Vec::new();
     let mut rows_json = Vec::new();
     let mut logsum = 0.0f64;
     let mut counted = 0usize;
+    let (mut wlog, mut wsum) = (0.0f64, 0.0f64);
+    let mut locked_weight = 0.0f64;
+    let mut compiled_rows: Option<&Vec<crate::scheme::Row>> = None;
 
     match &outcome {
         Outcome::LoadError(msg) => {
             gates.insert("loads".into(), false);
-            notes.push(format!("did not load: {msg}"));
+            match (msg.strip_prefix("[generators] "), &edit) {
+                (Some(m), Some((text, _, _))) => notes.push(format!("the edited generator library did not load: {}", crate::lispcheck::explain(m, text))),
+                _ => notes.push(format!("did not load: {}", crate::lispcheck::explain(msg, code))),
+            }
         }
         Outcome::Rows(rows) => {
             gates.insert("loads".into(), true);
+            compiled_rows = Some(rows);
             let (mut smaller, mut larger, mut skipped) = (0, 0, 0);
             for r in rows {
-                rows_json.push(json!({"expr": r.expr, "status": r.status, "note": r.note, "baseline": r.base_size, "candidate": r.cand_size}));
+                let weight = cfg.weights.get(&r.expr).copied().unwrap_or(0.0);
+                // the baseline pipeline leaves kernels with cooperative matrices alone, and so does every pipeline
+                let locked = r.status == "ok" && r.note == "cmat";
+                if locked {
+                    locked_weight += weight;
+                }
+                rows_json.push(json!({"expr": r.expr, "status": r.status, "note": if locked { "" } else { r.note.as_str() }, "baseline": r.base_size, "candidate": r.cand_size, "weight": weight, "locked": locked}));
                 match r.status.as_str() {
                     "ok" if r.base_size > 0 && r.cand_size > 0 => {
-                        logsum += (r.base_size as f64 / r.cand_size as f64).ln();
+                        let ln = (r.base_size as f64 / r.cand_size as f64).ln();
+                        logsum += ln;
+                        wlog += weight * ln;
+                        wsum += weight;
                         counted += 1;
                         if r.cand_size < r.base_size {
                             smaller += 1;
@@ -245,6 +340,30 @@ pub fn evaluate(forum: &Forum, cfg: &EvalConfig, code: &str, pipeline: &[String]
         }
     }
 
+    if let Some((_, _, names)) = &edit {
+        metrics.insert("generators_edited".into(), names.len() as f64);
+        notes.insert(0, format!("generator edit touches: {}", names.join(", ")));
+    }
+    // time the kernels the candidate changed against the reference ones, on the real GPU
+    let mut bench_report = None;
+    if let Some(rows) = compiled_rows
+        && cfg.target == "msl"
+        && !cfg.launches.is_empty()
+        && gates.values().all(|ok| *ok)
+    {
+        match crate::kbench::run(rows, &cfg.launches, &cfg.weights, &cfg.bench) {
+            Ok(r) => {
+                gates.insert("kernel-bench".into(), r.ok);
+                metrics.insert("kernel_speedup".into(), r.speedup);
+                metrics.insert("kernel_noise".into(), r.noise);
+                metrics.insert("kernel_coverage".into(), r.coverage);
+                let e = metrics.entry("speedup".into()).or_insert(r.speedup);
+                *e = e.min(r.speedup);
+                bench_report = Some(r);
+            }
+            Err(e) => notes.push(format!("kernel benchmark did not run: {e}")),
+        }
+    }
     let mut gate_logs = serde_json::Map::new();
     if !cfg.gates.is_empty() {
         if gates.values().all(|ok| *ok) {
@@ -252,8 +371,17 @@ pub fn evaluate(forum: &Forum, cfg: &EvalConfig, code: &str, pipeline: &[String]
             std::fs::create_dir_all(&dir)?;
             let file = dir.join(format!("{id}.ss"));
             std::fs::write(&file, code)?;
+            // the full edited generator file, for runtimes started by a gate (TL_TREE_KERNELS_FILE)
+            let kernels_file = match &edit {
+                Some((text, _, _)) => {
+                    let f = dir.join(format!("{id}.kernels.ss"));
+                    std::fs::write(&f, text)?;
+                    Some(f)
+                }
+                None => None,
+            };
             for g in &cfg.gates {
-                let run = run_gate(g, cfg, &file, pipeline)?;
+                let run = run_gate(g, cfg, &file, kernels_file.as_deref(), pipeline)?;
                 gates.insert(g.name.clone(), run.passed);
                 for (k, v) in run.metrics {
                     metrics.insert(format!("{}.{k}", g.name), v);
@@ -269,16 +397,35 @@ pub fn evaluate(forum: &Forum, cfg: &EvalConfig, code: &str, pipeline: &[String]
         }
     }
 
-    let static_score = if counted > 0 { (logsum / counted as f64).exp() } else { 0.0 };
-    metrics.insert("size_ratio".into(), static_score);
+    let uniform = if counted > 0 { (logsum / counted as f64).exp() } else { 0.0 };
+    metrics.insert("size_ratio".into(), uniform);
+    let static_score = if !cfg.weights.is_empty() && wsum > 0.0 {
+        let weighted = (wlog / wsum).exp();
+        metrics.insert("weighted_ratio".into(), weighted);
+        // how much of the profiled time the compared kernels account for
+        metrics.insert("hot_coverage".into(), wsum / cfg.weights.values().sum::<f64>().max(1e-12));
+        // the share of profiled time in kernels no pass can change: an upper bound on what passes can win
+        metrics.insert("hot_locked".into(), locked_weight / cfg.weights.values().sum::<f64>().max(1e-12));
+        weighted
+    } else {
+        uniform
+    };
     let score = metrics.get("speedup").copied().unwrap_or(static_score);
     let verdict = Verdict { eval_id: id.clone(), target: cfg.target.clone(), device: cfg.device.clone(), ok: gates.values().all(|g| *g), score, gates, metrics };
+    let shown_code = match &edit {
+        Some((_, diff, _)) => {
+            let commented: String = diff.lines().take(400).map(|l| format!(";; {l}\n")).collect();
+            format!("{code}\n\n;;; generator edit (diff of tree_kernels.ss)\n{commented}")
+        }
+        None => code.to_string(),
+    };
+    edit.take();
     let eval = Eval {
         id,
-        code: code.to_string(),
+        code: shown_code,
         pipeline: pipeline.to_vec(),
         verdict,
-        report: json!({"rows": rows_json, "notes": notes, "gate_output": gate_logs}),
+        report: json!({"rows": rows_json, "notes": notes, "gate_output": gate_logs, "bench": bench_report}),
         created: now_millis(),
     };
     forum.put_eval(&eval)?;
@@ -287,6 +434,12 @@ pub fn evaluate(forum: &Forum, cfg: &EvalConfig, code: &str, pipeline: &[String]
 
 /// A short text report for the agent (and for `tl-evolve eval`).
 pub fn render(eval: &Eval) -> String {
+    render_focus(eval, &[])
+}
+
+/// Like [`render`], plus the rows whose expression contains any of `focus` (substrings such as `matvec`)
+/// with their own geometric mean. The verdict does not change: focus only chooses what to look at.
+pub fn render_focus(eval: &Eval, focus: &[String]) -> String {
     let v = &eval.verdict;
     let mut out = format!("evaluation {} on {} / {}: {}\nscore {:.4} (above 1 is better than the baseline pipeline)\ngates:", eval.id, v.target, v.device, if v.ok { "OK" } else { "FAILED" }, v.score);
     for (g, ok) in &v.gates {
@@ -306,6 +459,32 @@ pub fn render(eval: &Eval) -> String {
         }
     }
     if let Some(rows) = eval.report["rows"].as_array() {
+        if !focus.is_empty() {
+            let picked: Vec<&serde_json::Value> = rows.iter().filter(|r| focus.iter().any(|f| r["expr"].as_str().is_some_and(|e| e.contains(f.as_str())))).collect();
+            let ratios: Vec<f64> = picked.iter().filter(|r| r["status"] == "ok").map(|r| r["baseline"].as_f64().unwrap_or(1.0) / r["candidate"].as_f64().unwrap_or(1.0).max(1.0)).collect();
+            if ratios.is_empty() {
+                out.push_str(&format!("focus {focus:?}: no kernel matched (or none compiled)\n"));
+            } else {
+                let g = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+                out.push_str(&format!("focus {focus:?}: {} kernels, geometric-mean size ratio {g:.4}\n", ratios.len()));
+                for r in picked.iter().take(12) {
+                    out.push_str(&format!("  {}: {} -> {}{}\n", r["expr"].as_str().unwrap_or(""), r["baseline"], r["candidate"], if r["status"] == "ok" { String::new() } else { format!(" [{}]", r["status"].as_str().unwrap_or("")) }));
+                }
+            }
+        }
+        // profiled kernels first, heaviest first: that is where a change pays
+        let mut hot: Vec<(&str, f64, i64, i64, bool)> = rows.iter().filter(|r| r["status"] == "ok" && r["weight"].as_f64().unwrap_or(0.0) > 0.0).map(|r| (r["expr"].as_str().unwrap_or(""), r["weight"].as_f64().unwrap_or(0.0), r["baseline"].as_i64().unwrap_or(0), r["candidate"].as_i64().unwrap_or(0), r["locked"] == true)).collect();
+        if !hot.is_empty() {
+            hot.sort_by(|a, b| b.1.total_cmp(&a.1));
+            out.push_str("profiled kernels (share of Tree busy time, baseline -> candidate size):\n");
+            for (e, w, b, c, locked) in hot.iter().take(8) {
+                out.push_str(&format!("  {:>5.1}%  {e}: {b} -> {c}{}\n", w * 100.0, if *locked { "  [locked: cooperative matrices, no pass changes it]" } else { "" }));
+            }
+            let locked_share: f64 = hot.iter().filter(|h| h.4).map(|h| h.1).sum::<f64>() / hot.iter().map(|h| h.1).sum::<f64>().max(1e-12);
+            if locked_share > 0.05 {
+                out.push_str(&format!("{:.0}% of the profiled time is in kernels passes cannot change (they contain cooperative matrices; `optimize` skips them), so a pass can win at most on the rest.\n", locked_share * 100.0));
+            }
+        }
         let mut moved: Vec<(&str, i64, i64)> = rows
             .iter()
             .filter(|r| r["status"] == "ok" && r["baseline"] != r["candidate"])
@@ -318,6 +497,9 @@ pub fn render(eval: &Eval) -> String {
                 out.push_str(&format!("  {e}: {b} -> {c}\n"));
             }
         }
+    }
+    if let Ok(b) = serde_json::from_value::<crate::kbench::Report>(eval.report["bench"].clone()) {
+        out.push_str(&crate::kbench::render(&b, 10));
     }
     if let Some(logs) = eval.report["gate_output"].as_object() {
         for (name, tail) in logs {
@@ -396,6 +578,151 @@ mod tests {
         // gates are skipped when a built-in gate fails
         let e = evaluate(&forum, &cfg, "(oops", &p(&["fold"])).unwrap();
         assert!(!e.verdict.gates.contains_key("pass"));
+    }
+
+    #[test]
+    fn profiled_kernels_are_compiled_weighted_and_listed_first() {
+        let (forum, mut cfg) = setup("weighted");
+        // neither expression is in the representative subset: the profile brings them in
+        cfg.weights = BTreeMap::from([("(k:rms-norm #f #t)".to_string(), 0.7), ("(k:argmax)".to_string(), 0.3)]);
+        let e = evaluate(&forum, &cfg, "", &p(&["fold"])).unwrap();
+        assert!(e.verdict.ok, "{}", render(&e));
+        let m = &e.verdict.metrics;
+        assert!((m["hot_coverage"] - 1.0).abs() < 1e-9, "{m:?}");
+        assert_eq!(e.verdict.score, m["weighted_ratio"]);
+        assert_ne!(m["weighted_ratio"], m["size_ratio"]);
+        assert_eq!(m["hot_locked"], 0.0);
+        let rows = e.report["rows"].as_array().unwrap();
+        assert!(rows.iter().any(|r| r["expr"] == "(k:argmax)" && r["weight"] == 0.3));
+        let text = render_focus(&e, &["rms-norm".to_string()]);
+        assert!(text.contains("profiled kernels") && text.contains("70.0%  (k:rms-norm #f #t)"), "{text}");
+        assert!(text.contains("focus [\"rms-norm\"]: ") && text.contains("geometric-mean size ratio"), "{text}");
+        assert!(render_focus(&e, &["nothing".to_string()]).contains("no kernel matched"));
+        // weights are part of the verdict's identity: the same candidate without them is a different evaluation
+        cfg.weights.clear();
+        let plain = evaluate(&forum, &cfg, "", &p(&["fold"])).unwrap();
+        assert_ne!(plain.id, e.id);
+        assert!(!plain.verdict.metrics.contains_key("weighted_ratio"));
+        // an expression the baseline cannot build is skipped, and lowers the coverage
+        cfg.weights = BTreeMap::from([("(k:argmax)".to_string(), 0.5), ("(k:no-such-generator)".to_string(), 0.5)]);
+        let e = evaluate(&forum, &cfg, "", &p(&["fold"])).unwrap();
+        assert!(e.verdict.ok && (e.verdict.metrics["hot_coverage"] - 0.5).abs() < 1e-9, "{}", render(&e));
+    }
+
+    #[test]
+    fn profiled_kernels_with_cooperative_matrices_are_flagged_as_locked() {
+        let (forum, mut cfg) = setup("locked");
+        cfg.weights = BTreeMap::from([("(k:matmul-cm 'f16 32 32 16 1 1)".to_string(), 0.6), ("(k:argmax)".to_string(), 0.4)]);
+        let e = evaluate(&forum, &cfg, "", &p(&["fold"])).unwrap();
+        assert!(e.verdict.ok, "{}", render(&e));
+        assert!((e.verdict.metrics["hot_locked"] - 0.6).abs() < 1e-9, "{:?}", e.verdict.metrics);
+        let text = render(&e);
+        assert!(text.contains("60.0%  (k:matmul-cm") && text.contains("[locked: cooperative matrices") && text.contains("60% of the profiled time is in kernels passes cannot change"), "{text}");
+        let rows = e.report["rows"].as_array().unwrap();
+        assert!(rows.iter().any(|r| r["expr"] == "(k:matmul-cm 'f16 32 32 16 1 1)" && r["locked"] == true && r["note"] == ""));
+    }
+
+    const SILU: &str = "[(silu) `(/ ,x (+ 1.0 (exp (- ,x))))]";
+
+    fn edited(old: &str, new: &str) -> String {
+        assert!(ORIGINAL_GENERATORS.matches(old).count() == 1, "`{old}` must occur exactly once in tree_kernels.ss");
+        ORIGINAL_GENERATORS.replacen(old, new, 1)
+    }
+
+    fn gen_setup(name: &str) -> (Forum, EvalConfig) {
+        let (forum, mut cfg) = setup(name);
+        cfg.exprs = vec!["(k:unary 'silu 'same)".into(), "(k:binary 'add)".into(), "(k:rms-norm #f)".into()];
+        (forum, cfg)
+    }
+
+    #[test]
+    fn the_diff_names_the_definitions_an_edit_touches() {
+        assert!(generator_edit(ORIGINAL_GENERATORS).is_none());
+        let (diff, names) = generator_edit(&edited(SILU, "[(silu) `(* ,x (/ 1.0 (+ 1.0 (exp (- ,x)))))]")).unwrap();
+        assert_eq!(names, ["unary-expr"]);
+        assert!(diff.contains("-      [(silu) `(/ ,x") && diff.contains("+      [(silu) `(* ,x (/ 1.0"), "{diff}");
+        // two edits in different definitions; a pure deletion is attributed to the definition it was in
+        let two = edited(SILU, "[(silu) `(* ,x (/ 1.0 (+ 1.0 (exp (- ,x)))))]").replacen("(define wg 256)", "(define wg 256)\n  (define extra-helper 1)", 1);
+        let (_, names) = generator_edit(&two).unwrap();
+        assert!(names.contains(&"unary-expr".to_string()) && names.contains(&"extra-helper".to_string()) || names.contains(&"wg".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn an_edited_generator_is_compared_with_the_original_one() {
+        let (forum, cfg) = gen_setup("genedit");
+        let base = evaluate(&forum, &cfg, "", &p(&["fold", "licm", "cse", "dce"])).unwrap();
+        assert!((base.verdict.score - 1.0).abs() < 1e-9);
+        // the same text as the original is no edit at all
+        let same = evaluate_with(&forum, &cfg, "", &p(&["fold", "licm", "cse", "dce"]), Some(ORIGINAL_GENERATORS)).unwrap();
+        assert_eq!(same.id, base.id);
+        assert!(same.report["notes"].as_array().unwrap().iter().all(|n| !n.as_str().unwrap().contains("generator edit")));
+
+        // a different way to write silu: same interface and meaning, different code
+        let text = edited(SILU, "[(silu) `(* ,x (/ 1.0 (+ 1.0 (exp (- ,x)))))]");
+        let e = evaluate_with(&forum, &cfg, "", &p(&["fold", "licm", "cse", "dce"]), Some(&text)).unwrap();
+        assert!(e.verdict.ok, "{}", render(&e));
+        assert_eq!(e.verdict.metrics["generators_edited"], 1.0);
+        assert!(render(&e).contains("generator edit touches: unary-expr"), "{}", render(&e));
+        let silu_row = e.report["rows"].as_array().unwrap().iter().find(|r| r["expr"] == "(k:unary 'silu 'same)").unwrap().clone();
+        assert_ne!(silu_row["baseline"], silu_row["candidate"], "{silu_row}");
+        // other kernels are untouched by this edit
+        let add_row = e.report["rows"].as_array().unwrap().iter().find(|r| r["expr"] == "(k:binary 'add)").unwrap().clone();
+        assert_eq!(add_row["baseline"], add_row["candidate"]);
+        // the stored record carries the diff, so the forum shows what changed
+        assert!(e.code.contains(";;; generator edit") && e.code.contains(";; +      [(silu)"), "{}", e.code);
+        let stored = forum.get_eval(&e.id).unwrap().unwrap().verdict;
+        assert!(stored.ok == e.verdict.ok && (stored.score - e.verdict.score).abs() < 1e-12 && stored.gates == e.verdict.gates);
+        assert_ne!(e.id, base.id);
+
+        // a second, different edit: the candidate library can be loaded again (no stale state from the first)
+        let text2 = edited(SILU, "[(silu) `(* ,x (/ 1.0 (+ 1.0 (exp (* -1.0 ,x)))))]");
+        let e2 = evaluate_with(&forum, &cfg, "", &p(&["fold", "licm", "cse", "dce"]), Some(&text2)).unwrap();
+        assert!(e2.verdict.ok && e2.id != e.id, "{}", render(&e2));
+        // and a plain evaluation afterwards is back to the original generators
+        let after = evaluate(&forum, &cfg, "", &p(&["fold", "licm", "cse", "dce"])).unwrap();
+        assert!((after.verdict.score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn generator_edits_that_change_the_interface_or_do_not_load_fail_their_gate() {
+        let (forum, cfg) = gen_setup("genbad");
+        let pipe = p(&["fold", "licm", "cse", "dce"]);
+        // the workgroup size is part of the launch contract with the Rust side
+        let e = evaluate_with(&forum, &cfg, "", &pipe, Some(&edited("(define wg 256)", "(define wg 128)"))).unwrap();
+        assert!(!e.verdict.ok && !e.verdict.gates["structure"], "{}", render(&e));
+        assert!(render(&e).contains("clauses changed"), "{}", render(&e));
+        // a syntax error in the generator file is reported against that file
+        let broken = edited(SILU, "[(silu) `(/ ,x (+ 1.0 (exp (- ,x))))");
+        let e = evaluate_with(&forum, &cfg, "", &pipe, Some(&broken)).unwrap();
+        assert!(!e.verdict.ok && !e.verdict.gates["loads"], "{}", render(&e));
+        let text = render(&e);
+        assert!(text.contains("the edited generator library did not load") && text.contains("paren check"), "{text}");
+        // a file without the library header is refused up front
+        assert!(evaluate_with(&forum, &cfg, "", &pipe, Some("(define x 1)")).unwrap_err().to_string().contains("keep its first form"));
+        // an edit that makes the baseline-valid expression fail to build is a compile failure
+        let e = evaluate_with(&forum, &cfg, "", &pipe, Some(&edited(SILU, "[(silu) `(this-is-not-an-operator ,x)]"))).unwrap();
+        assert!(!e.verdict.ok && !e.verdict.gates["compiles"], "{}", render(&e));
+    }
+
+    #[test]
+    fn a_semantic_change_passes_the_built_in_gates_which_is_why_the_device_gate_exists() {
+        let (forum, cfg) = gen_setup("gensem");
+        let wrong = edited(SILU, "[(silu) `(/ ,x (+ 2.0 (exp (- ,x))))]");
+        let e = evaluate_with(&forum, &cfg, "", &p(&["fold", "licm", "cse", "dce"]), Some(&wrong)).unwrap();
+        assert!(e.verdict.ok, "the structure check cannot see this: {}", render(&e));
+    }
+
+    #[test]
+    fn device_gates_get_the_edited_generator_file() {
+        let (forum, mut cfg) = gen_setup("gengate");
+        cfg.gates = vec!["kern=test -s \"$TL_TREE_KERNELS_FILE\" && grep -q 'define wg 256' \"$TL_TREE_KERNELS_FILE\" && grep -q '(\\* ,x (/ 1.0' \"$TL_TREE_KERNELS_FILE\"".parse().unwrap()];
+        let text = edited(SILU, "[(silu) `(* ,x (/ 1.0 (+ 1.0 (exp (- ,x)))))]");
+        let e = evaluate_with(&forum, &cfg, "", &p(&["fold"]), Some(&text)).unwrap();
+        assert_eq!(e.verdict.gates["kern"], true, "{}", render(&e));
+        // without an edit the variable is not set for the gate
+        cfg.gates = vec!["none=test -z \"$TL_TREE_KERNELS_FILE\"".parse().unwrap()];
+        let e = evaluate(&forum, &cfg, "", &p(&["fold"])).unwrap();
+        assert_eq!(e.verdict.gates["none"], true, "{}", render(&e));
     }
 
     #[test]

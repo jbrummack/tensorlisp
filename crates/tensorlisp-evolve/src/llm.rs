@@ -2,12 +2,46 @@
 //! a local server, or OpenAI itself. Configured by environment:
 //!
 //! * `TL_EVOLVE_BASE_URL` (default `https://openrouter.ai/api/v1`; `OPENAI_BASE_URL` also works)
-//! * `TL_EVOLVE_API_KEY` (`OPENROUTER_API_KEY` or `OPENAI_API_KEY`)
-//! * `TL_EVOLVE_MODEL`, e.g. `anthropic/claude-sonnet-4.5` or `qwen/qwen3-coder`
+//! * `TL_EVOLVE_API_KEY` (`OPENROUTER_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`)
+//! * `TL_EVOLVE_MODEL`, e.g. `anthropic/claude-sonnet-4.5` or `thinkingmachines/inkling:free`
+//!
+//! Each is read from the process environment, else from the repository's `.env` (see `config.rs`).
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+
+/// The endpoint refused the request because the conversation is longer than the model's context window.
+/// `limit` is the window in tokens when the message says it.
+#[derive(Debug, Clone)]
+pub struct ContextOverflow {
+    pub message: String,
+    pub limit: Option<usize>,
+}
+
+impl std::fmt::Display for ContextOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "context window exceeded{}: {}", self.limit.map(|l| format!(" (limit {l} tokens)")).unwrap_or_default(), self.message)
+    }
+}
+
+impl std::error::Error for ContextOverflow {}
+
+/// Recognizes the context-length errors of OpenAI-style, OpenRouter and Anthropic-style endpoints.
+pub fn context_overflow(status: u16, body: &str) -> Option<ContextOverflow> {
+    if !matches!(status, 400 | 413 | 422) {
+        return None;
+    }
+    let lower = body.to_lowercase();
+    const MARKERS: &[&str] = &["context length", "context_length", "maximum context", "context window", "prompt is too long", "too many tokens", "input is too long", "reduce the length", "exceeds the limit of", "request too large", "token limit"];
+    if !MARKERS.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+    let limit = [r"maximum context length is (\d+)", r"> (\d+) maximum", r"context window of (\d+)", r"limit of (\d+) tokens", r"(\d+) token limit", r"max(?:imum)? (?:of )?(\d+) tokens"]
+        .iter()
+        .find_map(|p| regex::Regex::new(p).ok()?.captures(&lower)?.get(1)?.as_str().parse::<usize>().ok());
+    Some(ContextOverflow { message: body.chars().take(300).collect(), limit })
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -33,31 +67,93 @@ pub struct Llm {
     pub model: String,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
+    /// App attribution for OpenRouter (`X-Title`, `HTTP-Referer`): it identifies *this* program, as the
+    /// service documents; it does not claim to be any other app.
+    pub headers: Vec<(String, String)>,
     agent: ureq::Agent,
 }
 
 fn first_env(names: &[&str]) -> Option<String> {
-    names.iter().find_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()))
+    crate::config::first_var(names)
+}
+
+/// What a `/models` listing says about a model (OpenRouter's schema; other servers may not have the endpoint).
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub context_length: Option<usize>,
+    pub free: bool,
+    pub tools: bool,
+}
+
+pub fn parse_models(text: &str) -> Result<Vec<ModelInfo>> {
+    let v: Value = serde_json::from_str(text).context("the models listing is not JSON")?;
+    let data = v["data"].as_array().context("the models listing has no `data`")?;
+    Ok(data
+        .iter()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?.to_string();
+            let ctx = [m["context_length"].as_u64(), m["top_provider"]["context_length"].as_u64()].into_iter().flatten().min().map(|c| c as usize);
+            let zero = |p: &Value| p.as_str().is_some_and(|s| s.parse::<f64>().is_ok_and(|x| x == 0.0));
+            let free = id.ends_with(":free") || (zero(&m["pricing"]["prompt"]) && zero(&m["pricing"]["completion"]));
+            let tools = m["supported_parameters"].as_array().is_some_and(|p| p.iter().any(|x| x == "tools"));
+            Some(ModelInfo { id, context_length: ctx, free, tools })
+        })
+        .collect())
 }
 
 impl Llm {
     pub fn new(base_url: &str, api_key: Option<String>, model: &str) -> Self {
         let agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_connect(Some(Duration::from_secs(30))).timeout_global(Some(Duration::from_secs(600))).build().into();
-        Llm { base_url: base_url.trim_end_matches('/').into(), api_key, model: model.into(), temperature: None, max_tokens: None, agent }
+        let base_url: String = base_url.trim_end_matches('/').into();
+        let mut headers = Vec::new();
+        if base_url.contains("openrouter.ai") {
+            let title = first_env(&["TL_EVOLVE_TITLE"]).unwrap_or_else(|| "tl-evolve".into());
+            headers.push(("X-Title".to_string(), title.clone()));
+            headers.push(("X-OpenRouter-Title".to_string(), title));
+            if let Some(r) = first_env(&["TL_EVOLVE_REFERER"]) {
+                headers.push(("HTTP-Referer".to_string(), r));
+            }
+        }
+        Llm { base_url, api_key, model: model.into(), temperature: None, max_tokens: None, headers, agent }
     }
 
     pub fn from_env(model: Option<&str>) -> Result<Self> {
         let base = first_env(&["TL_EVOLVE_BASE_URL", "OPENAI_BASE_URL"]).unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
-        let key = first_env(&["TL_EVOLVE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]);
+        let key = first_env(&["TL_EVOLVE_API_KEY", "OPENROUTER_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]);
         let model = model.map(String::from).or_else(|| first_env(&["TL_EVOLVE_MODEL"])).context("no model: pass --model or set TL_EVOLVE_MODEL")?;
         Ok(Self::new(&base, key, &model))
+    }
+
+    /// The endpoint's model listing (`GET /models`).
+    pub fn models(&self) -> Result<Vec<ModelInfo>> {
+        let mut req = self.agent.get(format!("{}/models", self.base_url));
+        if let Some(k) = &self.api_key {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let mut resp = req.call().context("models request")?;
+        let status = resp.status();
+        let body = resp.body_mut().read_to_string()?;
+        if !status.is_success() {
+            bail!("models endpoint returned {status}");
+        }
+        parse_models(&body)
+    }
+
+    /// This model's context window in tokens, if the endpoint says (OpenRouter does; a local server may not).
+    pub fn context_window(&self) -> Option<usize> {
+        self.models().ok()?.into_iter().find(|m| m.id == self.model)?.context_length
     }
 
     pub fn chat(&self, messages: &[Value], tools: &[Value]) -> Result<Reply> {
         let mut body = json!({"model": self.model, "messages": messages});
         if !tools.is_empty() {
+            // no `tool_choice`: "auto" is the default with tools, and some endpoints (e.g. inkling) list it as
+            // unsupported, which can make OpenRouter route the request nowhere
             body["tools"] = json!(tools);
-            body["tool_choice"] = json!("auto");
         }
         if let Some(t) = self.temperature {
             body["temperature"] = json!(t);
@@ -72,6 +168,9 @@ impl Llm {
             if let Some(k) = &self.api_key {
                 req = req.header("authorization", format!("Bearer {k}"));
             }
+            for (k, v) in &self.headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
             let sent = req.send(body.clone());
             let (status, text) = match sent {
                 Ok(mut r) => (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()),
@@ -83,11 +182,28 @@ impl Llm {
                 }
                 Err(e) => return Err(e).context("chat request"),
             };
+            // some free tiers answer 200 with nothing: that is a transient failure, not a reply
+            if status < 300 && text.trim().is_empty() && attempt < 5 {
+                eprintln!("llm: empty response; retrying in {delay:?}");
+                std::thread::sleep(delay);
+                delay *= 2;
+                continue;
+            }
+            // OpenRouter reports upstream trouble as an error object inside a 200: retry the transient ones
+            if status < 300 && attempt < 5 && transient_error_body(&text) {
+                eprintln!("llm: upstream error in the response body; retrying in {delay:?}");
+                std::thread::sleep(delay);
+                delay *= 2;
+                continue;
+            }
             if (status == 429 || status >= 500) && attempt < 5 {
                 eprintln!("llm: HTTP {status}; retrying in {delay:?}");
                 std::thread::sleep(delay);
                 delay *= 2;
                 continue;
+            }
+            if let Some(overflow) = context_overflow(status, &text) {
+                return Err(anyhow::Error::new(overflow));
             }
             if status >= 300 {
                 bail!("chat endpoint returned {status}: {}", text.chars().take(500).collect::<String>());
@@ -96,6 +212,15 @@ impl Llm {
         }
         bail!("chat endpoint kept failing")
     }
+}
+
+/// An `{"error": {...}}` body that says the service is busy, not that the request is wrong.
+pub fn transient_error_body(text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return false };
+    let Some(e) = v.get("error") else { return false };
+    let code = e["code"].as_u64().or_else(|| e["code"].as_str().and_then(|c| c.parse().ok())).unwrap_or(0);
+    let kind = format!("{} {}", e["metadata"]["error_type"].as_str().unwrap_or(""), e["message"].as_str().unwrap_or("")).to_lowercase();
+    code == 429 || (500..600).contains(&code) || kind.contains("overloaded") || kind.contains("rate limit") || kind.contains("temporarily")
 }
 
 pub fn parse_reply(text: &str) -> Result<Reply> {
@@ -210,7 +335,89 @@ mod tests {
         let body: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["model"], "vendor/some-model");
         assert_eq!(body["tools"][0]["function"]["name"], "glob");
+        assert!(body.get("tool_choice").is_none(), "tool_choice is left to the default");
         assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn model_listings_give_context_windows_and_free_tiers() {
+        let list = r#"{"data":[
+            {"id":"thinkingmachines/inkling:free","context_length":1048576,"top_provider":{"context_length":1000000},"pricing":{"prompt":"0","completion":"0"},"supported_parameters":["tools","temperature"]},
+            {"id":"vendor/paid","context_length":32000,"pricing":{"prompt":"0.000001","completion":"0.000002"},"supported_parameters":["temperature"]},
+            {"id":"vendor/zero-priced","context_length":8000,"pricing":{"prompt":"0.0","completion":"0.0"}},
+            {"nonsense": true}]}"#;
+        let m = parse_models(list).unwrap();
+        assert_eq!(m.len(), 3);
+        assert_eq!((m[0].context_length, m[0].free, m[0].tools), (Some(1_000_000), true, true));
+        assert_eq!((m[1].context_length, m[1].free, m[1].tools), (Some(32_000), false, false));
+        assert!(m[2].free);
+        assert!(parse_models("[]").is_err());
+        let (url, server) = serve(vec![(200, list.into())]);
+        assert_eq!(Llm::new(&url, Some("k".into()), "vendor/paid").context_window(), Some(32_000));
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET /v1/models") && requests[0].to_lowercase().contains("authorization: bearer k"));
+        // a server without the endpoint: no window, no error
+        let (url, server) = serve(vec![(404, "{}".into())]);
+        assert_eq!(Llm::new(&url, None, "vendor/paid").context_window(), None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn context_length_errors_are_recognized_with_their_limit() {
+        let openai = r#"{"error":{"message":"This model's maximum context length is 32768 tokens. However, your messages resulted in 40000 tokens.","code":"context_length_exceeded"}}"#;
+        let o = context_overflow(400, openai).unwrap();
+        assert_eq!(o.limit, Some(32768));
+        let anthropic = r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        assert_eq!(context_overflow(400, anthropic).unwrap().limit, Some(200000));
+        let router = r#"{"error":{"message":"This endpoint's maximum context length is 131072 tokens. However, you requested about 140000 tokens"}}"#;
+        assert_eq!(context_overflow(400, router).unwrap().limit, Some(131072));
+        assert!(context_overflow(400, r#"{"error":"Input is too long for requested model"}"#).unwrap().limit.is_none());
+        // other client errors, and server errors, are not overflows
+        assert!(context_overflow(401, openai).is_none());
+        assert!(context_overflow(400, r#"{"error":{"message":"invalid tool schema"}}"#).is_none());
+        assert!(context_overflow(500, openai).is_none());
+    }
+
+    #[test]
+    fn the_client_surfaces_an_overflow_as_a_typed_error() {
+        let (url, server) = serve(vec![(400, r#"{"error":{"message":"maximum context length is 8000 tokens"}}"#.into())]);
+        let err = Llm::new(&url, None, "m").chat(&[], &[]).unwrap_err();
+        let o = err.downcast_ref::<ContextOverflow>().expect("typed");
+        assert_eq!(o.limit, Some(8000));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn upstream_errors_inside_a_200_are_retried_but_request_errors_are_not() {
+        let busy = r#"{"error":{"code":503,"message":"Upstream error from Nvidia: Service temporarily overloaded","metadata":{"error_type":"provider_overloaded"}}}"#;
+        assert!(transient_error_body(busy));
+        assert!(transient_error_body(r#"{"error":{"code":"429","message":"x"}}"#));
+        assert!(!transient_error_body(r#"{"error":{"code":400,"message":"invalid tool schema"}}"#));
+        assert!(!transient_error_body(r#"{"choices":[]}"#) && !transient_error_body("not json"));
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"back"}}]}"#;
+        let (url, server) = serve(vec![(200, busy.into()), (200, ok.into())]);
+        assert_eq!(Llm::new(&url, None, "m").chat(&[], &[]).unwrap().content, "back");
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_empty_200_is_retried() {
+        let ok = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        let (url, server) = serve(vec![(200, String::new()), (200, ok.into())]);
+        assert_eq!(Llm::new(&url, None, "m").chat(&[], &[]).unwrap().content, "hello");
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn openrouter_gets_our_own_app_title_and_other_servers_get_nothing_extra() {
+        let or = Llm::new("https://openrouter.ai/api/v1", None, "m");
+        assert!(or.headers.iter().any(|(k, v)| k == "X-Title" && v == "tl-evolve"));
+        assert!(Llm::new("http://localhost:8080/v1", None, "m").headers.is_empty());
+        let (url, server) = serve(vec![(200, r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#.into())]);
+        let mut llm = Llm::new(&url, None, "m");
+        llm.headers.push(("X-Title".into(), "tl-evolve".into()));
+        llm.chat(&[], &[]).unwrap();
+        assert!(server.join().unwrap()[0].to_lowercase().contains("x-title: tl-evolve"));
     }
 
     #[test]

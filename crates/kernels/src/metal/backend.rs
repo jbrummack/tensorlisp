@@ -31,6 +31,9 @@ use crate::sched::backend::{Backend, Launch, Limits, MemKind};
 use crate::sched::blob::{Code, KernelBlob, Target};
 use crate::{Error, Result};
 
+/// Buffers up to this size are copied into launch records (`TL_METAL_LAUNCHES`).
+const SNAPSHOT_BYTES: u64 = 4096;
+
 /// Alignment of a binding's start; the rest is the residual passed in the push words.
 pub const OFFSET_ALIGN: u64 = 16;
 
@@ -40,10 +43,34 @@ pub const OFFSET_ALIGN: u64 = 16;
 struct Profile {
     on: bool,
     kernels: Mutex<HashMap<String, (u64, f64)>>,
+    /// `TL_METAL_LAUNCHES=<file>`: every distinct launch (kernel label, grid, push bytes, binding lengths) with
+    /// its count and the contents of its small buffers (index and position buffers: random data there would read out of
+    /// bounds; taken when the launch is encoded, so one a previous kernel writes shows the previous value), appended as JSON lines when the last handle goes. `tl-evolve` replays these to benchmark kernels.
+    launches_path: Option<std::path::PathBuf>,
+    launches: Mutex<HashMap<(String, [u32; 3], Vec<u8>, Vec<u64>), (u64, Vec<Option<Vec<u8>>>)>>,
 }
 
 impl Drop for Profile {
     fn drop(&mut self) {
+        if let Some(path) = &self.launches_path {
+            let launches = self.launches.lock().unwrap();
+            if !launches.is_empty() {
+                let mut rows: Vec<_> = launches.iter().collect();
+                rows.sort();
+                let mut out = String::new();
+                for ((label, grid, push, bind), (n, data)) in rows {
+                    let hex = |v: &[u8]| -> String { v.iter().map(|b| format!("{b:02x}")).collect() };
+                    let data: Vec<String> = data.iter().map(|d| d.as_ref().map(|d| format!("\"{}\"", hex(d))).unwrap_or_else(|| "null".into())).collect();
+                    out.push_str(&format!("{{\"label\":{label:?},\"grid\":{grid:?},\"push\":\"{}\",\"bind\":{bind:?},\"data\":[{}],\"count\":{n}}}\n", hex(push), data.join(",")));
+                }
+                // every Metal handle (one per test, say) appends its own table; readers add up equal rows
+                use std::io::Write;
+                let written = std::fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(out.as_bytes()));
+                if let Err(e) = written {
+                    eprintln!("metal: cannot write {}: {e}", path.display());
+                }
+            }
+        }
         let kernels = self.kernels.lock().unwrap();
         if !self.on || kernels.is_empty() {
             return;
@@ -72,11 +99,18 @@ impl Metal {
     /// Wraps an existing device.
     pub fn from_device(dev: Arc<Device>) -> Metal {
         let on = std::env::var_os("TL_METAL_PROFILE").is_some_and(|v| v != "0");
-        Metal { dev, profile: Arc::new(Profile { on, kernels: Mutex::new(HashMap::new()) }) }
+        let launches_path = std::env::var_os("TL_METAL_LAUNCHES").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        Metal { dev, profile: Arc::new(Profile { on, kernels: Mutex::new(HashMap::new()), launches_path, launches: Mutex::new(HashMap::new()) }) }
     }
 
     pub fn device(&self) -> &Arc<Device> {
         &self.dev
+    }
+
+    /// Seconds the GPU spent on a submission (start to end of its command buffer); waits for it.
+    pub fn gpu_seconds(&self, pending: &Pending) -> f64 {
+        pending.cmd.waitUntilCompleted();
+        pending.cmd.GPUEndTime() - pending.cmd.GPUStartTime()
     }
 }
 
@@ -253,6 +287,16 @@ impl Metal {
                         p.bindings,
                         p.push_bytes
                     )));
+                }
+                if self.profile.launches_path.is_some() {
+                    let key = (p.label.clone(), l.grid, l.push.to_vec(), l.bindings.iter().map(|b| b.len).collect::<Vec<_>>());
+                    let mut launches = self.profile.launches.lock().unwrap();
+                    let e = launches.entry(key).or_default();
+                    e.0 += 1;
+                    if e.1.is_empty() {
+                        // SAFETY: shared storage, `len` bytes from the binding's offset are inside the buffer
+                        e.1 = l.bindings.iter().map(|b| (b.len <= SNAPSHOT_BYTES).then(|| unsafe { std::slice::from_raw_parts(b.buffer.contents().add(b.offset as usize), b.len as usize).to_vec() })).collect();
+                    }
                 }
                 enc.setComputePipelineState(&p.pipeline.pso);
                 words.clear();

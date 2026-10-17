@@ -1,12 +1,20 @@
 //! An agent harness for searching for Tree optimization passes. See `docs/design/evolve.md`.
 pub mod forum;
+pub mod implementation;
 pub mod kv;
 pub mod search;
 pub mod embed;
+pub mod lispcheck;
 pub mod llm;
 pub mod scheme;
 pub mod eval;
 pub mod tools;
 pub mod agent;
+pub mod bench;
+pub mod kbench;
+pub mod config;
+pub mod context;
 #[cfg(feature = "object-store")]
 pub mod kv_object;
+pub mod weights;
+pub mod reference;

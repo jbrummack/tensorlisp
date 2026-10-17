@@ -28,6 +28,7 @@ const DIMS: usize = 512;
 /// Special forms and Tree/Scheme heads that stay as themselves in the skeleton; every other symbol
 /// becomes `_`, so renamed variables still look alike.
 const KEYWORDS: &[&str] = &[
+    "for", "while", "return", "float", "int", "uint", "const", "void", "struct", "template", "__global__", "__device__", "__shared__", "layout", "buffer", "uniform", "barrier", "kernel", "threadgroup", "device", "constant", "half", "bool", "true", "false",
     "define", "lambda", "let", "let*", "letrec", "if", "cond", "else", "when", "unless", "begin", "set!", "for", "while", "var", "load", "store", "select", "guard", "map", "for-each", "fold-left", "filter", "car", "cdr", "cons", "list", "append", "memq", "assq", "case", "and", "or", "not", "quote", "kernel", "register-pass!", "map-stmt", "expr-map", "pure?", "block-sync", "shared", "cast", "rsqrt", "sqrt", "exp",
 ];
 
@@ -71,6 +72,37 @@ fn tokens(code: &str) -> Vec<String> {
     out
 }
 
+/// C-like text (GLSL, CUDA, Metal): identifiers and numbers whole, every other symbol its own token,
+/// `//` comments dropped.
+fn generic_tokens(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in code.lines() {
+        let line = line.split("//").next().unwrap_or("");
+        let mut cur = String::new();
+        for c in line.chars() {
+            if c.is_alphanumeric() || c == '_' || c == '.' && cur.chars().next().is_some_and(|x| x.is_ascii_digit()) {
+                cur.push(c);
+            } else {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                if !c.is_whitespace() {
+                    out.push(c.to_string());
+                }
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+fn looks_like_scheme(code: &str) -> bool {
+    let t = code.trim_start();
+    t.starts_with('(') || t.starts_with(';') || t.starts_with('[')
+}
+
 fn fnv(s: &str, salt: u64) -> u64 {
     let mut h = 0xcbf29ce484222325u64 ^ salt.wrapping_mul(0x9e3779b97f4a7c15);
     for b in s.bytes() {
@@ -90,7 +122,7 @@ pub struct HashEmbedder;
 
 impl HashEmbedder {
     pub fn embed_one(code: &str) -> Vec<f32> {
-        let toks = tokens(code);
+        let toks = if looks_like_scheme(code) { tokens(code) } else { generic_tokens(code) };
         let norm: Vec<String> = toks
             .iter()
             .map(|t| if t.parse::<f64>().is_ok() { "#n".to_string() } else { t.to_lowercase() })
@@ -315,6 +347,20 @@ impl CodeIndex {
         Ok(texts.len())
     }
 
+    /// Adds the windows of a reference source file (`ref/<path>#<first>-<last>`); `budget` caps how many
+    /// windows may still be added so a huge tree cannot flood a paid embedding endpoint by accident.
+    pub fn add_reference(&mut self, rel: &str, text: &str, budget: &mut usize) -> Result<usize> {
+        let mut wins = crate::reference::windows(text);
+        wins.truncate(*budget);
+        let texts: Vec<String> = wins.iter().map(|w| w.2.clone()).collect();
+        let vs = self.vectors(&texts)?;
+        for ((a, b, t), v) in wins.into_iter().zip(vs) {
+            self.items.insert(format!("ref/{rel}#{a}-{b}"), (v, t));
+        }
+        *budget -= texts.len();
+        Ok(texts.len())
+    }
+
     /// Embeds the code of entries added to the forum since the last sync.
     pub fn sync(&mut self, forum: &Forum) -> Result<usize> {
         let mut added = 0;
@@ -351,8 +397,13 @@ impl CodeIndex {
 
     /// The `k` nearest sources to `code`, best first.
     pub fn nearest(&self, code: &str, k: usize, exclude: Option<&str>) -> Result<Vec<Similar>> {
+        self.nearest_where(code, k, |s| Some(s) != exclude)
+    }
+
+    /// Like [`CodeIndex::nearest`], among the sources `keep` accepts (e.g. `|s| s.starts_with("ref/")`).
+    pub fn nearest_where(&self, code: &str, k: usize, keep: impl Fn(&str) -> bool) -> Result<Vec<Similar>> {
         let q = self.vectors(&[code.to_string()])?.remove(0);
-        let mut scored: Vec<(f32, &String, &String)> = self.items.iter().filter(|(s, _)| Some(s.as_str()) != exclude).map(|(s, (v, t))| (cosine(&q, v), s, t)).collect();
+        let mut scored: Vec<(f32, &String, &String)> = self.items.iter().filter(|(s, _)| keep(s.as_str())).map(|(s, (v, t))| (cosine(&q, v), s, t)).collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
         Ok(scored.into_iter().take(k).map(|(similarity, source, text)| Similar { source: source.clone(), similarity, snippet: text.chars().take(400).collect() }).collect())
     }
@@ -377,6 +428,31 @@ mod tests {
         assert!((cosine(&a, &a) - 1.0).abs() < 1e-4);
         // comments and numbers do not matter
         assert!(cosine(&HashEmbedder::embed_one("(+ x 1) ; one"), &HashEmbedder::embed_one("(+ x 2)")) > 0.99);
+    }
+
+    #[test]
+    fn c_like_text_is_tokenized_as_code_not_as_comments() {
+        let a = HashEmbedder::embed_one("float acc = 0.0; for (int i = 0; i < n; i++) { acc += x[i] * y[i]; } // dot");
+        let b = HashEmbedder::embed_one("float s = 0.0; for (int j = 0; j < m; j++) { s += a[j] * b[j]; }");
+        let c = HashEmbedder::embed_one("layout(local_size_x = 32) in; void main() { barrier(); }");
+        assert!(cosine(&a, &b) > cosine(&a, &c) + 0.1, "{} vs {}", cosine(&a, &b), cosine(&a, &c));
+        assert!(generic_tokens("a.b; // x\nc").contains(&"c".to_string()) && !generic_tokens("a // x").contains(&"x".to_string()));
+    }
+
+    #[test]
+    fn reference_windows_are_searchable_and_budgeted() {
+        let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+        let mut idx = CodeIndex::new(Arc::new(HashEmbedder), kv);
+        let dot: String = (0..100).map(|i| format!("acc += x[{i}] * y[{i}];\n")).collect();
+        let mut budget = 10;
+        assert_eq!(idx.add_reference("vendor/x/dot.comp", &dot, &mut budget).unwrap(), 2);
+        assert_eq!(budget, 8);
+        let mut tiny = 1;
+        assert_eq!(idx.add_reference("vendor/x/other.comp", &dot, &mut tiny).unwrap(), 1);
+        idx.add("entries/e-1", LICM).unwrap();
+        let near = idx.nearest_where("acc += x[3] * y[3];", 5, |s| s.starts_with("ref/")).unwrap();
+        assert!(near.iter().all(|n| n.source.starts_with("ref/")) && near.len() == 3);
+        assert!(near[0].source.starts_with("ref/vendor/x/dot.comp#"), "{:?}", near[0].source);
     }
 
     #[test]
