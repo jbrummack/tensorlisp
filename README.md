@@ -25,6 +25,7 @@ ports/             real model ports: program, PyTorch reference script, nix flak
   tipsv2/          TIPSv2 B/14 text and vision encoders (match PyTorch, run on Metal)
   t5gemma2/        T5Gemma 2 270M-270M: image captioning / text generation, KV cache
   yolo11/          YOLO11n object detection (Ultralytics)
+  audiojepa/       Audio-JEPA ViT-B audio encoder (log-mel -> 128 x 768 patch embeddings)
 docs/              stdlib.md (the (tl ...) libraries), porting-notes.md, design notes
 examples/          tensorlisp programs (*.tl)
 scripts/           build helpers
@@ -221,7 +222,7 @@ see `tl pack --asset`).
   close to OpenCV's `INTER_LINEAR`: downscaling skips pixels).
 - Audio: `audio-rate`, `audio-length`, `audio-resample`, `audio-pad`,
   `audio->array` (waveform + mask), `log-mel` (options `n-fft hop win mels
-  f-min f-max power center scale norm log floor`), `whisper-features`.
+  f-min f-max power center scale norm log floor`), `whisper-features`, `kaldi-fbank` (torchaudio.compliance.kaldi.fbank: options `mels frame-length frame-shift low high window frames subtract-mean`).
 - Images for detectors: `(image-letterbox img w h 'fill (114 114 114))` (YOLO).
 - Arrays: `array-shape`, `array-affine`, `array-reshape`.
 - Rust: `model.run_raw(examples, &options)`, `model.preprocess(example)`.

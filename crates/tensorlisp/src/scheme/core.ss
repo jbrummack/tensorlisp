@@ -317,6 +317,9 @@
   (foreign-procedure "tl_host_log_mel"
     (integer-64 integer-64 integer-64 integer-64 integer-64 integer-64 double double double double) integer-64))
 (define tl_host_whisper_features (foreign-procedure "tl_host_whisper_features" (integer-64 integer-64) integer-64))
+(define tl_host_kaldi_fbank
+  (foreign-procedure "tl_host_kaldi_fbank" (integer-64 integer-64 double-float double-float double-float double-float
+                                            integer-64 integer-64 integer-64) integer-64))
 (define tl_host_tensor_rank (foreign-procedure "tl_host_tensor_rank" (integer-64) integer-64))
 (define tl_host_tensor_dim (foreign-procedure "tl_host_tensor_dim" (integer-64 integer-64) integer-64))
 (define tl_host_tensor_affine (foreign-procedure "tl_host_tensor_affine" (integer-64 double double) integer-64))
@@ -633,6 +636,22 @@
 (define (whisper-features a mels)
   (%host 'whisper-features 'array
     (tl_host_whisper_features (%host-id 'whisper-features 'audio a) (%int 'whisper-features 'mels mels))))
+
+;; torchaudio.compliance.kaldi.fbank: log-mel [frames, mels] (frames over the snipped signal).
+;; 'frames pads with zero rows / truncates to that many; 'subtract-mean removes the waveform mean first.
+(define (kaldi-fbank a . opts)
+  (let* ([o (%options 'kaldi-fbank opts
+              '((mels . 80) (frame-length . 25) (frame-shift . 10) (low . 20) (high . 0) (window . povey)
+                (frames . #f) (subtract-mean . #f)))]
+         [window (case (%opt o 'window) [(hanning) 0] [(hamming) 1] [(povey) 2] [(rectangular) 3]
+                   [else (error 'kaldi-fbank "window must be hanning, hamming, povey or rectangular" (%opt o 'window))])])
+    (%host 'kaldi-fbank 'array
+      (tl_host_kaldi_fbank (%host-id 'kaldi-fbank 'audio a) (%int 'kaldi-fbank 'mels (%opt o 'mels))
+                           (%real 'kaldi-fbank 'frame-length (%opt o 'frame-length))
+                           (%real 'kaldi-fbank 'frame-shift (%opt o 'frame-shift))
+                           (%real 'kaldi-fbank 'low (%opt o 'low)) (%real 'kaldi-fbank 'high (%opt o 'high))
+                           window (if (%opt o 'frames) (%int 'kaldi-fbank 'frames (%opt o 'frames)) 0)
+                           (if (%opt o 'subtract-mean) 1 0)))))
 
 ;; Arrays
 

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use tensorlisp::{
     Device, LoadOptions, Model, Program, RawInput, RunOptions,
     autopro::{
-        audio::{Audio, MelSpectrogram},
+        audio::{Audio, KaldiFbank, KaldiWindow, MelSpectrogram},
         image::{Filter, ImageProcessor, Size},
     },
     gguf::GgufWriter,
@@ -99,6 +99,39 @@ fn audio_features() {
     mel.f_max = 8000.0;
     assert_eq!(arrays[0].1, mel.compute(&samples).into_dyn());
     assert_eq!(arrays[0].1.shape(), &[40, 101]);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn kaldi_fbank() {
+    let program = r#"
+      (preprocess ([clip audio])
+        (model-inputs [mel (kaldi-fbank clip 'mels 20 'frame-length 25 'frame-shift 10 'window 'hanning
+                                        'frames 120 'subtract-mean #t)]))
+      (model (inputs [mel f32 (20 120 batch)]) (outputs [y (ggml-scale mel 1.0) 3]))
+    "#;
+    let path = write("fbank", program, &[]);
+    let model = Model::load(&path, Device::Cpu).unwrap();
+    let samples: Vec<f32> = (0..16000).map(|i| (i as f32 * 0.05).sin() * 0.3 + 0.1).collect();
+    let arrays = model.preprocess(raw("clip", RawInput::Audio(Audio::new(samples.clone(), 16000)))).unwrap();
+    // 1 s at 16 kHz: 1 + (16000 - 400) / 160 = 98 frames, zero padded to 120.
+    assert_eq!(arrays[0].1.shape(), &[120, 20]);
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    let centered: Vec<f32> = samples.iter().map(|v| v - mean).collect();
+    let mut fbank = KaldiFbank::new(16000, 20);
+    fbank.window = KaldiWindow::Hanning;
+    let want = fbank.compute(&centered);
+    assert_eq!(want.shape(), &[98, 20]);
+    let got = arrays[0].1.view().into_dimensionality::<ndarray::Ix2>().unwrap();
+    for t in 0..120 {
+        for m in 0..20 {
+            let expected = if t < 98 { want[[t, m]] } else { 0.0 };
+            assert!((got[[t, m]] - expected).abs() < 1e-4, "frame {t} mel {m}: {} vs {expected}", got[[t, m]]);
+        }
+    }
+    // Silence floors at ln(f32::EPSILON).
+    let silence = fbank.compute(&vec![0.0; 1600]);
+    assert!(silence.iter().all(|&v| (v - f32::EPSILON.ln()).abs() < 1e-6));
     std::fs::remove_file(path).unwrap();
 }
 

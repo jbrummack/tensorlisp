@@ -112,7 +112,7 @@ image-letterbox`
 
 **Audio preprocessing**
 `audio-rate audio-length audio-resample audio-pad audio->array log-mel
-whisper-features`
+whisper-features kaldi-fbank`
 
 **Plain-array helpers** (host-side ndarray, not ggml tensors)
 `array-shape array-affine array-reshape array-length array->list

@@ -15,7 +15,7 @@ use std::{
 use autopro::{
     cluster::{Dbscan, Metric, centroids},
     detect::{BoxFormat, Detector},
-    audio::{Audio, LogMode, MelNorm, MelScale, MelSpectrogram, WaveformProcessor, WhisperFeatures},
+    audio::{Audio, KaldiFbank, KaldiWindow, LogMode, MelNorm, MelScale, MelSpectrogram, WaveformProcessor, WhisperFeatures},
     image::{ChannelOrder, Filter, ImageProcessor, Layout, Size, TileProcessor},
     ocr::{DbDecoder, Quad},
     text::{Padding, TextOptions, Tokenizer},
@@ -466,6 +466,53 @@ extern "C" fn tl_host_log_mel(
             return Err("invalid n-fft / hop / win".into());
         }
         Ok(insert(HostValue::Tensor(mel.compute(&a.samples).into_dyn())))
+    })
+}
+
+/// Kaldi fbank `[frames, mels]` (torchaudio.compliance.kaldi.fbank defaults). `window`: 0 hanning,
+/// 1 hamming, 2 povey, 3 rectangular; `frames` > 0 zero-pads / truncates the result to that many
+/// frames; `flags` bit 0 subtracts the waveform mean first.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn tl_host_kaldi_fbank(
+    id: i64,
+    mels: i64,
+    frame_ms: f64,
+    shift_ms: f64,
+    low: f64,
+    high: f64,
+    window: i64,
+    frames: i64,
+    flags: i64,
+) -> i64 {
+    ffi(|| {
+        let a = audio(id)?;
+        if mels <= 0 || frame_ms <= 0.0 || shift_ms <= 0.0 {
+            return Err("invalid mels / frame length / frame shift".into());
+        }
+        let mut fbank = KaldiFbank::new(a.sample_rate, mels as usize);
+        fbank.frame_length_ms = frame_ms;
+        fbank.frame_shift_ms = shift_ms;
+        fbank.low_freq = low;
+        fbank.high_freq = high;
+        fbank.window = match window {
+            0 => KaldiWindow::Hanning,
+            1 => KaldiWindow::Hamming,
+            2 => KaldiWindow::Povey,
+            _ => KaldiWindow::Rectangular,
+        };
+        let mut samples = a.samples.clone();
+        if flags & 1 != 0 && !samples.is_empty() {
+            let mean = samples.iter().map(|&v| v as f32).sum::<f32>() / samples.len() as f32;
+            samples.iter_mut().for_each(|v| *v -= mean);
+        }
+        let mut out = fbank.compute(&samples);
+        if frames > 0 && out.nrows() != frames as usize {
+            let mut fixed = ndarray::Array2::<f32>::zeros((frames as usize, out.ncols()));
+            let n = out.nrows().min(frames as usize);
+            fixed.slice_mut(ndarray::s![..n, ..]).assign(&out.slice(ndarray::s![..n, ..]));
+            out = fixed;
+        }
+        Ok(insert(HostValue::Tensor(out.into_dyn())))
     })
 }
 
@@ -1520,6 +1567,7 @@ pub(crate) fn symbols() -> Vec<(&'static str, *const std::ffi::c_void)> {
         ("tl_host_audio_to_tensor", tl_host_audio_to_tensor as *const _),
         ("tl_host_log_mel", tl_host_log_mel as *const _),
         ("tl_host_whisper_features", tl_host_whisper_features as *const _),
+        ("tl_host_kaldi_fbank", tl_host_kaldi_fbank as *const _),
         ("tl_host_tensor_rank", tl_host_tensor_rank as *const _),
         ("tl_host_tensor_dim", tl_host_tensor_dim as *const _),
         ("tl_host_tensor_affine", tl_host_tensor_affine as *const _),

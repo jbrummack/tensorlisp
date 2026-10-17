@@ -49,7 +49,7 @@ pub(crate) const STDLIB: &[(&str, &str)] = &[
 const PUBLIC: &str = "tensor? shape strides dtype contiguous? weight weight? model inputs outputs tap \
     preprocess model-inputs host? asset tokenizer tokenize \
     image-size image-resize image-resize-shortest image-resize-longest image-resize-multiple image-center-crop image->array image-tile \
-    audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features \
+    audio-rate audio-length audio-resample audio-pad audio->array log-mel whisper-features kaldi-fbank \
     array-shape array-affine array-reshape \
     postprocess results pipeline run output stream-recv emit client-call client-sample detokenize token-id define-state define-param lora-config! lora-attach! lora-delta state effect paged-attention paged-cache-write device usm-mel-new usm-mel-push! usm-mel-frames usm-mel-window random-seed! random-uniform random-normal nemo-mel-new nemo-mel-push! nemo-mel-finish! nemo-mel-frames nemo-mel-window tool-call-regex tools-prompt guide-new guide-mask guide-advance! guide-final? guide-reset! array-length array-zeros array-concat array->list list->array array-slice array-transpose array-take array-argmax \
     image-letterbox boxes-convert nms detect boxes-scale boxes-clip boxes-unletterbox dbscan cluster-centroids \
